@@ -14,7 +14,7 @@
 - 图形化环境检测、初始化、部署、更新、卸载
 - 首次运行向导
 - Nekro-Agent / NapCat / 应用日志分离展示
-- 浏览器快捷访问
+- 内置 WebView 访问 Nekro-Agent / NapCat 管理界面，并保留系统浏览器兜底打开
 - 运行环境内文件路径快捷打开
 
 ## 目录结构
@@ -56,6 +56,12 @@ python main.py
 
 ```bash
 python main.py --debug
+```
+
+如果内置 WebView 在个别 Windows 机器上出现闪烁或渲染异常，可临时关闭 GPU 加速：
+
+```bash
+python main.py --disable-webview-gpu
 ```
 
 ## 配置

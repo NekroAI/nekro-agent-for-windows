@@ -15,6 +15,23 @@ from core.backend_base import BackendBase
 # 专用 WSL 发行版名称
 DISTRO_NAME = "NekroAgent"
 
+# 各部署模式需要的镜像清单
+REQUIRED_IMAGES = {
+    "napcat": [
+        "postgres:14",
+        "qdrant/qdrant",
+        "kromiose/nekro-agent:latest",
+        "mlikiowa/napcat-docker",
+        "kromiose/nekro-agent-sandbox",
+    ],
+    "lite": [
+        "postgres:14",
+        "qdrant/qdrant",
+        "kromiose/nekro-agent:latest",
+        "kromiose/nekro-agent-sandbox",
+    ],
+}
+
 # Ubuntu 22.04 WSL rootfs 下载地址（按优先级排列）
 ROOTFS_URLS = [
     "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cloud-images/wsl/jammy/current/ubuntu-jammy-wsl-amd64-ubuntu22.04lts.rootfs.tar.gz",
@@ -75,74 +92,138 @@ class WSLManager(BackendBase):
             except Exception:
                 pass
 
+    def _emit_pull_progress(self, phase, message):
+        self.progress_updated.emit(f"__pull_progress__|{phase}|{message}")
+
+    def _get_local_images(self, distro):
+        """获取 WSL 内已存在的 docker 镜像列表，返回 set of 'repo:tag'"""
+        try:
+            output = self._wsl_exec(distro, "docker images --format '{{.Repository}}:{{.Tag}}'", timeout=15)
+            images = set()
+            for line in output.strip().splitlines():
+                line = line.strip().strip("'")
+                if line and line != "<none>:<none>":
+                    images.add(line)
+            return images
+        except Exception:
+            return set()
+
+    def _get_missing_images(self, distro, deploy_mode):
+        """对比镜像清单，返回本地缺失的镜像列表"""
+        required = REQUIRED_IMAGES.get(deploy_mode, REQUIRED_IMAGES["lite"])
+        local = self._get_local_images(distro)
+
+        missing = []
+        for image in required:
+            # 镜像名可能不带 tag，docker images 输出会带 :latest
+            check_name = image if ":" in image else f"{image}:latest"
+            if check_name not in local:
+                missing.append(image)
+        return missing
+
+    def _pull_images(self, distro, images):
+        """逐个拉取镜像列表，带进度反馈。返回 True 全部成功，False 有失败"""
+        total = len(images)
+        for idx, image in enumerate(images, 1):
+            self._emit_pull_progress("stage", f"拉取镜像 ({idx}/{total}): {image}")
+            self.log_received.emit(f"拉取镜像 ({idx}/{total}): {image}", "info")
+
+            proc = subprocess.Popen(
+                ["wsl", "-d", distro, "--", "docker", "pull", image],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                creationflags=self._creation_flags(),
+            )
+            while True:
+                line = proc.stdout.readline()
+                if not line and proc.poll() is not None:
+                    break
+                if line:
+                    text = self._safe_decode(line).strip()
+                    if text and not self._is_wsl_noise(text):
+                        self._emit_pull_progress("update", text)
+
+            proc.wait()
+            if proc.returncode != 0:
+                self._emit_pull_progress("error", f"镜像拉取失败: {image}")
+                self.log_received.emit(f"镜像拉取失败: {image}", "error")
+                return False
+            self.log_received.emit(f"✓ {image} 拉取完成", "info")
+
+        self._emit_pull_progress("done", "所有镜像拉取完成")
+        self.log_received.emit("✓ 所有镜像拉取完成", "info")
+        return True
+
     # ------------------------------------------------------------------ #
     #  环境检测
     # ------------------------------------------------------------------ #
 
-    def check_environment(self):
-        """检测 WSL2 / NekroAgent 发行版 / Docker / Compose 是否就绪"""
-        result = {
-            "wsl_installed": False,
-            "distro": "",
-            "docker_available": False,
-            "compose_available": False,
-        }
+    def get_check_funcs(self):
+        """返回 4 个检测步骤的 callable 列表，每个返回 (passed, detail)"""
+        ctx = {}
 
-        self.log_received.emit("[环境检测] 开始检测...", "info")
+        def check_wsl():
+            self.log_received.emit("[环境检测] 1/4 检测 WSL2...", "info")
+            try:
+                proc = subprocess.run(
+                    ["wsl", "--status"],
+                    capture_output=True, timeout=10,
+                    creationflags=self._creation_flags(),
+                )
+                ok = (proc.returncode == 0)
+                ctx["wsl"] = ok
+                if ok:
+                    self.log_received.emit("[环境检测] ✓ WSL2 已安装", "info")
+                else:
+                    self.log_received.emit("[环境检测] ✗ WSL2 未安装，返回码: " + str(proc.returncode), "error")
+                return (ok, "")
+            except FileNotFoundError:
+                self.log_received.emit("[环境检测] ✗ wsl 命令未找到", "error")
+                ctx["wsl"] = False
+                return (False, "")
+            except Exception as e:
+                self.log_received.emit(f"[环境检测] ✗ WSL 检测异常: {e}", "error")
+                ctx["wsl"] = False
+                return (False, "")
 
-        # 1. WSL 是否已安装
-        self.log_received.emit("[环境检测] 1/4 检测 WSL2...", "info")
-        try:
-            proc = subprocess.run(
-                ["wsl", "--status"],
-                capture_output=True, timeout=10,
-                creationflags=self._creation_flags(),
-            )
-            result["wsl_installed"] = (proc.returncode == 0)
-            if result["wsl_installed"]:
-                self.log_received.emit("[环境检测] ✓ WSL2 已安装", "info")
-            else:
-                self.log_received.emit("[环境检测] ✗ WSL2 未安装，返回码: " + str(proc.returncode), "error")
-                return result
-        except FileNotFoundError:
-            self.log_received.emit("[环境检测] ✗ wsl 命令未找到", "error")
-            return result
-        except Exception as e:
-            self.log_received.emit(f"[环境检测] ✗ WSL 检测异常: {e}", "error")
-            return result
-
-        # 2. NekroAgent 专用发行版是否存在
-        self.log_received.emit("[环境检测] 2/4 检测 NekroAgent 发行版...", "info")
-        if self._distro_exists():
-            result["distro"] = DISTRO_NAME
-            self.log_received.emit(f"[环境检测] ✓ {DISTRO_NAME} 发行版已存在", "info")
-        else:
+        def check_distro():
+            self.log_received.emit("[环境检测] 2/4 检测 NekroAgent 发行版...", "info")
+            if not ctx.get("wsl"):
+                return (False, "未创建")
+            if self._distro_exists():
+                ctx["distro"] = True
+                self.log_received.emit(f"[环境检测] ✓ {DISTRO_NAME} 发行版已存在", "info")
+                return (True, DISTRO_NAME)
             self.log_received.emit("[环境检测] ✗ NekroAgent 发行版不存在", "error")
-            return result
+            return (False, "未创建")
 
-        # 3. Docker 是否可用
-        self.log_received.emit("[环境检测] 3/4 检测 Docker...", "info")
-        try:
-            proc = subprocess.run(
-                ["wsl", "-d", DISTRO_NAME, "--", "bash", "-c",
-                 "docker info"],
-                capture_output=True, timeout=30,
-                creationflags=self._creation_flags(),
-            )
-            result["docker_available"] = (proc.returncode == 0)
+        def check_docker():
+            self.log_received.emit("[环境检测] 3/4 检测 Docker...", "info")
+            if not ctx.get("distro"):
+                return (False, "")
+            try:
+                proc = subprocess.run(
+                    ["wsl", "-d", DISTRO_NAME, "--", "bash", "-c",
+                     "docker info"],
+                    capture_output=True, timeout=30,
+                    creationflags=self._creation_flags(),
+                )
+                ok = (proc.returncode == 0)
+                ctx["docker"] = ok
+                if ok:
+                    self.log_received.emit("[环境检测] ✓ Docker 可用", "info")
+                else:
+                    self.log_received.emit("[环境检测] ✗ Docker 检测失败", "error")
+                    self.log_received.emit(f"返回码: {proc.returncode}", "debug")
+                    self.log_received.emit(f"STDERR: {self._clean_stderr(proc.stderr, 300)}", "debug")
+                return (ok, "")
+            except Exception as e:
+                self.log_received.emit(f"[环境检测] ✗ Docker 检测异常: {e}", "error")
+                return (False, "")
 
-            if not result["docker_available"]:
-                self.log_received.emit("[环境检测] ✗ Docker 检测失败", "error")
-                self.log_received.emit(f"返回码: {proc.returncode}", "debug")
-                self.log_received.emit(f"STDERR: {self._clean_stderr(proc.stderr, 300)}", "debug")
-            else:
-                self.log_received.emit("[环境检测] ✓ Docker 可用", "info")
-        except Exception as e:
-            self.log_received.emit(f"[环境检测] ✗ Docker 检测异常: {e}", "error")
-
-        # 4. Docker Compose 是否可用
-        self.log_received.emit("[环境检测] 4/4 检测 Docker Compose...", "info")
-        if result["docker_available"]:
+        def check_compose():
+            self.log_received.emit("[环境检测] 4/4 检测 Docker Compose...", "info")
+            if not ctx.get("docker"):
+                return (False, "")
             try:
                 proc = subprocess.run(
                     ["wsl", "-d", DISTRO_NAME, "--", "bash", "-c",
@@ -150,26 +231,36 @@ class WSLManager(BackendBase):
                     capture_output=True, timeout=10,
                     creationflags=self._creation_flags(),
                 )
-                result["compose_available"] = (proc.returncode == 0)
-
-                if not result["compose_available"]:
-                    self.log_received.emit("[环境检测] ✗ Docker Compose 检测失败", "error")
-                    self.log_received.emit(f"[DEBUG] 返回码: {proc.returncode}", "error")
-                    self.log_received.emit(f"[DEBUG] STDERR: {self._clean_stderr(proc.stderr, 300)}", "error")
-                else:
+                ok = (proc.returncode == 0)
+                if ok:
                     self.log_received.emit("[环境检测] ✓ Docker Compose 可用", "info")
+                else:
+                    self.log_received.emit("[环境检测] ✗ Docker Compose 检测失败", "error")
+                return (ok, "")
             except Exception as e:
                 self.log_received.emit(f"[环境检测] ✗ Docker Compose 检测异常: {e}", "error")
+                return (False, "")
 
-        # 汇总
-        all_ok = (result["wsl_installed"] and result["distro"] and
-                  result["docker_available"] and result["compose_available"])
+        return [check_wsl, check_distro, check_docker, check_compose]
+
+    def check_environment(self):
+        """检测 WSL2 / NekroAgent 发行版 / Docker / Compose 是否就绪"""
+        self.log_received.emit("[环境检测] 开始检测...", "info")
+        funcs = self.get_check_funcs()
+        results = [func() for func in funcs]
+
+        all_ok = all(r[0] for r in results)
         if all_ok:
             self.log_received.emit("[环境检测] ✓ 所有环境组件就绪！", "info")
         else:
             self.log_received.emit("[环境检测] ✗ 部分环境组件缺失", "error")
 
-        return result
+        return {
+            "wsl_installed": results[0][0],
+            "distro": results[1][1] if results[1][0] else "",
+            "docker_available": results[2][0],
+            "compose_available": results[3][0],
+        }
 
     def _distro_exists(self):
         """检查 NekroAgent 专用发行版是否已存在"""
@@ -656,53 +747,16 @@ default = root
                 compose_version = self._wsl_exec(distro, "docker compose version")
                 self.log_received.emit(f"Docker Compose 版本: {compose_version}", "debug")
 
-                # 首次部署时拉取镜像，后续启动跳过
-                if env_exists != "yes":
-                    self.log_received.emit("拉取 Docker 镜像（可能需要较长时间）...", "info")
-                    self.progress_updated.emit("拉取 Docker 镜像...")
-                    pull_proc = subprocess.Popen(
-                        ["wsl", "-d", distro, "--", "bash", "-c",
-                         f"cd {deploy_dir} && docker compose -f docker-compose.yml --env-file .env pull 2>&1"],
-                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        creationflags=self._creation_flags(),
-                    )
-                    while True:
-                        line = pull_proc.stdout.readline()
-                        if not line and pull_proc.poll() is not None:
-                            break
-                        if line:
-                            text = self._safe_decode(line).strip()
-                            # 过滤 WSL 系统警告（UTF-16 乱码）
-                            if text and not self._is_wsl_noise(text):
-                                self.log_received.emit(f"[镜像拉取] {text}", "info")
-                    pull_proc.wait()
-                    if pull_proc.returncode != 0:
-                        self.log_received.emit("镜像拉取失败", "error")
+                # 检查并拉取缺失的镜像
+                missing = self._get_missing_images(distro, deploy_mode)
+                if missing:
+                    self.log_received.emit(f"检测到 {len(missing)} 个镜像需要拉取...", "info")
+                    self._emit_pull_progress("start", f"准备拉取 {len(missing)} 个镜像")
+                    if not self._pull_images(distro, missing):
                         self.status_changed.emit("启动失败")
                         return
-                    self.log_received.emit("✓ 镜像拉取完成", "info")
-
-                    # 拉取沙盒镜像
-                    self.log_received.emit("拉取沙盒镜像...", "info")
-                    sandbox_proc = subprocess.Popen(
-                        ["wsl", "-d", distro, "--", "docker", "pull", "kromiose/nekro-agent-sandbox"],
-                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        creationflags=self._creation_flags(),
-                    )
-                    while True:
-                        line = sandbox_proc.stdout.readline()
-                        if not line and sandbox_proc.poll() is not None:
-                            break
-                        if line:
-                            text = self._safe_decode(line).strip()
-                            if text and not self._is_wsl_noise(text):
-                                self.log_received.emit(f"[沙盒镜像] {text}", "info")
-                    sandbox_proc.wait()
-                    if sandbox_proc.returncode != 0:
-                        self.log_received.emit("沙盒镜像拉取失败", "error")
-                        self.status_changed.emit("启动失败")
-                        return
-                    self.log_received.emit("✓ 沙盒镜像拉取完成", "info")
+                else:
+                    self.log_received.emit("所有镜像已就绪", "info")
 
                 # docker compose up -d
                 self.log_received.emit("启动 Docker Compose 服务...", "info")
@@ -727,9 +781,19 @@ default = root
                 self.is_running = True
                 self.log_received.emit("Compose 服务已启动，等待就绪...", "info")
 
-                # 仅首次部署时，标记需要显示弹窗（等待 napcat token 捕获后再显示）
-                if env_exists != "yes":
-                    self._pending_deploy_info = (env_content, deploy_mode)
+                # 从 .env 解析凭据
+                is_first_deploy = env_exists != "yes"
+                deploy_info = self._parse_deploy_info(env_content, deploy_mode)
+
+                if is_first_deploy:
+                    if deploy_mode == "napcat":
+                        # napcat 模式：等 token 捕获后再弹窗
+                        self._pending_deploy_info = deploy_info
+                    else:
+                        # lite 模式：直接弹窗
+                        self._show_deploy_info(deploy_info)
+                else:
+                    self._refresh_deploy_info(deploy_info)
 
                 threading.Thread(target=self._log_reader, args=(distro, deploy_dir), daemon=True).start()
                 threading.Thread(target=self._health_check, daemon=True).start()
@@ -770,7 +834,7 @@ default = root
 
                 subprocess.run(
                     ["wsl", "-d", distro, "--", "bash", "-c",
-                     f"cd {deploy_dir} && docker compose -f docker-compose.yml down"],
+                     f"cd {deploy_dir} && docker compose -f docker-compose.yml stop"],
                     capture_output=True, timeout=60,
                     creationflags=self._creation_flags(),
                 )
@@ -801,41 +865,15 @@ default = root
                     wsl_home = "/root"
                 deploy_dir = f"{wsl_home}/nekro_agent"
 
-                # 拉取最新镜像（只更新 nekroagent 和 sandbox）
-                self.log_received.emit("拉取 NekroAgent 镜像...", "info")
-                self.status_changed.emit("更新中...")
-                pull_proc = subprocess.Popen(
-                    ["wsl", "-d", distro, "--", "bash", "-c",
-                     f"cd {deploy_dir} && docker compose -f docker-compose.yml pull nekro_agent 2>&1"],
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    creationflags=self._creation_flags(),
-                )
-                while True:
-                    line = pull_proc.stdout.readline()
-                    if not line and pull_proc.poll() is not None:
-                        break
-                    if line:
-                        text = self._safe_decode(line).strip()
-                        if text and not self._is_wsl_noise(text):
-                            self.log_received.emit(f"[镜像拉取] {text}", "info")
-                pull_proc.wait()
-                if pull_proc.returncode != 0:
-                    self.log_received.emit("NekroAgent 镜像拉取失败", "error")
+                # 只更新 nekro-agent 和 sandbox 镜像
+                update_images = [
+                    "kromiose/nekro-agent:latest",
+                    "kromiose/nekro-agent-sandbox",
+                ]
+                self._emit_pull_progress("start", "准备更新镜像")
+                if not self._pull_images(distro, update_images):
                     self.status_changed.emit("更新失败")
                     return
-
-                # 拉取沙盒镜像
-                self.log_received.emit("拉取沙盒镜像...", "info")
-                sandbox_proc = subprocess.run(
-                    ["wsl", "-d", distro, "--", "docker", "pull", "kromiose/nekro-agent-sandbox"],
-                    capture_output=True, timeout=300,
-                    creationflags=self._creation_flags(),
-                )
-                if sandbox_proc.returncode != 0:
-                    self.log_received.emit("沙盒镜像拉取失败", "error")
-                    self.status_changed.emit("更新失败")
-                    return
-                self.log_received.emit("✓ 镜像拉取完成", "info")
 
                 # 重启服务
                 self.log_received.emit("重启服务...", "info")
@@ -950,10 +988,10 @@ default = root
                             info["napcat_token"] = token
                             self.config.set("deploy_info", info)
                             self.log_received.emit(f"[NapCat] 已捕获 WebUI Token: {token}", "info")
-                            # 如果有待显示的部署信息，现在显示
+                            # 首次部署等待 token 后弹窗
                             if hasattr(self, '_pending_deploy_info') and self._pending_deploy_info:
-                                env_content, deploy_mode = self._pending_deploy_info
-                                self._show_deploy_info(env_content, deploy_mode)
+                                self._pending_deploy_info["napcat_token"] = token
+                                self._show_deploy_info(self._pending_deploy_info)
                                 self._pending_deploy_info = None
 
         except Exception as e:
@@ -971,14 +1009,15 @@ default = root
     # ------------------------------------------------------------------ #
 
     def _health_check(self):
-        """轮询 http://localhost:8021 直到返回 200"""
+        """轮询 Nekro Agent 服务直到返回 200"""
+        nekro_port = self.config.get("nekro_port") or 8021
         timeout = 300
         start = time.time()
         interval = 2.0
 
         while time.time() - start < timeout and not self._stop_event.is_set():
             try:
-                resp = urlopen("http://localhost:8021", timeout=5)
+                resp = urlopen(f"http://localhost:{nekro_port}", timeout=5)
                 if resp.status == 200:
                     elapsed = time.time() - start
                     self.log_received.emit(f"服务已就绪！(耗时 {elapsed:.1f}s)", "info")
@@ -1029,9 +1068,27 @@ default = root
         encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
         self._wsl_exec(distro, f'echo "{encoded}" | base64 -d > "{wsl_path}"')
 
-    def _show_deploy_info(self, env_content, deploy_mode):
-        """部署成功后保存凭据并发送信号给 UI 弹窗"""
-        # 从 env 内容中提取关键信息
+    def _show_deploy_info(self, info):
+        """保存凭据并发送信号给 UI 弹窗"""
+        if self.config:
+            self.config.set("deploy_info", info)
+
+        self.log_received.emit("=== 部署完成！===", "info")
+        self.log_received.emit(f"管理员账号: admin | 密码: {info['admin_password']}", "info")
+        self.log_received.emit(f"Web 访问地址: http://127.0.0.1:{info['port']}", "info")
+
+        self.deploy_info_ready.emit(info)
+
+    def _refresh_deploy_info(self, info):
+        """非首次启动时静默刷新凭据（不弹窗），防止上次中途退出丢失"""
+        if self.config:
+            old_info = self.config.get("deploy_info") or {}
+            if old_info.get("napcat_token"):
+                info["napcat_token"] = old_info["napcat_token"]
+            self.config.set("deploy_info", info)
+
+    def _parse_deploy_info(self, env_content, deploy_mode):
+        """从 .env 内容中解析部署凭据信息"""
         env_vars = {}
         for line in env_content.splitlines():
             line = line.strip()
@@ -1048,17 +1105,7 @@ default = root
         if deploy_mode == "napcat":
             info["napcat_port"] = env_vars.get("NAPCAT_EXPOSE_PORT", "6099")
 
-        # 保存到配置，支持后续再次查看
-        if self.config:
-            self.config.set("deploy_info", info)
-
-        # 日志也输出一份
-        self.log_received.emit("=== 部署完成！===", "info")
-        self.log_received.emit(f"管理员账号: admin | 密码: {info['admin_password']}", "info")
-        self.log_received.emit(f"Web 访问地址: http://127.0.0.1:{info['port']}", "info")
-
-        # 发信号给 UI 弹窗
-        self.deploy_info_ready.emit(info)
+        return info
 
     def _prepare_env(self, env_template_path, data_dir):
         """读取 env 模板文件，填充必要值，返回最终 .env 内容"""
@@ -1086,6 +1133,10 @@ default = root
                 new_lines.append(f"ONEBOT_ACCESS_TOKEN={self._random_token(32)}")
             elif key == "NEKRO_ADMIN_PASSWORD" and not value:
                 new_lines.append(f"NEKRO_ADMIN_PASSWORD={self._random_token(16)}")
+            elif key == "NEKRO_EXPOSE_PORT":
+                new_lines.append(f"NEKRO_EXPOSE_PORT={self.config.get('nekro_port') or 8021}")
+            elif key == "NAPCAT_EXPOSE_PORT":
+                new_lines.append(f"NAPCAT_EXPOSE_PORT={self.config.get('napcat_port') or 6099}")
             else:
                 new_lines.append(line)
 

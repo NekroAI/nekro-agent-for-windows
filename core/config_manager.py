@@ -27,6 +27,8 @@ class ConfigManager:
             "wsl_distro": "",        # 检测到的发行版名称
             "wsl_install_dir": "",   # WSL 发行版安装目录 (Windows 路径)
             "data_dir": "",          # WSL 内数据目录路径
+            "nekro_port": 8021,      # Nekro Agent 对外端口
+            "napcat_port": 6099,     # NapCat 对外端口
             "hyperv_vm_name": "NekroAgent",
             "hyperv_switch_name": "NekroAgentSwitch",
             "hyperv_nat_name": "NekroAgentNat",

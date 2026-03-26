@@ -23,6 +23,12 @@ class BackendBase(QObject):
         raise NotImplementedError
 
     @abstractmethod
+    def get_check_funcs(self):
+        """返回 4 个 callable 的列表，每个返回 (passed: bool, detail: str)。
+        按顺序对应: 运行时平台、运行环境、Docker、Docker Compose。"""
+        raise NotImplementedError
+
+    @abstractmethod
     def get_default_install_dir(self):
         raise NotImplementedError
 

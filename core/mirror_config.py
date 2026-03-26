@@ -1,8 +1,8 @@
 UBUNTU_CLOUD_IMAGE_URLS = [
-    "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cloud-images/releases/jammy/release-20240207/ubuntu-22.04-server-cloudimg-amd64.vhdx",
-    "https://mirrors.ustc.edu.cn/ubuntu-cloud-images/releases/jammy/release-20240207/ubuntu-22.04-server-cloudimg-amd64.vhdx",
-    "https://mirrors.sjtug.sjtu.edu.cn/ubuntu-cloud-images/releases/jammy/release-20240207/ubuntu-22.04-server-cloudimg-amd64.vhdx",
-    "https://cloud-images.ubuntu.com/releases/jammy/release-20240207/ubuntu-22.04-server-cloudimg-amd64.vhdx",
+    "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cloud-images/jammy/current/jammy-server-cloudimg-amd64-azure.vhd.tar.gz",
+    "https://mirrors.ustc.edu.cn/ubuntu-cloud-images/jammy/current/jammy-server-cloudimg-amd64-azure.vhd.tar.gz",
+    "https://mirror.sjtu.edu.cn/ubuntu-cloud-images/jammy/current/jammy-server-cloudimg-amd64-azure.vhd.tar.gz",
+    "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64-azure.vhd.tar.gz",
 ]
 
 APT_MIRROR_LINES = [

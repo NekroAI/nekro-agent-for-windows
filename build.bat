@@ -14,12 +14,16 @@ if errorlevel 1 (
 )
 
 echo.
-echo [2/5] 安装打包工具...
-pip install pyinstaller
+echo [2/5] 检查打包工具...
+python -m PyInstaller --version >nul 2>&1
 if errorlevel 1 (
-    echo 错误: PyInstaller 安装失败！
-    pause
-    exit /b 1
+    echo PyInstaller 未安装，正在安装...
+    pip install pyinstaller
+    if errorlevel 1 (
+        echo 错误: PyInstaller 安装失败！
+        pause
+        exit /b 1
+    )
 )
 
 echo.
@@ -31,7 +35,7 @@ echo 清理完成
 
 echo.
 echo [4/5] 打包为单文件 EXE...
-pyinstaller build.spec
+python -m PyInstaller build.spec
 if errorlevel 1 (
     echo 错误: 打包失败！
     pause

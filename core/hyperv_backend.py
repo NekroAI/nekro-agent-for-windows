@@ -46,77 +46,108 @@ class HyperVBackend(BackendBase):
             private_key=self.config.get("hyperv_ssh_key_path") or None,
         )
 
-    def check_environment(self):
-        cache_dir = self._runtime_cache_dir()
-        image_path = os.path.join(cache_dir, "ubuntu-hyperv.vhdx")
-        hyperv_enabled = self.manager.is_hyperv_enabled()
-        edition = self.manager.get_windows_edition() or "Unknown"
-        is_home = self.manager.is_home_edition()
-        management_available = self.manager.is_hyperv_management_available()
-        vm_exists = self.manager.vm_exists()
-        image_cached = os.path.exists(image_path)
-        key_ready = self._ssh_key_ready()
-        ssh_ready = False
-        docker_ready = False
-        compose_ready = False
+    def _emit_pull_progress(self, phase, message):
+        self.progress_updated.emit(f"__pull_progress__|{phase}|{message}")
 
-        self.log_received.emit(f"[环境检测] Windows 版本: {edition}", "info")
+    def get_check_funcs(self):
+        """返回 4 个检测步骤的 callable 列表，每个返回 (passed, detail)"""
+        ctx = {}
 
-        if hyperv_enabled:
-            self.log_received.emit("[环境检测] ✓ Hyper-V 已启用", "info")
-        elif is_home and self.manager.can_force_enable_on_home():
-            self.log_received.emit("[环境检测] ✗ Hyper-V 未启用，检测到家庭版，可尝试强制启用", "warning")
-        else:
-            self.log_received.emit("[环境检测] ✗ Hyper-V 未启用", "error")
+        def check_hyperv():
+            edition = self.manager.get_windows_edition() or "Unknown"
+            is_home = self.manager.is_home_edition()
+            self.log_received.emit(f"[环境检测] Windows 版本: {edition}", "info")
 
-        if management_available:
-            self.log_received.emit("[环境检测] ✓ Hyper-V 管理命令可用", "info")
-        else:
-            self.log_received.emit("[环境检测] ✗ Hyper-V 管理命令不可用", "warning")
+            hyperv_enabled = self.manager.is_hyperv_enabled()
+            management_available = self.manager.is_hyperv_management_available()
 
-        if image_cached:
-            self.log_received.emit("[环境检测] ✓ 已发现本地基础镜像缓存", "info")
-        else:
-            self.log_received.emit("[环境检测] 未发现本地基础镜像缓存，创建时会尝试下载", "warning")
-
-        if vm_exists:
-            self.log_received.emit(f"[环境检测] ✓ 虚拟机 {self.vm_name} 已存在", "info")
-        else:
-            self.log_received.emit(f"[环境检测] ✗ 虚拟机 {self.vm_name} 不存在", "warning")
-
-        if key_ready:
-            self.log_received.emit("[环境检测] ✓ SSH 密钥已准备", "info")
-        else:
-            self.log_received.emit("[环境检测] ✗ SSH 密钥未准备", "warning")
-
-        if hyperv_enabled and management_available and vm_exists and key_ready:
-            ssh_ready = self.wait_for_ssh_ready(timeout=12)
-            if ssh_ready:
-                self.log_received.emit("[环境检测] ✓ SSH 初始化已完成", "info")
-                docker_ready = self._guest_command_ok("docker info", timeout=30)
-                if docker_ready:
-                    self.log_received.emit("[环境检测] ✓ Docker 可用", "info")
-                    compose_ready = self._guest_command_ok("docker compose version", timeout=20)
-                    if compose_ready:
-                        self.log_received.emit("[环境检测] ✓ Docker Compose 可用", "info")
-                    else:
-                        self.log_received.emit("[环境检测] ✗ Docker Compose 不可用", "warning")
-                else:
-                    self.log_received.emit("[环境检测] ✗ Docker 不可用", "warning")
+            if hyperv_enabled:
+                self.log_received.emit("[环境检测] ✓ Hyper-V 已启用", "info")
+            elif is_home and self.manager.can_force_enable_on_home():
+                self.log_received.emit("[环境检测] ✗ Hyper-V 未启用，检测到家庭版，可尝试强制启用", "warning")
             else:
-                self.log_received.emit("[环境检测] ✗ SSH 尚未就绪", "warning")
+                self.log_received.emit("[环境检测] ✗ Hyper-V 未启用", "error")
 
-        all_ok = hyperv_enabled and management_available and vm_exists and ssh_ready and docker_ready and compose_ready
+            if management_available:
+                self.log_received.emit("[环境检测] ✓ Hyper-V 管理命令可用", "info")
+            else:
+                self.log_received.emit("[环境检测] ✗ Hyper-V 管理命令不可用", "warning")
+
+            ok = hyperv_enabled and management_available
+            ctx["hyperv"] = ok
+            detail = ""
+            if not ok and is_home and self.manager.can_force_enable_on_home():
+                detail = "家庭版可尝试强制启用"
+            return (ok, detail)
+
+        def check_vm():
+            cache_dir = self._runtime_cache_dir()
+            image_path = os.path.join(cache_dir, "ubuntu-hyperv.vhdx")
+            if os.path.exists(image_path):
+                self.log_received.emit("[环境检测] ✓ 已发现本地基础镜像缓存", "info")
+            else:
+                self.log_received.emit("[环境检测] 未发现本地基础镜像缓存，创建时会尝试下载", "warning")
+
+            vm_exists = self.manager.vm_exists()
+            if vm_exists:
+                self.log_received.emit(f"[环境检测] ✓ 虚拟机 {self.vm_name} 已存在", "info")
+                ctx["vm"] = True
+                return (True, self.vm_name)
+            self.log_received.emit(f"[环境检测] ✗ 虚拟机 {self.vm_name} 不存在", "warning")
+            return (False, "未创建")
+
+        def check_docker():
+            if not ctx.get("hyperv") or not ctx.get("vm"):
+                return (False, "")
+
+            key_ready = self._ssh_key_ready()
+            if key_ready:
+                self.log_received.emit("[环境检测] ✓ SSH 密钥已准备", "info")
+            else:
+                self.log_received.emit("[环境检测] ✗ SSH 密钥未准备", "warning")
+                return (False, "SSH 未就绪")
+
+            ssh_ready = self.wait_for_ssh_ready(timeout=12)
+            if not ssh_ready:
+                self.log_received.emit("[环境检测] ✗ SSH 尚未就绪", "warning")
+                return (False, "SSH 未就绪")
+
+            self.log_received.emit("[环境检测] ✓ SSH 初始化已完成", "info")
+            docker_ready = self._guest_command_ok("docker info", timeout=30)
+            if docker_ready:
+                self.log_received.emit("[环境检测] ✓ Docker 可用", "info")
+                ctx["docker"] = True
+                return (True, "SSH 已就绪")
+            self.log_received.emit("[环境检测] ✗ Docker 不可用", "warning")
+            return (False, "Docker 不可用")
+
+        def check_compose():
+            if not ctx.get("docker"):
+                return (False, "")
+            compose_ready = self._guest_command_ok("docker compose version", timeout=20)
+            if compose_ready:
+                self.log_received.emit("[环境检测] ✓ Docker Compose 可用", "info")
+                return (True, "")
+            self.log_received.emit("[环境检测] ✗ Docker Compose 不可用", "warning")
+            return (False, "")
+
+        return [check_hyperv, check_vm, check_docker, check_compose]
+
+    def check_environment(self):
+        funcs = self.get_check_funcs()
+        results = [func() for func in funcs]
+
+        all_ok = all(r[0] for r in results)
         if all_ok:
             self.log_received.emit("[环境检测] ✓ Hyper-V 运行环境已就绪", "info")
         else:
             self.log_received.emit("[环境检测] ✗ Hyper-V 运行环境未完成初始化", "warning")
 
         return {
-            "wsl_installed": hyperv_enabled and management_available,
-            "distro": self.vm_name if vm_exists else "",
-            "docker_available": ssh_ready and docker_ready,
-            "compose_available": compose_ready,
+            "wsl_installed": results[0][0],
+            "distro": results[1][1] if results[1][0] else "",
+            "docker_available": results[2][0],
+            "compose_available": results[3][0],
         }
 
     def get_default_install_dir(self):
@@ -145,16 +176,37 @@ class HyperVBackend(BackendBase):
             self.log_received.emit(f"[Hyper-V] 创建目录失败: {exc}", "error")
             return False
 
-        base_image = os.path.join(self._runtime_cache_dir(), "ubuntu-hyperv.vhdx")
-        if not os.path.exists(base_image):
+        base_image = os.path.join(self._runtime_cache_dir(), "ubuntu-hyperv.vhd")
+        base_vhdx = base_image.replace(".vhd", ".vhdx")
+        if not os.path.exists(base_image) and not os.path.exists(base_vhdx):
+            # 下载 VHD tar.gz 并解压
+            tar_path = base_image + ".tar.gz"
             fetcher = RuntimeImageFetcher(
                 UBUNTU_CLOUD_IMAGE_URLS,
                 log=self.log_received.emit,
                 progress=self.progress_updated.emit,
             )
-            if not fetcher.download(base_image):
+            if not fetcher.download(tar_path):
                 self.log_received.emit("[Hyper-V] 基础镜像下载失败", "error")
                 return False
+
+            self.progress_updated.emit("正在解压基础镜像...")
+            try:
+                import tarfile
+                with tarfile.open(tar_path, "r:gz") as tar:
+                    for member in tar.getmembers():
+                        if member.name.endswith(".vhd"):
+                            member.name = os.path.basename(base_image)
+                            tar.extract(member, path=os.path.dirname(base_image))
+                            break
+                    else:
+                        self.log_received.emit("[Hyper-V] tar.gz 中未找到 .vhd 文件", "error")
+                        return False
+                os.remove(tar_path)
+            except Exception as exc:
+                self.log_received.emit(f"[Hyper-V] 解压失败: {exc}", "error")
+                return False
+            self.log_received.emit("[Hyper-V] 基础镜像准备完成", "info")
 
         self.progress_updated.emit("准备 SSH 密钥...")
         key_path = self._ensure_ssh_keypair(install_dir)
@@ -235,11 +287,18 @@ class HyperVBackend(BackendBase):
             return self._launch_elevated("cmd.exe", command, packages_path, "已启动家庭版 Hyper-V 强制启用流程，完成后将在 60 秒后自动重启。")
 
         command = (
-            '/c powershell -NoProfile -ExecutionPolicy Bypass -Command '
-            '\\"Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V -All -NoRestart; '
-            'Enable-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -All -NoRestart; '
-            'bcdedit /set hypervisorlaunchtype auto; '
-            'shutdown /r /t 60 /c \'Hyper-V 启用完成，系统将在 60 秒后重启\'\\"'
+            '/k powershell -NoProfile -ExecutionPolicy Bypass -Command "'
+            'Write-Host \'正在启用 Hyper-V，请稍候...\' -ForegroundColor Cyan;'
+            'Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V -All -NoRestart;'
+            'Enable-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -All -NoRestart;'
+            'bcdedit /set hypervisorlaunchtype auto;'
+            'if ($?) {'
+            '  Write-Host \'Hyper-V 启用完成，系统将在 60 秒后重启...\' -ForegroundColor Green;'
+            '  shutdown /r /t 60 /c \'Hyper-V 启用完成，系统将在 60 秒后重启\';'
+            '} else {'
+            '  Write-Host \'启用过程中出现错误，请检查上方输出\' -ForegroundColor Red;'
+            '}'
+            '"'
         )
         return self._launch_elevated("cmd.exe", command, None, "已启动 Hyper-V 启用流程，完成后将在 60 秒后自动重启。")
 
@@ -308,19 +367,27 @@ class HyperVBackend(BackendBase):
                     env_content = self._guest_exec(f"cat {deploy_dir}/.env", timeout=20)
 
                 self.log_received.emit("[Hyper-V] 拉取 Docker 镜像...", "info")
+                self._emit_pull_progress("start", "准备拉取 Nekro Agent 镜像")
                 if not self._stream_guest_command(
                     f"cd {deploy_dir} && docker compose -f docker-compose.yml --env-file .env pull",
                     prefix="[镜像拉取]",
+                    progress_prefix="拉取中",
                 ):
+                    self._emit_pull_progress("error", "Nekro Agent 镜像拉取失败")
                     self.status_changed.emit("启动失败")
                     return
+                self._emit_pull_progress("stage", "Nekro Agent 镜像拉取完成")
 
+                self._emit_pull_progress("stage", "准备拉取沙盒镜像")
                 if not self._stream_guest_command(
                     "docker pull kromiose/nekro-agent-sandbox",
                     prefix="[沙盒镜像]",
+                    progress_prefix="拉取中",
                 ):
+                    self._emit_pull_progress("error", "沙盒镜像拉取失败")
                     self.status_changed.emit("启动失败")
                     return
+                self._emit_pull_progress("done", "镜像拉取完成")
 
                 self.log_received.emit("[Hyper-V] 启动 Compose 服务...", "info")
                 code, stdout, stderr = self.transport.exec(
@@ -379,16 +446,22 @@ class HyperVBackend(BackendBase):
                 if not self._stream_guest_command(
                     f"cd {deploy_dir} && docker compose -f docker-compose.yml pull nekro_agent",
                     prefix="[镜像拉取]",
+                    progress_prefix="拉取中",
                 ):
+                    self._emit_pull_progress("error", "Nekro Agent 镜像更新失败")
                     self.status_changed.emit("更新失败")
                     return
 
+                self._emit_pull_progress("stage", "准备更新沙盒镜像")
                 if not self._stream_guest_command(
                     "docker pull kromiose/nekro-agent-sandbox",
                     prefix="[沙盒镜像]",
+                    progress_prefix="拉取中",
                 ):
+                    self._emit_pull_progress("error", "沙盒镜像更新失败")
                     self.status_changed.emit("更新失败")
                     return
+                self._emit_pull_progress("done", "镜像更新完成")
 
                 code, stdout, stderr = self.transport.exec(
                     f"cd {deploy_dir} && docker compose -f docker-compose.yml --env-file .env up -d",
@@ -594,7 +667,7 @@ ethernets:
             with open(os.path.join(seed_dir, name), "w", encoding="utf-8", newline="\n") as fh:
                 fh.write(content)
 
-        seed_disk = os.path.join(install_dir, "cloud-init-seed.vhdx")
+        seed_disk = os.path.join(install_dir, "cloud-init-seed.iso")
         if not self.manager.create_seed_disk(seed_disk, seed_dir):
             self.log_received.emit("[Hyper-V] 生成 cloud-init 引导盘失败", "error")
             return ""
@@ -720,7 +793,7 @@ ethernets:
         self.log_received.emit(f"[Hyper-V] ✓ {desc}", "info")
         return True
 
-    def _stream_guest_command(self, command, prefix="", timeout=600):
+    def _stream_guest_command(self, command, prefix="", timeout=600, progress_prefix=""):
         args = [
             "ssh",
             *self.transport._base_args(),
@@ -742,7 +815,11 @@ ethernets:
                     break
                 line = proc.stdout.readline()
                 if line:
-                    self.log_received.emit(f"{prefix} {line.strip()}".strip(), "info")
+                    clean_line = line.strip()
+                    if progress_prefix:
+                        self._emit_pull_progress("update", clean_line)
+                    else:
+                        self.log_received.emit(f"{prefix} {clean_line}".strip(), "info")
                 if proc.poll() is not None:
                     break
                 if time.time() - started > timeout:

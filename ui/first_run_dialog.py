@@ -8,17 +8,18 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from ui.styles import STYLESHEET
 
 
-class EnvCheckThread(QThread):
-    """后台环境检测线程"""
-    finished = pyqtSignal(dict)
+class CheckStepThread(QThread):
+    """运行单个环境检测步骤"""
+    step_done = pyqtSignal(int, bool, str)
 
-    def __init__(self, backend):
+    def __init__(self, func, step_index):
         super().__init__()
-        self.backend = backend
+        self._func = func
+        self._step = step_index
 
     def run(self):
-        result = self.backend.check_environment()
-        self.finished.emit(result)
+        passed, detail = self._func()
+        self.step_done.emit(self._step, passed, detail)
 
 
 class CreateRuntimeThread(QThread):
@@ -39,12 +40,14 @@ class FirstRunDialog(QDialog):
     """首次运行向导对话框"""
 
     deploy_requested = pyqtSignal(str)  # 发出部署模式: "lite" 或 "napcat"
+    backend_changed = pyqtSignal(str)   # 用户选择了新后端: "wsl" 或 "hyperv"
 
     def __init__(self, backend, config, parent=None):
         super().__init__(parent)
         self.backend = backend
         self.config = config
         self.env_result = None
+        self._check_in_progress = False
 
         self.setWindowTitle("Nekro Agent 环境配置向导")
         self.resize(660, 560)
@@ -59,16 +62,20 @@ class FirstRunDialog(QDialog):
         self.stack = QStackedWidget()
         layout.addWidget(self.stack)
 
-        self._init_check_page()       # 页面 0: 环境检测
-        self._init_create_page()      # 页面 1: 创建运行环境
-        self._init_select_page()      # 页面 2: 版本选择
-        self._init_datadir_page()     # 页面 3: 数据目录配置
+        self._init_backend_page()     # 页面 0: 后端选择
+        self._init_check_page()       # 页面 1: 环境检测
+        self._init_create_page()      # 页面 2: 创建运行环境
+        self._init_select_page()      # 页面 3: 版本选择
+        self._init_datadir_page()     # 页面 4: 数据目录配置
 
-        self.stack.setCurrentIndex(0)
-
-        self.backend.progress_updated.connect(self._on_progress)
-
-        # 启动检测
+        # 当前版本仅支持 WSL 后端，跳过后端选择页直接进入检测
+        if self.config:
+            self.config.set("backend", "wsl")
+            self.config.set("backend_selected", True)
+        self.stack.setCurrentIndex(1)
+        self._refresh_check_labels()
+        self._refresh_backend_texts()
+        self._connect_backend_signals()
         self._start_check()
 
     def _show_notice_dialog(self, title, text, button_text="确定", danger=False):
@@ -112,7 +119,121 @@ class FirstRunDialog(QDialog):
         dialog.exec()
 
     # ------------------------------------------------------------------ #
-    #  页面 0：环境检测
+    #  页面 0：后端选择
+    # ------------------------------------------------------------------ #
+
+    def _init_backend_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(20)
+
+        title = QLabel("选择运行环境")
+        title.setStyleSheet("font-size: 22px; font-weight: bold; color: #24292f;")
+        title.setWordWrap(True)
+        layout.addWidget(title)
+
+        desc = QLabel("请选择 Nekro Agent 的运行后端：")
+        desc.setStyleSheet("font-size: 14px; color: #57606a;")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        self.card_wsl = self._create_backend_card(
+            "WSL2",
+            "使用 Windows Subsystem for Linux 2\n推荐大多数用户使用，配置简单、资源占用低",
+            "wsl",
+        )
+        layout.addWidget(self.card_wsl)
+
+        self.card_hyperv = self._create_backend_card(
+            "Hyper-V",
+            "使用 Hyper-V 虚拟机\n隔离性更强，适合高级用户（需要 Windows Pro 或更高版本）",
+            "hyperv",
+        )
+        layout.addWidget(self.card_hyperv)
+
+        layout.addStretch()
+        self.stack.addWidget(page)
+
+    def _create_backend_card(self, title, desc, backend_key):
+        card = QPushButton()
+        card.setCursor(Qt.CursorShape.PointingHandCursor)
+        card.setMinimumHeight(104)
+        card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        card.setStyleSheet(
+            "QPushButton { background-color: #ffffff; border: 2px solid #d0d7de; "
+            "border-radius: 10px; padding: 15px 20px; }"
+            "QPushButton:hover { border-color: #0969da; background-color: #f6f8fa; }"
+        )
+
+        inner = QVBoxLayout(card)
+        inner.setContentsMargins(0, 0, 0, 0)
+        inner.setSpacing(4)
+        inner.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        lbl_title = QLabel(title)
+        lbl_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl_title.setWordWrap(True)
+        lbl_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #24292f; "
+                                "background: transparent; border: none;")
+        lbl_title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        lbl_desc = QLabel(desc)
+        lbl_desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl_desc.setWordWrap(True)
+        lbl_desc.setStyleSheet("font-size: 12px; color: #57606a; "
+                               "background: transparent; border: none;")
+        lbl_desc.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+        inner.addWidget(lbl_title)
+        inner.addWidget(lbl_desc)
+
+        card.clicked.connect(lambda: self._select_backend(backend_key))
+        return card
+
+    def _select_backend(self, backend_key):
+        if self.config:
+            self.config.set("backend", backend_key)
+            self.config.set("backend_selected", True)
+        self.backend_changed.emit(backend_key)
+        # 刷新检测页标签和创建页/数据目录页文字（后端已由 MainWindow 替换）
+        self._refresh_check_labels()
+        self._refresh_backend_texts()
+        self.stack.setCurrentIndex(1)
+        self._connect_backend_signals()
+        self._start_check()
+
+    def _refresh_check_labels(self):
+        """根据当前后端刷新环境检测页的检测项文字"""
+        labels = self._check_item_labels()
+        for lbl, name in zip(
+            [self.lbl_wsl, self.lbl_distro, self.lbl_docker, self.lbl_compose],
+            labels,
+        ):
+            lbl.setProperty("check_name", name)
+            lbl.setText(f"⏳  {name}")
+            lbl.setStyleSheet("font-size: 15px; color: #57606a; padding: 5px 0;")
+
+    def _refresh_backend_texts(self):
+        """根据当前后端刷新创建页和数据目录页中的动态文字"""
+        name = self.backend.display_name
+        self.create_desc.setText(f"将下载 Ubuntu 并创建专用 {name} 运行环境，与系统已有环境互不影响。")
+        self.dir_edit.setText(self.backend.get_default_install_dir())
+        self.create_hint.setText(f"此目录将存放 {name} 运行时文件，建议预留 10GB 以上空间。")
+
+        sample_path = self.backend.get_host_access_path("/root/nekro_agent_data")
+        hint_text = "此目录位于运行环境内部。"
+        if sample_path:
+            hint_text += f" Windows 侧访问路径示例: {sample_path}"
+        self.datadir_hint.setText(hint_text)
+
+    def _connect_backend_signals(self):
+        self.backend.progress_updated.connect(self._on_progress)
+
+    def set_backend(self, backend):
+        """外部替换后端实例（由 MainWindow 在 backend_changed 时调用）"""
+        self.backend = backend
+
+    # ------------------------------------------------------------------ #
+    #  页面 1：环境检测
     # ------------------------------------------------------------------ #
 
     def _init_check_page(self):
@@ -195,18 +316,39 @@ class FirstRunDialog(QDialog):
             label.setStyleSheet("font-size: 15px; color: #cf222e; padding: 5px 0;")
 
     def _start_check(self):
-        self._check_thread = EnvCheckThread(self.backend)
-        self._check_thread.finished.connect(self._on_check_done)
-        self._check_thread.start()
+        self._check_in_progress = True
+        self._check_funcs = self.backend.get_check_funcs()
+        self._check_results = {}
+        self._run_check_step(0)
 
-    def _on_check_done(self, result):
-        self.env_result = result
+    def _run_check_step(self, step):
+        """启动第 step 步检测的子线程"""
+        if step >= len(self._check_funcs):
+            self._on_all_checks_done()
+            return
+        thread = CheckStepThread(self._check_funcs[step], step)
+        thread.step_done.connect(self._on_step_done)
+        self._current_step_thread = thread  # prevent GC
+        thread.start()
 
-        self._update_check_item(self.lbl_wsl, result["wsl_installed"])
-        self._update_check_item(self.lbl_distro, bool(result["distro"]),
-                                result["distro"] if result["distro"] else "未创建")
-        self._update_check_item(self.lbl_docker, result["docker_available"])
-        self._update_check_item(self.lbl_compose, result["compose_available"])
+    def _on_step_done(self, step, passed, detail):
+        """单步检测完成，更新 UI 后启动下一步"""
+        labels = [self.lbl_wsl, self.lbl_distro, self.lbl_docker, self.lbl_compose]
+        self._check_results[step] = (passed, detail)
+        self._update_check_item(labels[step], passed, detail)
+        self._run_check_step(step + 1)
+
+    def _on_all_checks_done(self):
+        """全部检测完成，更新描述文字和按钮状态"""
+        self._check_in_progress = False
+        r = self._check_results
+        self.env_result = {
+            "wsl_installed": r.get(0, (False, ""))[0],
+            "distro": r.get(1, (False, ""))[1] if r.get(1, (False, ""))[0] else "",
+            "docker_available": r.get(2, (False, ""))[0],
+            "compose_available": r.get(3, (False, ""))[0],
+        }
+        result = self.env_result
 
         all_ok = (result["wsl_installed"] and result["distro"]
                   and result["docker_available"] and result["compose_available"])
@@ -239,7 +381,7 @@ class FirstRunDialog(QDialog):
         mode = getattr(self, '_action_mode', None)
 
         if mode == "next":
-            self.stack.setCurrentIndex(2)
+            self.stack.setCurrentIndex(3)
             return
 
         if mode == "install_wsl":
@@ -261,7 +403,7 @@ class FirstRunDialog(QDialog):
             return
 
         if mode == "create_runtime":
-            self.stack.setCurrentIndex(1)
+            self.stack.setCurrentIndex(2)
             return
 
         if mode == "install_docker":
@@ -291,7 +433,7 @@ class FirstRunDialog(QDialog):
         self._start_check()
 
     # ------------------------------------------------------------------ #
-    #  页面 1：创建运行环境
+    #  页面 2：创建运行环境
     # ------------------------------------------------------------------ #
 
     def _init_create_page(self):
@@ -304,10 +446,11 @@ class FirstRunDialog(QDialog):
         title.setWordWrap(True)
         layout.addWidget(title)
 
-        desc = QLabel(f"将下载 Ubuntu 并创建专用 {self.backend.display_name} 运行环境，与系统已有环境互不影响。")
+        desc = QLabel("")
         desc.setStyleSheet("font-size: 13px; color: #57606a;")
         desc.setWordWrap(True)
         layout.addWidget(desc)
+        self.create_desc = desc
 
         # 安装目录
         lbl_dir = QLabel("安装目录:")
@@ -315,7 +458,7 @@ class FirstRunDialog(QDialog):
         layout.addWidget(lbl_dir)
 
         dir_box = QHBoxLayout()
-        self.dir_edit = QLineEdit(self.backend.get_default_install_dir())
+        self.dir_edit = QLineEdit("")
         self.dir_edit.setStyleSheet(
             "padding: 8px; border: 1px solid #d0d7de; border-radius: 6px; "
             "background: white; font-size: 13px;"
@@ -330,10 +473,11 @@ class FirstRunDialog(QDialog):
         dir_box.addWidget(btn_browse)
         layout.addLayout(dir_box)
 
-        hint = QLabel(f"此目录将存放 {self.backend.display_name} 运行时文件，建议预留 10GB 以上空间。")
+        hint = QLabel("")
         hint.setStyleSheet("font-size: 12px; color: #8b949e;")
         hint.setWordWrap(True)
         layout.addWidget(hint)
+        self.create_hint = hint
 
         # 进度条
         self.create_progress = QProgressBar()
@@ -367,7 +511,7 @@ class FirstRunDialog(QDialog):
             "border-radius: 6px; font-size: 14px; font-weight: 600; }"
             "QPushButton:hover { background-color: #e8e9eb; }"
         )
-        self.btn_back.clicked.connect(lambda: self.stack.setCurrentIndex(0))
+        self.btn_back.clicked.connect(lambda: self.stack.setCurrentIndex(1))
         btn_box.addWidget(self.btn_back)
 
         btn_box.addStretch()
@@ -415,7 +559,7 @@ class FirstRunDialog(QDialog):
     def _on_progress(self, text):
         """接收 wsl_manager.progress_updated 信号"""
         # 检查当前是否在创建页面（页面 1）
-        if self.stack.currentIndex() == 1:
+        if self.stack.currentIndex() == 2:
             self.lbl_progress.setText(text)
             return
 
@@ -442,12 +586,12 @@ class FirstRunDialog(QDialog):
             self.lbl_progress.setText("环境创建完成！")
             self.lbl_progress.setStyleSheet("font-size: 13px; color: #2da44e; margin-top: 8px;")
             # 直接跳到版本选择页
-            self.stack.setCurrentIndex(2)
+            self.stack.setCurrentIndex(3)
         else:
             self.lbl_progress.setStyleSheet("font-size: 13px; color: #cf222e; margin-top: 8px;")
 
     # ------------------------------------------------------------------ #
-    #  页面 2：版本选择
+    #  页面 3：版本选择
     # ------------------------------------------------------------------ #
 
     def _init_select_page(self):
@@ -520,10 +664,10 @@ class FirstRunDialog(QDialog):
         self._selected_mode = mode
         if self.config:
             self.config.set("deploy_mode", mode)
-        self.stack.setCurrentIndex(3)  # 跳转到数据目录配置页
+        self.stack.setCurrentIndex(4)  # 跳转到数据目录配置页
 
     # ------------------------------------------------------------------ #
-    #  页面 3：数据目录配置
+    #  页面 4：数据目录配置
     # ------------------------------------------------------------------ #
 
     def _init_datadir_page(self):
@@ -561,6 +705,40 @@ class FirstRunDialog(QDialog):
         hint.setStyleSheet("font-size: 12px; color: #8b949e;")
         hint.setWordWrap(True)
         layout.addWidget(hint)
+        self.datadir_hint = hint
+
+        # 端口配置
+        lbl_ports = QLabel("端口配置:")
+        lbl_ports.setStyleSheet("font-size: 14px; font-weight: 600; color: #24292f; margin-top: 10px;")
+        layout.addWidget(lbl_ports)
+
+        port_row1 = QHBoxLayout()
+        port_row1.addWidget(QLabel("Nekro Agent 端口:"))
+        self.nekro_port_edit = QLineEdit(str(self.config.get("nekro_port") or 8021))
+        self.nekro_port_edit.setFixedWidth(100)
+        self.nekro_port_edit.setStyleSheet(
+            "padding: 6px; border: 1px solid #d0d7de; border-radius: 6px; "
+            "background: white; font-size: 13px;"
+        )
+        port_row1.addWidget(self.nekro_port_edit)
+        port_row1.addStretch()
+        layout.addLayout(port_row1)
+
+        port_row2 = QHBoxLayout()
+        port_row2.addWidget(QLabel("NapCat 端口:"))
+        self.napcat_port_edit = QLineEdit(str(self.config.get("napcat_port") or 6099))
+        self.napcat_port_edit.setFixedWidth(100)
+        self.napcat_port_edit.setStyleSheet(
+            "padding: 6px; border: 1px solid #d0d7de; border-radius: 6px; "
+            "background: white; font-size: 13px;"
+        )
+        port_row2.addWidget(self.napcat_port_edit)
+        port_row2.addStretch()
+        layout.addLayout(port_row2)
+
+        port_hint = QLabel("如无特殊需求保持默认即可。端口冲突时可修改。")
+        port_hint.setStyleSheet("font-size: 12px; color: #8b949e;")
+        layout.addWidget(port_hint)
 
         layout.addStretch()
 
@@ -576,7 +754,7 @@ class FirstRunDialog(QDialog):
             "border-radius: 6px; font-size: 14px; font-weight: 600; }"
             "QPushButton:hover { background-color: #e8e9eb; }"
         )
-        btn_back.clicked.connect(lambda: self.stack.setCurrentIndex(2))
+        btn_back.clicked.connect(lambda: self.stack.setCurrentIndex(3))
         btn_box.addWidget(btn_back)
 
         btn_box.addStretch()
@@ -601,8 +779,21 @@ class FirstRunDialog(QDialog):
         if not data_dir:
             self._show_notice_dialog("提示", "请指定数据目录")
             return
+
+        # 校验端口
+        try:
+            nekro_port = int(self.nekro_port_edit.text().strip())
+            napcat_port = int(self.napcat_port_edit.text().strip())
+            if not (1 <= nekro_port <= 65535) or not (1 <= napcat_port <= 65535):
+                raise ValueError
+        except ValueError:
+            self._show_notice_dialog("提示", "端口号必须为 1-65535 之间的整数")
+            return
+
         if self.config:
             self.config.set("data_dir", data_dir)
+            self.config.set("nekro_port", nekro_port)
+            self.config.set("napcat_port", napcat_port)
             self.config.set("first_run", False)
         self.deploy_requested.emit(self._selected_mode)
         self.accept()
