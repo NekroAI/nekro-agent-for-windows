@@ -292,6 +292,15 @@ class MainWindow(QMainWindow):
 
     def _on_deploy_mode_selected(self, mode):
         self._is_first_deploy = True
+        # 向导里可能更新了端口，同步刷新 browser_urls 和设置页输入框
+        nekro_port = self.config.get("nekro_port") or 8021
+        napcat_port = self.config.get("napcat_port") or 6099
+        self.browser_urls["nekro"] = f"http://localhost:{nekro_port}"
+        self.browser_urls["napcat"] = f"http://localhost:{napcat_port}"
+        if hasattr(self, "nekro_port_setting"):
+            self.nekro_port_setting.setText(str(nekro_port))
+        if hasattr(self, "napcat_port_setting"):
+            self.napcat_port_setting.setText(str(napcat_port))
         self.refresh_dashboard()
         self.start_deploy()
 
@@ -944,8 +953,12 @@ class MainWindow(QMainWindow):
                     deploy_info["port"] = str(nekro_port)
                     deploy_info["napcat_port"] = str(napcat_port)
                     self.config.set("deploy_info", deploy_info)
-                # 刷新内置浏览器当前页地址栏和 WebView
-                self._set_browser_target(self.current_browser_target, force_reload=False)
+                # 刷新内置浏览器地址栏（强制更新 URL，不依赖 is_running 状态）
+                target_url = self._target_url(self.current_browser_target)
+                if hasattr(self, "browser_url_label"):
+                    self.browser_url_label.setText(f"当前地址: {target_url}")
+                if getattr(self.backend, "is_running", False) and hasattr(self, "webview"):
+                    self.webview.setUrl(QUrl(target_url))
         except ValueError:
             pass
 
