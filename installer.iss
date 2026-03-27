@@ -23,6 +23,8 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 UsePreviousAppDir=no
 CloseApplications=yes
 RestartApplications=yes
+ArchitecturesInstallIn64BitMode=x64compatible
+ArchitecturesAllowed=x64compatible
 
 [Languages]
 Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
