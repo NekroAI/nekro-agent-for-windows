@@ -842,7 +842,7 @@ default = root
 
                 # 关闭 NekroAgent 发行版
                 self.log_received.emit(f"关闭 {distro} 发行版...", "info")
-                subprocess.run(["wsl", "--terminate", distro], capture_output=True, timeout=30)
+                subprocess.run(["wsl", "--terminate", distro], capture_output=True, timeout=30, creationflags=self._creation_flags())
                 self.log_received.emit(f"{distro} 已关闭", "info")
             except subprocess.TimeoutExpired:
                 self.log_received.emit("停止服务超时", "warn")
@@ -1149,7 +1149,7 @@ default = root
 
     @staticmethod
     def _creation_flags():
-        """返回 Windows 平台的进程创建标志"""
-        if sys.platform == "win32":
-            return subprocess.CREATE_NO_WINDOW
+        """返回 Windows 平台的进程创建标志，打包后隐藏控制台窗口"""
+        if sys.platform == "win32" and getattr(sys, 'frozen', False):
+            return 0x08000000  # CREATE_NO_WINDOW
         return 0

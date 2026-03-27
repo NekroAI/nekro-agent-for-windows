@@ -39,10 +39,3 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "启动 {#MyAppName}"; Flags: nowait postinstall skipifsilent
-
-[UninstallDelete]
-Type: files; Name: "{app}\config.json"
-Type: files; Name: "{app}\debug.log"
-Type: files; Name: "{app}\*.log"
-Type: filesandordirs; Name: "{app}\_internal"
-Type: dirifempty; Name: "{app}"

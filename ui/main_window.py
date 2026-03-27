@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QStackedWidget,
     QSystemTrayIcon,
     QTextEdit,
@@ -818,15 +819,16 @@ class MainWindow(QMainWindow):
         card_layout.addWidget(self.browser_hint)
 
         self.webview = QWebEngineView()
-        self.webview.setMinimumHeight(560)
+        self.webview.setMinimumHeight(200)
+        self.webview.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.webview.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self.webview.setAutoFillBackground(True)
         self.webview.setStyleSheet("background: #f4f7fb; border: 1px solid #dfe7ef; border-radius: 8px;")
         self.webview.page().setBackgroundColor(QColor("#f4f7fb"))
-        card_layout.addWidget(self.webview)
+        card_layout.addWidget(self.webview, 1)
 
-        layout.addWidget(card)
-        layout.addStretch()
+        card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        layout.addWidget(card, 1)
         self._set_browser_target("nekro")
         self._add_page(page)
 
