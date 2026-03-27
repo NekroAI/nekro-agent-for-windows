@@ -8,9 +8,7 @@ a = Analysis(
     binaries=[],
     datas=[
         ('assets', 'assets'),
-        ('env', '.'),
-        ('docker-compose_with_napcat.yml', '.'),
-        ('docker-compose_withnot_napcat.yml', '.'),
+        ('data', 'data'),
     ],
     hiddenimports=[],
     hookspath=[],

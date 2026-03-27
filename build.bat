@@ -58,7 +58,7 @@ echo ========================================
 echo   打包完成！
 echo ========================================
 echo.
-echo 单文件 EXE: dist\NekroAgent.exe
+echo 输出目录: dist\NekroAgent\
 echo 安装包将生成在: installer\NekroAgent-Setup.exe
 echo.
 pause

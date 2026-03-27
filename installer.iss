@@ -20,7 +20,7 @@ PrivilegesRequired=admin
 PrivilegesRequiredOverridesAllowed=dialog
 UninstallDisplayIcon={app}\{#MyAppExeName}
 ; 支持覆盖安装/升级
-UsePreviousAppDir=yes
+UsePreviousAppDir=no
 CloseApplications=yes
 RestartApplications=yes
 
@@ -31,7 +31,8 @@ Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.i
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加图标:"
 
 [Files]
-Source: "dist\NekroAgent\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist\NekroAgent\NekroAgent.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\NekroAgent\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

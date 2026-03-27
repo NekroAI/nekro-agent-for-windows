@@ -706,8 +706,8 @@ default = root
         else:
             compose_file = "docker-compose_withnot_napcat.yml"
 
-        compose_src = os.path.join(self.base_path, compose_file)
-        env_src = os.path.join(self.base_path, "env")
+        compose_src = os.path.join(self.base_path, "data", compose_file)
+        env_src = os.path.join(self.base_path, "data", "env")
 
         if not os.path.exists(compose_src):
             self.log_received.emit(f"Compose 文件不存在: {compose_src}", "error")
