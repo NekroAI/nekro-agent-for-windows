@@ -143,11 +143,33 @@ class MainWindow(QMainWindow):
 
         sidebar_layout.addStretch()
 
-        footnote = QLabel('<a href="https://github.com/KroMiose/nekro-agent" style="color:#8b949e;text-decoration:none;">KroMiose/nekro-agent</a>')
-        footnote.setObjectName("SidebarFootnote")
-        footnote.setWordWrap(True)
-        footnote.setOpenExternalLinks(True)
-        sidebar_layout.addWidget(footnote)
+        footer_row = QHBoxLayout()
+        footer_row.setSpacing(8)
+
+        btn_repo = QPushButton("⌂")
+        btn_repo.setToolTip("主仓库: KroMiose/nekro-agent")
+        btn_repo.setFixedSize(32, 32)
+        btn_repo.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_repo.setStyleSheet(
+            "QPushButton { background: transparent; color: #57606a; font-size: 18px; border: none; border-radius: 6px; }"
+            "QPushButton:hover { background: #f0f2f4; color: #24292f; }"
+        )
+        btn_repo.clicked.connect(lambda: webbrowser.open("https://github.com/KroMiose/nekro-agent"))
+        footer_row.addWidget(btn_repo)
+
+        btn_feedback = QPushButton("✉")
+        btn_feedback.setToolTip("反馈问题")
+        btn_feedback.setFixedSize(32, 32)
+        btn_feedback.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_feedback.setStyleSheet(
+            "QPushButton { background: transparent; color: #57606a; font-size: 18px; border: none; border-radius: 6px; }"
+            "QPushButton:hover { background: #f0f2f4; color: #24292f; }"
+        )
+        btn_feedback.clicked.connect(lambda: webbrowser.open("https://github.com/NekroAI/nekro-agent-for-windows/issues/new"))
+        footer_row.addWidget(btn_feedback)
+
+        footer_row.addStretch()
+        sidebar_layout.addLayout(footer_row)
 
         root_layout.addWidget(self.sidebar)
 
