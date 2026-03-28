@@ -47,7 +47,7 @@ def get_resource_path(relative_path):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Nekro Agent 管理")
+        self.setWindowTitle("Nekro Agent 启动器")
         self.resize(1220, 820)
         self.setMinimumSize(880, 620)
         self.setStyleSheet(STYLESHEET)
