@@ -467,6 +467,9 @@ default = root
 
     def _download_rootfs(self, dest_path):
         """下载 Ubuntu rootfs，返回是否成功"""
+        from urllib.error import HTTPError, URLError
+        import socket
+        last_error = ""
         for url in ROOTFS_URLS:
             try:
                 self.progress_updated.emit("正在下载 Ubuntu rootfs...")
@@ -499,10 +502,29 @@ default = root
                 self.progress_updated.emit("下载完成")
                 return True
 
+            except HTTPError as e:
+                last_error = f"HTTP {e.code} {e.reason}（{url}）"
+                self.install_error.emit(f"下载源返回错误: {last_error}，尝试下一个源...")
+            except URLError as e:
+                reason = str(e.reason)
+                if isinstance(e.reason, socket.timeout) or "timed out" in reason.lower():
+                    last_error = f"连接超时（{url}）"
+                elif "Name or service not known" in reason or "getaddrinfo" in reason:
+                    last_error = f"DNS 解析失败，请检查网络连接（{url}）"
+                elif "Connection refused" in reason:
+                    last_error = f"连接被拒绝（{url}）"
+                else:
+                    last_error = f"网络错误: {reason}（{url}）"
+                self.install_error.emit(f"{last_error}，尝试下一个源...")
+            except OSError as e:
+                last_error = f"磁盘写入失败: {e}"
+                self.install_error.emit(last_error)
+                return False
             except Exception as e:
-                self.progress_updated.emit(f"下载失败: {e}，尝试下一个源...")
-                continue
+                last_error = str(e)
+                self.install_error.emit(f"下载异常: {last_error}，尝试下一个源...")
 
+        self.install_error.emit(f"所有下载源均失败，最后错误: {last_error}")
         self.progress_updated.emit("所有下载源均失败")
         return False
 
@@ -514,15 +536,21 @@ default = root
 
         def _run_step(cmd, desc, timeout=300):
             """执行一个安装步骤，返回是否成功"""
-            proc = subprocess.run(
-                ["wsl", "-d", distro, "--", "bash", "-c", cmd],
-                capture_output=True, timeout=timeout,
-                creationflags=self._creation_flags(),
-            )
+            try:
+                proc = subprocess.run(
+                    ["wsl", "-d", distro, "--", "bash", "-c", cmd],
+                    capture_output=True, timeout=timeout,
+                    creationflags=self._creation_flags(),
+                )
+            except subprocess.TimeoutExpired:
+                self.install_error.emit(f"{desc} 超时（>{timeout}s），请检查网络或磁盘")
+                return False
             if proc.returncode != 0:
+                stderr = self._clean_stderr(proc.stderr)
                 self.log_received.emit(f"[Docker 安装] ✗ {desc}失败", "error")
                 self.log_received.emit(f"[DEBUG] 返回码: {proc.returncode}", "error")
-                self.log_received.emit(f"[DEBUG] STDERR: {self._clean_stderr(proc.stderr)}", "error")
+                self.log_received.emit(f"[DEBUG] STDERR: {stderr}", "error")
+                self.install_error.emit(f"{desc}失败（返回码 {proc.returncode}）: {stderr[:200]}")
                 return False
             return True
 

@@ -9,6 +9,7 @@ class BackendBase(QObject):
     boot_finished = pyqtSignal()
     progress_updated = pyqtSignal(str)
     deploy_info_ready = pyqtSignal(dict)
+    install_error = pyqtSignal(str)  # 安装过程中的具体错误信息
 
     backend_key = ""
     display_name = ""

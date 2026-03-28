@@ -191,6 +191,12 @@ class FirstRunDialog(QDialog):
 
     def _connect_backend_signals(self):
         self.backend.progress_updated.connect(self._on_progress)
+        self.backend.install_error.connect(self._on_install_error)
+
+    def _on_install_error(self, message):
+        if hasattr(self, "lbl_error"):
+            self.lbl_error.setText(message)
+            self.lbl_error.setVisible(True)
 
     def set_backend(self, backend):
         """外部替换后端实例（由 MainWindow 在 backend_changed 时调用）"""
@@ -458,8 +464,17 @@ class FirstRunDialog(QDialog):
         self.lbl_progress = QLabel("")
         self.lbl_progress.setStyleSheet("font-size: 13px; color: #0969da; margin-top: 8px;")
         self.lbl_progress.setWordWrap(True)
-        self.lbl_progress.setWordWrap(True)
         layout.addWidget(self.lbl_progress)
+
+        # 错误详情文本
+        self.lbl_error = QLabel("")
+        self.lbl_error.setStyleSheet(
+            "font-size: 12px; color: #cf222e; background: #fff0f0; border: 1px solid #ffcdd2; "
+            "border-radius: 6px; padding: 8px; margin-top: 4px;"
+        )
+        self.lbl_error.setWordWrap(True)
+        self.lbl_error.setVisible(False)
+        layout.addWidget(self.lbl_error)
 
         layout.addStretch()
 
@@ -547,12 +562,14 @@ class FirstRunDialog(QDialog):
         self.create_progress.setVisible(False)
 
         if success:
+            self.lbl_error.setVisible(False)
             self.lbl_progress.setText("环境创建完成！")
             self.lbl_progress.setStyleSheet("font-size: 13px; color: #2da44e; margin-top: 8px;")
             # 直接跳到版本选择页
             self.stack.setCurrentIndex(3)
         else:
             self.lbl_progress.setStyleSheet("font-size: 13px; color: #cf222e; margin-top: 8px;")
+            self.lbl_progress.setText("环境创建失败，请查看上方错误详情后重试。")
 
     # ------------------------------------------------------------------ #
     #  页面 3：版本选择
