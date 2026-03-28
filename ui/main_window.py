@@ -894,9 +894,8 @@ class MainWindow(QMainWindow):
 
         card_layout.addWidget(QLabel("数据目录 (运行环境内路径)"))
         datadir_box = QHBoxLayout()
-        self.datadir_edit = QLineEdit(self.config.get("data_dir") or "/root/nekro_agent_data")
-        self.datadir_edit.setPlaceholderText("/root/nekro_agent_data")
-        self.datadir_edit.editingFinished.connect(self._save_data_dir)
+        self.datadir_edit = QLineEdit("/root/nekro_agent_data")
+        self.datadir_edit.setReadOnly(True)
         datadir_box.addWidget(self.datadir_edit)
 
         btn_open_datadir = QPushButton("打开目录")
@@ -933,11 +932,6 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         self._add_page(page)
 
-    def _save_data_dir(self):
-        self.config.set("data_dir", self.datadir_edit.text().strip())
-        self._refresh_datadir_hint()
-        self.refresh_dashboard()
-
     def _save_ports(self):
         try:
             nekro_port = int(self.nekro_port_setting.text().strip())
@@ -963,7 +957,7 @@ class MainWindow(QMainWindow):
             pass
 
     def _refresh_datadir_hint(self):
-        sample_path = self.backend.get_host_access_path(self.datadir_edit.text().strip() or "/root/nekro_agent_data")
+        sample_path = self.backend.get_host_access_path("/root/nekro_agent_data")
         if sample_path:
             self.datadir_hint.setText(f"宿主机可访问路径: {sample_path}")
         else:
@@ -977,7 +971,7 @@ class MainWindow(QMainWindow):
         self._show_notice_dialog("提示", "后端已切换，重启应用后生效。")
 
     def _open_datadir_in_explorer(self):
-        data_dir = self.datadir_edit.text().strip() or "/root/nekro_agent_data"
+        data_dir = "/root/nekro_agent_data"
         win_path = self.backend.get_host_access_path(data_dir)
         if not win_path:
             self._show_notice_dialog("提示", f"当前后端 {self.backend.display_name} 暂不支持直接打开宿主机路径。")

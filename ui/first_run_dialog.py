@@ -184,9 +184,9 @@ class FirstRunDialog(QDialog):
         self.create_hint.setText(f"此目录将存放 {name} 运行时文件，建议预留 10GB 以上空间。")
 
         sample_path = self.backend.get_host_access_path("/root/nekro_agent_data")
-        hint_text = "此目录位于运行环境内部。"
+        hint_text = "此目录位于运行环境内部（固定路径，不可修改）。"
         if sample_path:
-            hint_text += f" Windows 侧访问路径示例: {sample_path}"
+            hint_text += f" Windows 侧访问路径: {sample_path}"
         self.datadir_hint.setText(hint_text)
 
     def _connect_backend_signals(self):
@@ -656,15 +656,16 @@ class FirstRunDialog(QDialog):
         self.datadir_edit = QLineEdit("/root/nekro_agent_data")
         self.datadir_edit.setStyleSheet(
             "padding: 8px; border: 1px solid #d0d7de; border-radius: 6px; "
-            "background: white; font-size: 13px;"
+            "background: #f6f8fa; color: #57606a; font-size: 13px;"
         )
         self.datadir_edit.setMinimumWidth(260)
+        self.datadir_edit.setReadOnly(True)
         layout.addWidget(self.datadir_edit)
 
         sample_path = self.backend.get_host_access_path("/root/nekro_agent_data")
-        hint_text = "此目录位于运行环境内部。"
+        hint_text = "此目录位于运行环境内部（固定路径，不可修改）。"
         if sample_path:
-            hint_text += f" Windows 侧访问路径示例: {sample_path}"
+            hint_text += f" Windows 侧访问路径: {sample_path}"
         hint = QLabel(hint_text)
         hint.setStyleSheet("font-size: 12px; color: #8b949e;")
         hint.setWordWrap(True)
@@ -739,10 +740,7 @@ class FirstRunDialog(QDialog):
         self.stack.addWidget(page)
 
     def _confirm_datadir(self):
-        data_dir = self.datadir_edit.text().strip()
-        if not data_dir:
-            self._show_notice_dialog("提示", "请指定数据目录")
-            return
+        data_dir = "/root/nekro_agent_data"
 
         # 校验端口
         try:

@@ -715,18 +715,8 @@ default = root
 
         def _deploy():
             try:
-                # 获取 WSL 内 home 目录
-                wsl_home = self._wsl_exec(distro, "echo $HOME").strip()
-                if not wsl_home:
-                    wsl_home = "/root"
-                deploy_dir = f"{wsl_home}/nekro_agent"
-
-                # 优先使用用户配置的数据目录
-                data_dir = None
-                if self.config:
-                    data_dir = self.config.get("data_dir")
-                if not data_dir:
-                    data_dir = f"{wsl_home}/nekro_agent_data"
+                deploy_dir = "/root/nekro_agent"
+                data_dir = "/root/nekro_agent_data"
 
                 # 在 WSL 内创建部署目录
                 self._wsl_exec(distro, f"mkdir -p {deploy_dir}")
