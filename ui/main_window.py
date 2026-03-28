@@ -62,6 +62,10 @@ class MainWindow(QMainWindow):
         self._pull_layer_order = []  # 保持 docker pull 输出的原始顺序
         self._pull_events = []
         self._pull_header = ""
+        self._pull_spinner_idx = 0
+        self._pull_spinner_timer = QTimer(self)
+        self._pull_spinner_timer.timeout.connect(self._tick_pull_spinner)
+        self._pull_active = False
         self.browser_urls = {
             "nekro": f"http://localhost:{self.config.get('nekro_port') or 8021}",
             "napcat": f"http://localhost:{self.config.get('napcat_port') or 6099}",
@@ -358,6 +362,8 @@ class MainWindow(QMainWindow):
             self.pull_view_frame.setVisible(visible)
 
     # layer 状态对应颜色
+    _SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
     _LAYER_STATUS_COLOR = {
         "Waiting":           "#57606a",
         "Pulling fs layer":  "#57606a",
@@ -369,40 +375,84 @@ class MainWindow(QMainWindow):
         "Already exists":   "#8b949e",
     }
 
+    _LAYER_STATUS_ICON = {
+        "Waiting":           "○",
+        "Pulling fs layer":  "○",
+        "Downloading":       "↓",
+        "Verifying":         "~",
+        "Extracting":        "⚡",
+        "Download complete": "✓",
+        "Pull complete":     "✓",
+        "Already exists":    "✓",
+    }
+
     def _layer_color(self, status):
         for key, color in self._LAYER_STATUS_COLOR.items():
             if status.startswith(key):
                 return color
         return "#cccccc"
 
+    def _layer_icon(self, status):
+        for key, icon in self._LAYER_STATUS_ICON.items():
+            if status.startswith(key):
+                return icon
+        return "·"
+
+    def _layer_progress(self, status):
+        """从 Downloading 状态行提取进度百分比字符串，如 '34%'"""
+        m = re.search(r'(\d+\.?\d*)\s*MB/(\d+\.?\d*)\s*MB', status)
+        if m:
+            done, total = float(m.group(1)), float(m.group(2))
+            if total > 0:
+                pct = int(done * 100 / total)
+                return f"{pct}%"
+        m = re.search(r'(\d+)%', status)
+        if m:
+            return f"{m.group(1)}%"
+        return ""
+
+    def _tick_pull_spinner(self):
+        self._pull_spinner_idx = (self._pull_spinner_idx + 1) % len(self._SPINNER_FRAMES)
+        self._render_pull_view()
+
     def _render_pull_view(self):
         if not hasattr(self, "pull_viewer"):
             return
+
+        spinner = self._SPINNER_FRAMES[self._pull_spinner_idx] if self._pull_active else ""
+
         parts = []
         if self._pull_header:
-            parts.append(f"<span style='color:#8b949e;'>{self._pull_header}</span><br>")
+            header_html = f"<b style='color:#58a6ff;'>{spinner + ' ' if spinner else ''}{self._pull_header}</b><br>"
+            parts.append(header_html)
 
-        for layer_id in self._pull_layer_order:
-            status = self._pull_layers.get(layer_id, "")
-            color = self._layer_color(status)
-            # 截断 ASCII 进度条中多余空格
-            display_status = re.sub(r'\s{2,}', ' ', status)
-            parts.append(
-                f"<span style='color:#8b949e;font-family:monospace'>{layer_id}</span>"
-                f"<span style='color:#444;'> &nbsp;</span>"
-                f"<span style='color:{color};'>{display_status}</span><br>"
-            )
+        if self._pull_layer_order:
+            parts.append("<br>")
+            for layer_id in self._pull_layer_order:
+                status = self._pull_layers.get(layer_id, "")
+                color = self._layer_color(status)
+                icon = self._layer_icon(status)
+                # 只保留状态关键词，去掉 ASCII 进度条和多余空格
+                clean_status = re.split(r'\[', status)[0].strip()
+                progress = self._layer_progress(status)
+                progress_html = f" <span style='color:#8b949e;'>({progress})</span>" if progress else ""
+                parts.append(
+                    f"<span style='color:#8b949e;'>{layer_id}</span>"
+                    f"<span style='color:#444;'>&nbsp;&nbsp;</span>"
+                    f"<span style='color:{color};'>{icon} {clean_status}</span>"
+                    f"{progress_html}<br>"
+                )
 
         if self._pull_events:
-            if self._pull_layers:
-                parts.append("<br>")
+            if self._pull_layer_order:
+                parts.append("<hr style='border:none;border-top:1px solid #1e3a52;margin:6px 0;'>")
             for event in self._pull_events[-6:]:
                 color = "#3fb950" if event.startswith("✓") else ("#f26f82" if event.startswith("✗") else "#8b949e")
                 parts.append(f"<span style='color:{color};'>{event}</span><br>")
 
         self.pull_viewer.setHtml(
-            "<div style='font-family: Cascadia Mono, Consolas, Courier New, Microsoft YaHei UI, monospace; "
-            "font-size: 12px; line-height: 1.6;'>" + "".join(parts) + "</div>"
+            "<div style='font-family: Segoe UI, Microsoft YaHei UI, sans-serif; "
+            "font-size: 13px; line-height: 1.8;'>" + "".join(parts) + "</div>"
         )
         self.pull_viewer.verticalScrollBar().setValue(self.pull_viewer.verticalScrollBar().maximum())
 
@@ -425,11 +475,16 @@ class MainWindow(QMainWindow):
                 self._pull_events.append(detail)
                 self._pull_events = self._pull_events[-12:]
         self._set_pull_view_visible(True)
+        if not self._pull_spinner_timer.isActive():
+            self._pull_active = True
+            self._pull_spinner_timer.start(100)
         self._render_pull_view()
 
     def _clear_pull_progress(self):
         if not hasattr(self, "pull_viewer"):
             return
+        self._pull_active = False
+        self._pull_spinner_timer.stop()
         self._pull_layers.clear()
         self._pull_layer_order.clear()
         self._pull_events.clear()
@@ -819,8 +874,8 @@ class MainWindow(QMainWindow):
         self.pull_viewer.setReadOnly(True)
         self.pull_viewer.setMinimumHeight(200)
         self.pull_viewer.setStyleSheet(
-            "QTextEdit { font-family: 'Cascadia Mono', 'Consolas', 'Courier New', 'Microsoft YaHei UI', monospace; "
-            "font-size: 12px; background: #0f2032; color: #dfeaf6; "
+            "QTextEdit { font-family: 'Segoe UI', 'Microsoft YaHei UI', sans-serif; "
+            "font-size: 13px; background: #0f2032; color: #dfeaf6; "
             "border: 1px solid #20384f; border-radius: 8px; padding: 14px; }"
         )
         pull_view_layout.addWidget(self.pull_viewer)
