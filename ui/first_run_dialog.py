@@ -306,6 +306,15 @@ class FirstRunDialog(QDialog):
         labels = [self.lbl_wsl, self.lbl_distro, self.lbl_docker, self.lbl_compose]
         self._check_results[step] = (passed, detail)
         self._update_check_item(labels[step], passed, detail)
+        if not passed:
+            # 当前步骤失败，跳过后续检测，直接标记为未检测
+            for i in range(step + 1, len(labels)):
+                self._check_results[i] = (False, "")
+                name = labels[i].property("check_name")
+                labels[i].setText(f"—  {name}")
+                labels[i].setStyleSheet("font-size: 15px; color: #8b949e; padding: 5px 0;")
+            self._on_all_checks_done()
+            return
         self._run_check_step(step + 1)
 
     def _on_all_checks_done(self):
