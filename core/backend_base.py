@@ -10,6 +10,9 @@ class BackendBase(QObject):
     progress_updated = pyqtSignal(str)
     deploy_info_ready = pyqtSignal(dict)
     install_error = pyqtSignal(str)  # 安装过程中的具体错误信息
+    update_check_result = pyqtSignal(bool, str)  # (has_update, message)
+    image_status_result = pyqtSignal(list)  # list of {image, name, local, remote, has_update, error}
+    image_pull_result = pyqtSignal(str, bool, str)  # (image_ref, success, message)
 
     backend_key = ""
     display_name = ""

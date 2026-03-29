@@ -19,18 +19,28 @@ DISTRO_NAME = "NekroAgent"
 REQUIRED_IMAGES = {
     "napcat": [
         "postgres:14",
-        "qdrant/qdrant",
+        "qdrant/qdrant:v1.17.1",
         "kromiose/nekro-agent:latest",
         "mlikiowa/napcat-docker",
         "kromiose/nekro-agent-sandbox",
+        "kromiose/nekro-cc-sandbox",
     ],
     "lite": [
         "postgres:14",
-        "qdrant/qdrant",
+        "qdrant/qdrant:v1.17.1",
         "kromiose/nekro-agent:latest",
         "kromiose/nekro-agent-sandbox",
+        "kromiose/nekro-cc-sandbox",
     ],
 }
+
+# 镜像管理页面展示的镜像（image, 显示名, 描述, 支持的模式）
+MANAGED_IMAGES = [
+    ("kromiose/nekro-agent:latest",  "Nekro Agent 本体", "NA 核心服务镜像",         ["napcat", "lite"]),
+    ("kromiose/nekro-agent-sandbox", "NA 沙盒",          "代码执行沙盒环境",         ["napcat", "lite"]),
+    ("kromiose/nekro-cc-sandbox",    "NA CC 沙盒",       "CC 扩展沙盒环境",          ["napcat", "lite"]),
+    ("mlikiowa/napcat-docker",       "NapCat",           "QQ 协议端（完整版专用）",  ["napcat"]),
+]
 
 # Ubuntu 22.04 WSL rootfs 下载地址（按优先级排列）
 ROOTFS_URLS = [
@@ -125,6 +135,8 @@ class WSLManager(BackendBase):
         """逐个拉取镜像列表，带进度反馈。返回 True 全部成功，False 有失败"""
         total = len(images)
         for idx, image in enumerate(images, 1):
+            tag = image.split(":")[1] if ":" in image else "latest"
+            image_name = image.split(":")[0]
             self._emit_pull_progress("stage", f"拉取镜像 ({idx}/{total}): {image}")
             self.log_received.emit(f"拉取镜像 ({idx}/{total}): {image}", "info")
 
@@ -133,6 +145,7 @@ class WSLManager(BackendBase):
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 creationflags=self._creation_flags(),
             )
+            last_lines = []
             while True:
                 line = proc.stdout.readline()
                 if not line and proc.poll() is not None:
@@ -141,11 +154,18 @@ class WSLManager(BackendBase):
                     text = self._safe_decode(line).strip()
                     if text and not self._is_wsl_noise(text):
                         self._emit_pull_progress("update", text)
+                        last_lines.append(text)
+                        if len(last_lines) > 10:
+                            last_lines.pop(0)
 
             proc.wait()
             if proc.returncode != 0:
-                self._emit_pull_progress("error", f"镜像拉取失败: {image}")
-                self.log_received.emit(f"镜像拉取失败: {image}", "error")
+                detail = "\n".join(last_lines[-5:]) if last_lines else ""
+                err_msg = f"镜像拉取失败: {image}"
+                if detail:
+                    err_msg += f"\n{detail}"
+                self._emit_pull_progress("error", err_msg)
+                self.log_received.emit(err_msg, "error")
                 return False
             self.log_received.emit(f"✓ {image} 拉取完成", "info")
 
@@ -894,6 +914,157 @@ default = root
 
         threading.Thread(target=_do_stop, daemon=True).start()
 
+    def check_images_status(self, only_image=None, _mock_has_update=False):
+        """检测 MANAGED_IMAGES 各镜像本地/远程状态，结果通过 image_status_result 信号发出
+        only_image: 若传入则只检测该 image_ref
+        _mock_has_update: 测试用，强制所有镜像返回有更新"""
+        import json
+        distro = DISTRO_NAME
+
+        if _mock_has_update:
+            results = [
+                {"image": ref, "name": name, "modes": modes,
+                 "local": "sha256:aabbccdd11", "remote": "sha256:eeff99887",
+                 "has_update": True, "error": None}
+                for ref, name, desc, modes in MANAGED_IMAGES
+                if not only_image or ref == only_image
+            ]
+            self.image_status_result.emit(results)
+            return
+        import json
+        distro = DISTRO_NAME
+
+        def _do_check():
+            results = []
+            for image_ref, name, desc, modes in MANAGED_IMAGES:
+                if only_image and image_ref != only_image:
+                    continue
+                image = image_ref.split(":")[0]
+                tag = image_ref.split(":")[1] if ":" in image_ref else "latest"
+                entry = {"image": image_ref, "name": name, "modes": modes,
+                         "local": None, "remote": None, "has_update": False, "error": None}
+                try:
+                    # 本地 digest
+                    local_out = self._wsl_exec(
+                        distro,
+                        f"docker image inspect {image}:{tag} --format '{{{{index .RepoDigests 0}}}}' 2>/dev/null",
+                        timeout=15,
+                    ).strip().strip("'")
+                    if local_out and "@" in local_out:
+                        full_local = local_out.split("@")[-1]
+                        entry["local"] = full_local[:19]
+                    else:
+                        full_local = ""
+                        entry["local"] = None
+
+                    # 远程 digest via Docker Hub
+                    token_req = Request(
+                        f"https://auth.docker.io/token?service=registry.docker.io&scope=repository:{image}:pull",
+                        headers={"User-Agent": "NekroAgent/1.0"},
+                    )
+                    with urlopen(token_req, timeout=10) as resp:
+                        token = json.loads(resp.read())["token"]
+                    manifest_req = Request(
+                        f"https://registry-1.docker.io/v2/{image}/manifests/{tag}",
+                        headers={
+                            "Authorization": f"Bearer {token}",
+                            "Accept": "application/vnd.docker.distribution.manifest.v2+json",
+                            "User-Agent": "NekroAgent/1.0",
+                        },
+                    )
+                    with urlopen(manifest_req, timeout=10) as resp:
+                        full_remote = resp.headers.get("Docker-Content-Digest", "")
+                        entry["remote"] = full_remote[:19] if full_remote else ""
+
+                    if full_remote:
+                        entry["has_update"] = full_remote != full_local
+                except Exception as e:
+                    entry["error"] = str(e)
+                results.append(entry)
+            self.image_status_result.emit(results)
+
+        threading.Thread(target=_do_check, daemon=True).start()
+
+    def check_update(self):
+        """检测 nekro-agent 镜像是否有更新（对比本地与 Docker Hub digest）"""
+        import json
+        import time
+        distro = DISTRO_NAME
+
+        # 检查缓存（一天一次）
+        cache = self.config.get("update_check_cache") if self.config else None
+        if cache and isinstance(cache, dict):
+            if time.time() - cache.get("ts", 0) < 86400:
+                has_update = cache.get("has_update", False)
+                msg = "有新版本可用！" if has_update else "已是最新版本。"
+                self.update_check_result.emit(has_update, msg)
+                return
+
+        def _do_check():
+            try:
+                image = "kromiose/nekro-agent"
+                tag = "latest"
+
+                # 获取本地 digest
+                local_out = self._wsl_exec(
+                    distro,
+                    f"docker image inspect {image}:{tag} --format '{{{{index .RepoDigests 0}}}}' 2>/dev/null",
+                    timeout=15,
+                ).strip().strip("'")
+                if not local_out or "@" not in local_out:
+                    self.update_check_result.emit(False, "本地镜像未找到，请先部署。")
+                    return
+                local_digest = local_out.split("@")[-1]
+
+                # 获取 Docker Hub token
+                token_req = Request(
+                    f"https://auth.docker.io/token?service=registry.docker.io&scope=repository:{image}:pull",
+                    headers={"User-Agent": "NekroAgent/1.0"},
+                )
+                with urlopen(token_req, timeout=10) as resp:
+                    token = json.loads(resp.read())["token"]
+
+                # 获取远程 manifest digest
+                manifest_req = Request(
+                    f"https://registry-1.docker.io/v2/{image}/manifests/{tag}",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "application/vnd.docker.distribution.manifest.v2+json",
+                        "User-Agent": "NekroAgent/1.0",
+                    },
+                )
+                with urlopen(manifest_req, timeout=10) as resp:
+                    remote_digest = resp.headers.get("Docker-Content-Digest", "")
+
+                has_update = bool(remote_digest) and remote_digest != local_digest
+                msg = "有新版本可用！" if has_update else "已是最新版本。"
+
+                # 写入缓存
+                if self.config:
+                    self.config.set("update_check_cache", {"ts": time.time(), "has_update": has_update})
+
+                self.update_check_result.emit(has_update, msg)
+            except Exception as e:
+                self.update_check_result.emit(False, f"检测失败: {e}")
+
+        threading.Thread(target=_do_check, daemon=True).start()
+
+    def pull_single_image(self, image_ref):
+        """拉取单个镜像，结果通过 image_pull_result 信号发出"""
+        distro = DISTRO_NAME
+
+        def _do_pull():
+            image = image_ref.split(":")[0]
+            tag = image_ref.split(":")[1] if ":" in image_ref else "latest"
+            self._emit_pull_progress("start", f"拉取镜像: {image_ref}")
+            ok = self._pull_images(distro, [f"{image}:{tag}"])
+            if ok:
+                self.image_pull_result.emit(image_ref, True, "拉取成功")
+            else:
+                self.image_pull_result.emit(image_ref, False, "拉取失败")
+
+        threading.Thread(target=_do_pull, daemon=True).start()
+
     def update_services(self):
         """拉取最新镜像并重启服务"""
         distro = DISTRO_NAME
@@ -910,6 +1081,7 @@ default = root
                 update_images = [
                     "kromiose/nekro-agent:latest",
                     "kromiose/nekro-agent-sandbox",
+                    "kromiose/nekro-cc-sandbox",
                 ]
                 self._emit_pull_progress("start", "准备更新镜像")
                 if not self._pull_images(distro, update_images):

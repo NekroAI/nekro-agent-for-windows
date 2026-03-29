@@ -83,6 +83,7 @@ class MainWindow(QMainWindow):
         self.init_browser_page()
         self.init_logs_page()
         self.init_files_page()
+        self.init_images_page()
         self.init_settings_page()
         self.switch_tab(0)
 
@@ -90,6 +91,8 @@ class MainWindow(QMainWindow):
         self.backend.progress_updated.connect(self._on_backend_progress)
         self.backend.status_changed.connect(self.update_status_ui)
         self.backend.deploy_info_ready.connect(self._show_credentials_dialog)
+        self.backend.image_status_result.connect(self._on_image_status_result)
+        self.backend.image_pull_result.connect(self._on_image_pull_result)
 
         self._build_tray_icon()
         QTimer.singleShot(200, self._on_startup)
@@ -136,9 +139,10 @@ class MainWindow(QMainWindow):
         self.btn_browser = self.create_sidebar_btn("服务访问", 1)
         self.btn_logs = self.create_sidebar_btn("日志中心", 2)
         self.btn_files = self.create_sidebar_btn("存储与路径", 3)
-        self.btn_settings = self.create_sidebar_btn("系统设置", 4)
+        self.btn_images = self.create_sidebar_btn("镜像管理", 4)
+        self.btn_settings = self.create_sidebar_btn("系统设置", 5)
 
-        for button in [self.btn_home, self.btn_browser, self.btn_logs, self.btn_files, self.btn_settings]:
+        for button in [self.btn_home, self.btn_browser, self.btn_logs, self.btn_files, self.btn_images, self.btn_settings]:
             sidebar_layout.addWidget(button)
 
         sidebar_layout.addStretch()
@@ -274,7 +278,7 @@ class MainWindow(QMainWindow):
 
     def switch_tab(self, index):
         self.stack.setCurrentIndex(index)
-        buttons = [self.btn_home, self.btn_browser, self.btn_logs, self.btn_files, self.btn_settings]
+        buttons = [self.btn_home, self.btn_browser, self.btn_logs, self.btn_files, self.btn_images, self.btn_settings]
         for current, button in enumerate(buttons):
             button.setChecked(current == index)
 
@@ -299,6 +303,8 @@ class MainWindow(QMainWindow):
         self.backend.progress_updated.disconnect(self._on_backend_progress)
         self.backend.status_changed.disconnect(self.update_status_ui)
         self.backend.deploy_info_ready.disconnect(self._show_credentials_dialog)
+        self.backend.image_status_result.disconnect(self._on_image_status_result)
+        self.backend.image_pull_result.disconnect(self._on_image_pull_result)
 
         # 创建新后端
         self.backend = BackendFactory.create(self.config)
@@ -308,6 +314,8 @@ class MainWindow(QMainWindow):
         self.backend.progress_updated.connect(self._on_backend_progress)
         self.backend.status_changed.connect(self.update_status_ui)
         self.backend.deploy_info_ready.connect(self._show_credentials_dialog)
+        self.backend.image_status_result.connect(self._on_image_status_result)
+        self.backend.image_pull_result.connect(self._on_image_pull_result)
 
         # 更新对话框中的后端引用
         dialog.set_backend(self.backend)
@@ -559,7 +567,11 @@ class MainWindow(QMainWindow):
                 self.switch_tab(1)
                 self._set_browser_target(self.current_browser_target, force_reload=True)
             self._clear_pull_progress()
+            self.btn_log_nekro.setVisible(True)
+            self.btn_log_napcat.setVisible(self.config.get("deploy_mode") == "napcat")
         else:
+            self.btn_log_nekro.setVisible(False)
+            self.btn_log_napcat.setVisible(False)
             self.btn_primary_deploy.setText("开始部署")
             if self._quit_after_stop and status in {"已停止", "已卸载"}:
                 self._quit_after_stop = False
@@ -819,6 +831,8 @@ class MainWindow(QMainWindow):
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.clicked.connect(lambda checked, current=idx: self._set_log_tab(current))
             top.addWidget(button)
+        self.btn_log_nekro.setVisible(False)
+        self.btn_log_napcat.setVisible(False)
         top.addStretch()
         card_layout.addLayout(top)
 
@@ -834,6 +848,208 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(card)
         self._add_page(page)
+
+    def init_images_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(34, 30, 34, 30)
+        layout.setSpacing(22)
+
+        card = SectionCard("镜像管理", "查看 Nekro Agent 相关镜像的本地与远程版本状态。")
+        card_layout = card.layout()
+
+        # 表头
+        header = QHBoxLayout()
+        for text, stretch in [("镜像", 3), ("本地 Digest", 2), ("远程 Digest", 2), ("状态", 2), ("", 2)]:
+            lbl = QLabel(text)
+            lbl.setObjectName("SectionDesc")
+            header.addWidget(lbl, stretch)
+        card_layout.addLayout(header)
+
+        # 镜像行容器
+        self._image_rows_layout = QVBoxLayout()
+        self._image_rows_layout.setSpacing(6)
+        card_layout.addLayout(self._image_rows_layout)
+        self._image_row_widgets = {}  # image_ref -> dict of labels
+
+        from core.wsl_manager import MANAGED_IMAGES
+        deploy_mode = self.config.get("deploy_mode") or "lite"
+        for image_ref, name, desc, modes in MANAGED_IMAGES:
+            if deploy_mode not in modes:
+                continue
+            row = QHBoxLayout()
+            name_lbl = QLabel(f"<b>{name}</b><br><span style='color:#57606a;font-size:11px;'>{image_ref}</span>")
+            name_lbl.setTextFormat(Qt.TextFormat.RichText)
+            local_lbl = QLabel("—")
+            local_lbl.setObjectName("SectionDesc")
+            remote_lbl = QLabel("—")
+            remote_lbl.setObjectName("SectionDesc")
+            status_lbl = QLabel("未检测")
+            status_lbl.setObjectName("SectionDesc")
+            btn_single = QPushButton("检查更新")
+            btn_single.setObjectName("HeroSecondary")
+            btn_single.setFixedHeight(32)
+            btn_single.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_single.clicked.connect(lambda checked, ref=image_ref: self._check_single_image(ref))
+            row.addWidget(name_lbl, 3)
+            row.addWidget(local_lbl, 2)
+            row.addWidget(remote_lbl, 2)
+            row.addWidget(status_lbl, 2)
+            row.addWidget(btn_single, 2)
+            self._image_rows_layout.addLayout(row)
+            self._image_row_widgets[image_ref] = {
+                "local": local_lbl, "remote": remote_lbl, "status": status_lbl, "btn": btn_single
+            }
+
+        btn_row = QHBoxLayout()
+        self.btn_check_images = QPushButton("检查全部更新")
+        self.btn_check_images.setObjectName("HeroSecondary")
+        self.btn_check_images.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_check_images.clicked.connect(self._check_images)
+        self._img_spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        self._img_spinner_idx = 0
+        self._img_spinner_timer = QTimer(self)
+        self._img_spinner_timer.timeout.connect(self._tick_img_spinner)
+        self._img_checking_ref = None  # 当前单独检测的 image_ref，None 表示全量
+        btn_row.addWidget(self.btn_check_images)
+        btn_row.addStretch()
+        card_layout.addLayout(btn_row)
+
+        layout.addWidget(card)
+        layout.addStretch()
+        self._add_page(page)
+
+    def _tick_img_spinner(self):
+        self._img_spinner_idx = (self._img_spinner_idx + 1) % len(self._img_spinner_frames)
+        frame = self._img_spinner_frames[self._img_spinner_idx]
+        if self._img_checking_ref is None:
+            self.btn_check_images.setText(f"{frame} 检测中...")
+        else:
+            widgets = self._image_row_widgets.get(self._img_checking_ref)
+            if widgets:
+                widgets["btn"].setText(f"{frame}")
+
+    def _check_single_image(self, image_ref):
+        if self._img_spinner_timer.isActive():
+            return
+        widgets = self._image_row_widgets.get(image_ref)
+        if not widgets:
+            return
+        self._img_checking_ref = image_ref
+        widgets["btn"].setEnabled(False)
+        widgets["btn"].setText(self._img_spinner_frames[0])
+        widgets["local"].setText("...")
+        widgets["remote"].setText("...")
+        widgets["status"].setText("检测中")
+        self._img_spinner_timer.start(100)
+        self.backend.check_images_status(only_image=image_ref)
+
+    def _check_images(self):
+        if self._img_spinner_timer.isActive():
+            return
+        self._img_checking_ref = None
+        self.btn_check_images.setEnabled(False)
+        self.btn_check_images.setText(f"{self._img_spinner_frames[0]} 检测中...")
+        for widgets in self._image_row_widgets.values():
+            widgets["local"].setText("...")
+            widgets["remote"].setText("...")
+            widgets["status"].setText("检测中")
+            widgets["btn"].setEnabled(False)
+        self._img_spinner_timer.start(100)
+        self.backend.check_images_status()
+
+    def _on_image_status_result(self, results):
+        self._img_spinner_timer.stop()
+        self.btn_check_images.setEnabled(True)
+        self.btn_check_images.setText("检查全部更新")
+        for entry in results:
+            widgets = self._image_row_widgets.get(entry["image"])
+            if not widgets:
+                continue
+            if entry["error"]:
+                widgets["local"].setText("—")
+                widgets["remote"].setText("—")
+                widgets["status"].setText("<span style='color:#f26f82;'>错误</span>")
+                widgets["status"].setTextFormat(Qt.TextFormat.RichText)
+                widgets["btn"].setEnabled(True)
+                widgets["btn"].setText("检查更新")
+            elif entry["local"] is None:
+                widgets["local"].setText("未安装")
+                widgets["remote"].setText(entry["remote"] or "—")
+                widgets["status"].setText("<span style='color:#d29922;'>未拉取</span>")
+                widgets["status"].setTextFormat(Qt.TextFormat.RichText)
+                widgets["btn"].setEnabled(True)
+                widgets["btn"].setText("检查更新")
+            elif entry["has_update"]:
+                widgets["local"].setText(entry["local"] or "—")
+                widgets["remote"].setText(entry["remote"] or "—")
+                widgets["status"].setText("<span style='color:#58a6ff;'>有更新</span>")
+                widgets["status"].setTextFormat(Qt.TextFormat.RichText)
+                image_ref = entry["image"]
+                if image_ref == "kromiose/nekro-agent:latest":
+                    widgets["btn"].setEnabled(True)
+                    widgets["btn"].setText("检查更新")
+                else:
+                    widgets["btn"].setEnabled(True)
+                    widgets["btn"].setText("立即更新")
+                    try:
+                        widgets["btn"].clicked.disconnect()
+                    except Exception:
+                        pass
+                    widgets["btn"].clicked.connect(lambda checked, ref=image_ref: self._do_image_update(ref))
+            else:
+                widgets["local"].setText(entry["local"] or "—")
+                widgets["remote"].setText(entry["remote"] or "—")
+                widgets["status"].setText("<span style='color:#3fb950;'>最新</span>")
+                widgets["status"].setTextFormat(Qt.TextFormat.RichText)
+                widgets["btn"].setEnabled(True)
+                widgets["btn"].setText("检查更新")
+                try:
+                    widgets["btn"].clicked.disconnect()
+                except Exception:
+                    pass
+                widgets["btn"].clicked.connect(lambda checked, ref=entry["image"]: self._check_single_image(ref))
+
+    def _do_image_update(self, image_ref):
+        widgets = self._image_row_widgets.get(image_ref)
+        if widgets:
+            widgets["btn"].setEnabled(False)
+            widgets["btn"].setText(self._img_spinner_frames[0])
+            widgets["status"].setText("更新中")
+        self._img_checking_ref = image_ref
+        self._img_spinner_timer.start(100)
+        self.backend.pull_single_image(image_ref)
+
+    def _on_image_pull_result(self, image_ref, success, message):
+        self._img_spinner_timer.stop()
+        widgets = self._image_row_widgets.get(image_ref)
+        if not widgets:
+            return
+        widgets["btn"].setEnabled(True)
+        if success:
+            widgets["btn"].setText("检查更新")
+            try:
+                widgets["btn"].clicked.disconnect()
+            except Exception:
+                pass
+            widgets["btn"].clicked.connect(lambda checked, ref=image_ref: self._check_single_image(ref))
+            widgets["status"].setText("<span style='color:#3fb950;'>已更新</span>")
+            widgets["status"].setTextFormat(Qt.TextFormat.RichText)
+            # 镜像特化提示
+            if image_ref == "kromiose/nekro-cc-sandbox":
+                self._show_notice_dialog(
+                    "NA CC 沙盒已更新",
+                    "镜像拉取完成。\n\n请前往 WebUI → 工作区 → 工作区管理 → 对应工作区 → 沙盒容器，手动重建沙盒以应用新版本。"
+                )
+            elif image_ref == "kromiose/nekro-agent-sandbox":
+                self._show_notice_dialog(
+                    "NA 沙盒已更新",
+                    "镜像拉取完成。\n\n沙盒由 Nekro Agent 动态创建销毁，新版本将在下次任务执行时自动生效，无需手动操作。"
+                )
+        else:
+            widgets["btn"].setText("立即更新")
+            widgets["status"].setText("<span style='color:#f26f82;'>更新失败</span>")
+            widgets["status"].setTextFormat(Qt.TextFormat.RichText)
 
     def init_settings_page(self):
         page = QWidget()
@@ -962,21 +1178,7 @@ class MainWindow(QMainWindow):
             self._show_notice_dialog("提示", f"无法打开目录，请确认服务已启动且目录已创建。\n\n路径: {win_path}\n错误: {error}", danger=True)
 
     def _update_services(self):
-        if not self.backend.is_running:
-            self._show_notice_dialog("提示", "服务未运行，请先部署启动。")
-            return
-
-        reply = self._show_confirm_dialog(
-            "确认更新",
-            "将拉取最新镜像并重启所有容器，期间服务会短暂中断。\n确定要继续吗？",
-            confirm_text="继续更新",
-        )
-        if not reply:
-            return
-
-        self.switch_tab(2)
-        self.log_viewer_app.append("<span style='color:#7ce0a3;'>[INFO]</span> 开始更新服务...")
-        self.backend.update_services()
+        self.switch_tab(4)
 
     def _uninstall_environment(self):
         reply = self._show_confirm_dialog(

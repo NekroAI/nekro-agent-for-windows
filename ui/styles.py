@@ -304,7 +304,7 @@ QLabel[role="info_block"] {
 QPushButton#SegmentBtn {
     min-height: 34px;
     background: transparent;
-    border: 1px solid transparent;
+    border: 1px solid #e2e8ef;
     border-radius: 8px;
     color: #7d8fa0;
     font-size: 13px;
