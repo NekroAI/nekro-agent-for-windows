@@ -1,28 +1,35 @@
 {
-  "version": "1.0",
+  "version": "1.1",
   "steps": [
     {
-      "type": "pull",
-      "image": "kromiose/nekro-agent:latest",
-      "label": "拉取最新 Nekro Agent 镜像",
-      "step": 1
-    },
-    {
-      "type": "compose_down",
-      "services": ["nekro_agent"],
-      "label": "停止 Nekro Agent 容器",
-      "step": 2
-    },
-    {
-      "type": "compose_up",
-      "services": ["nekro_agent"],
-      "label": "启动 Nekro Agent 容器",
-      "step": 3
-    },
-    {
+      "step": 1,
       "type": "notify",
-      "message": "Nekro Agent 更新完成，服务已重启。",
-      "step": 4
+      "label": "更新开始通知",
+      "message": "正在更新 Nekro Agent，请稍候..."
+    },
+    {
+      "step": 2,
+      "type": "shell",
+      "label": "创建数据目录备份",
+      "command": "cp -r /root/nekro_agent_data /root/nekro_agent_data_backup"
+    },
+    {
+      "step": 3,
+      "type": "pull",
+      "label": "拉取最新 Nekro Agent 镜像",
+      "image": "kromiose/nekro-agent:latest"
+    },
+    {
+      "step": 4,
+      "type": "compose_up",
+      "label": "重启 Nekro Agent 容器",
+      "services": ["nekro_agent"]
+    },
+    {
+      "step": 5,
+      "type": "notify",
+      "label": "更新完成通知",
+      "message": "Nekro Agent 更新完成，服务已重启。"
     }
   ]
 }
