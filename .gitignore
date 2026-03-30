@@ -7,7 +7,11 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+installer/
 installer/*.exe
+*.msi
+*.pyd
+*.whl
 
 # 配置文件
 config.json

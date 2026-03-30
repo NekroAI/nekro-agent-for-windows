@@ -59,6 +59,7 @@ class MainWindow(QMainWindow):
         self._responsive_buttons = []
         self._last_status = ""
         self._uninstall_in_progress = False
+        self._update_in_progress = False
         self._pull_layers = OrderedDict()
         self._pull_layer_order = []
         self.browser_urls = {
@@ -93,6 +94,8 @@ class MainWindow(QMainWindow):
         self.backend.deploy_info_ready.connect(self._show_credentials_dialog)
         self.backend.image_status_result.connect(self._on_image_status_result)
         self.backend.image_pull_result.connect(self._on_image_pull_result)
+        self.backend.update_optional_confirm.connect(self._on_update_optional_confirm)
+        self.backend.update_finished.connect(self._on_update_finished)
 
         self._build_tray_icon()
         QTimer.singleShot(200, self._on_startup)
@@ -293,32 +296,7 @@ class MainWindow(QMainWindow):
 
         dialog = FirstRunDialog(self.backend, self.config, parent=self)
         dialog.deploy_requested.connect(self._on_deploy_mode_selected)
-        dialog.backend_changed.connect(lambda key: self._switch_backend(key, dialog))
         dialog.exec()
-
-    def _switch_backend(self, backend_key, dialog):
-        """用户在首次运行向导中选择了后端，重建 backend 实例"""
-        # 断开旧后端信号
-        self.backend.log_received.disconnect(self.append_log)
-        self.backend.progress_updated.disconnect(self._on_backend_progress)
-        self.backend.status_changed.disconnect(self.update_status_ui)
-        self.backend.deploy_info_ready.disconnect(self._show_credentials_dialog)
-        self.backend.image_status_result.disconnect(self._on_image_status_result)
-        self.backend.image_pull_result.disconnect(self._on_image_pull_result)
-
-        # 创建新后端
-        self.backend = BackendFactory.create(self.config)
-
-        # 连接新后端信号
-        self.backend.log_received.connect(self.append_log)
-        self.backend.progress_updated.connect(self._on_backend_progress)
-        self.backend.status_changed.connect(self.update_status_ui)
-        self.backend.deploy_info_ready.connect(self._show_credentials_dialog)
-        self.backend.image_status_result.connect(self._on_image_status_result)
-        self.backend.image_pull_result.connect(self._on_image_pull_result)
-
-        # 更新对话框中的后端引用
-        dialog.set_backend(self.backend)
 
     def _on_deploy_mode_selected(self, mode):
         self._is_first_deploy = True
@@ -548,19 +526,30 @@ class MainWindow(QMainWindow):
         self._last_status = status
         self.status_badge.setText(f"状态: {status}")
 
+        updating = status == "更新中..."
         running = status == "运行中"
         was_running = previous_status == "运行中"
         self.metric_status.findChild(QLabel, "MetricValue").setText(status)
-        self.metric_status.findChild(QLabel, "MetricHint").setText("服务可访问" if running else "等待部署或启动")
-        self.metric_status.setProperty("accent", "green" if running else "red")
+        if updating:
+            metric_hint = "正在执行升级步骤"
+            accent = "amber"
+        else:
+            metric_hint = "服务可访问" if running else "等待部署或启动"
+            accent = "green" if running else "red"
+        self.metric_status.findChild(QLabel, "MetricHint").setText(metric_hint)
+        self.metric_status.setProperty("accent", accent)
         self.metric_status.style().unpolish(self.metric_status)
         self.metric_status.style().polish(self.metric_status)
 
-        self.btn_deploy_action.setEnabled(not running)
-        self.btn_primary_deploy.setEnabled(not running)
+        self.btn_deploy_action.setEnabled(not running and not updating)
+        self.btn_primary_deploy.setEnabled(not running and not updating)
+        can_update = bool(self.config.get("deploy_mode")) and not updating
+        self.btn_update_action.setEnabled(can_update)
+        self.btn_primary_update.setEnabled(can_update)
 
         if running:
             self.btn_primary_deploy.setText("服务运行中")
+            self.btn_primary_update.setText("升级 Nekro Agent")
             if hasattr(self, "_is_first_deploy") and self._is_first_deploy:
                 self._is_first_deploy = False
             if hasattr(self, "webview") and not was_running:
@@ -573,6 +562,7 @@ class MainWindow(QMainWindow):
             self.btn_log_nekro.setVisible(False)
             self.btn_log_napcat.setVisible(False)
             self.btn_primary_deploy.setText("开始部署")
+            self.btn_primary_update.setText("升级 Nekro Agent" if not updating else "升级中...")
             if self._quit_after_stop and status in {"已停止", "已卸载"}:
                 self._quit_after_stop = False
                 QApplication.quit()
@@ -593,6 +583,25 @@ class MainWindow(QMainWindow):
             self.browser_open_external_btn.setEnabled(running)
         if hasattr(self, "browser_reload_btn"):
             self.browser_reload_btn.setEnabled(True)
+
+    def _on_update_optional_confirm(self, step_label, prompt):
+        confirmed = self._show_confirm_dialog(
+            step_label,
+            prompt,
+            confirm_text="执行",
+            cancel_text="跳过",
+        )
+        self.backend.reply_update_optional(confirmed)
+
+    def _on_update_finished(self, success, message):
+        self._update_in_progress = False
+        self.btn_primary_update.setText("升级 Nekro Agent")
+        self.btn_update_action.setEnabled(bool(self.config.get("deploy_mode")))
+        self.btn_primary_update.setEnabled(bool(self.config.get("deploy_mode")))
+        if success:
+            self._show_notice_dialog("升级完成", message)
+        else:
+            self._show_notice_dialog("升级失败", message, danger=True)
 
     def init_home_page(self):
         page = QWidget()
@@ -986,16 +995,15 @@ class MainWindow(QMainWindow):
                 widgets["status"].setText("<span style='color:#58a6ff;'>有更新</span>")
                 widgets["status"].setTextFormat(Qt.TextFormat.RichText)
                 image_ref = entry["image"]
+                widgets["btn"].setEnabled(True)
+                widgets["btn"].setText("立即更新")
+                try:
+                    widgets["btn"].clicked.disconnect()
+                except Exception:
+                    pass
                 if image_ref == "kromiose/nekro-agent:latest":
-                    widgets["btn"].setEnabled(True)
-                    widgets["btn"].setText("检查更新")
+                    widgets["btn"].clicked.connect(lambda checked: self._update_services())
                 else:
-                    widgets["btn"].setEnabled(True)
-                    widgets["btn"].setText("立即更新")
-                    try:
-                        widgets["btn"].clicked.disconnect()
-                    except Exception:
-                        pass
                     widgets["btn"].clicked.connect(lambda checked, ref=image_ref: self._do_image_update(ref))
             else:
                 widgets["local"].setText(entry["local"] or "—")
@@ -1057,26 +1065,13 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(34, 30, 34, 30)
         layout.setSpacing(18)
 
-        card = SectionCard("系统设置", "控制后端、数据路径和系统集成选项。")
+        card = SectionCard("系统设置", "控制部署、数据路径和系统集成选项。")
         card_layout = card.body_layout()
 
         self.check_auto = QCheckBox("开机自动启动 Nekro Agent 管理系统")
         self.check_auto.setChecked(self.config.get("autostart"))
         self.check_auto.stateChanged.connect(lambda state: self.config.set("autostart", state == 2))
         card_layout.addWidget(self.check_auto)
-
-        self._backend_label = QLabel("运行时后端")
-        card_layout.addWidget(self._backend_label)
-        self.backend_combo = QComboBox()
-        self.backend_combo.addItem("WSL", "wsl")
-        self.backend_combo.addItem("Hyper-V", "hyperv")
-        current_backend = self.config.get("backend") or "wsl"
-        self.backend_combo.setCurrentIndex(0 if current_backend == "wsl" else 1)
-        self.backend_combo.currentIndexChanged.connect(self._on_backend_changed)
-        # 当前版本仅支持 WSL，隐藏后端切换
-        self._backend_label.setVisible(False)
-        self.backend_combo.setVisible(False)
-        card_layout.addWidget(self.backend_combo)
 
         card_layout.addWidget(QLabel("部署版本"))
         self.mode_display = QLineEdit(self._format_mode_text(self.config.get("deploy_mode")))
@@ -1159,13 +1154,6 @@ class MainWindow(QMainWindow):
         else:
             self.datadir_hint.setText(f"当前后端 {self.backend.display_name} 暂未提供宿主机侧直接打开路径。")
 
-    def _on_backend_changed(self, index):
-        backend_key = self.backend_combo.itemData(index)
-        if backend_key == self.config.get("backend"):
-            return
-        self.config.set("backend", backend_key)
-        self._show_notice_dialog("提示", "后端已切换，重启应用后生效。")
-
     def _open_datadir_in_explorer(self):
         data_dir = "/root/nekro_agent_data"
         win_path = self.backend.get_host_access_path(data_dir)
@@ -1178,7 +1166,33 @@ class MainWindow(QMainWindow):
             self._show_notice_dialog("提示", f"无法打开目录，请确认服务已启动且目录已创建。\n\n路径: {win_path}\n错误: {error}", danger=True)
 
     def _update_services(self):
-        self.switch_tab(4)
+        if self._update_in_progress:
+            self._show_notice_dialog("提示", "升级流程正在进行中，请等待当前操作完成。")
+            return
+        if not self.config.get("deploy_mode"):
+            self._show_notice_dialog("提示", "尚未完成部署，无法执行升级。")
+            return
+        if not hasattr(self.backend, "run_remote_update"):
+            self._show_notice_dialog("提示", f"当前后端 {self.backend.display_name} 暂不支持远程升级。")
+            return
+
+        reply = self._show_confirm_dialog(
+            "确认升级",
+            "将从远端获取最新升级步骤，拉取最新版 Nekro Agent 镜像并重启服务。\n\n升级过程中可能需要确认是否备份数据目录。",
+            confirm_text="开始升级",
+        )
+        if not reply:
+            return
+
+        self._update_in_progress = True
+        self.switch_tab(2)
+        self.log_viewer_app.append("<span style='color:#7ce0a3;'>[INFO]</span> 开始升级 Nekro Agent...")
+        if hasattr(self, "log_preview"):
+            self.log_preview.append("<span style='color:#7ce0a3;'>[INFO]</span> 开始升级 Nekro Agent...")
+        self.btn_update_action.setEnabled(False)
+        self.btn_primary_update.setEnabled(False)
+        self.btn_primary_update.setText("升级中...")
+        self.backend.run_remote_update()
 
     def _uninstall_environment(self):
         reply = self._show_confirm_dialog(

@@ -49,6 +49,9 @@ ROOTFS_URLS = [
     "https://cloud-images.ubuntu.com/wsl/jammy/current/ubuntu-jammy-wsl-amd64-ubuntu22.04lts.rootfs.tar.gz",
 ]
 
+# 测试升级流程用，完成联调后改回 False
+FORCE_MOCK_IMAGE_UPDATES = True
+
 
 class WSLManager(BackendBase):
     backend_key = "wsl"
@@ -71,36 +74,12 @@ class WSLManager(BackendBase):
         self._log_process = None
         self._stop_event = threading.Event()
 
-    def get_runtime_name(self):
-        return DISTRO_NAME
-
     def get_host_access_path(self, guest_path):
         normalized = guest_path or "/"
         return f"\\\\wsl$\\{DISTRO_NAME}{normalized}"
 
     def create_runtime(self, install_dir):
-        return self.create_distro(install_dir)
-
-    # ------------------------------------------------------------------ #
-    #  日志辅助
-    # ------------------------------------------------------------------ #
-
-    def _safe_log(self, message, level="info"):
-        """安全地发送日志，处理编码问题"""
-        try:
-            # 确保字符串是正确的编码
-            if isinstance(message, bytes):
-                message = message.decode('utf-8', errors='replace')
-            else:
-                message = str(message)
-            # 替换可能导致问题的字符
-            message = message.replace('\x00', '')
-            self.log_received.emit(message, level)
-        except Exception as e:
-            try:
-                self.log_received.emit(f"[LOG ERROR] {str(e)}", "error")
-            except Exception:
-                pass
+        return self._create_distro(install_dir)
 
     def _emit_pull_progress(self, phase, message):
         self.progress_updated.emit(f"__pull_progress__|{phase}|{message}")
@@ -263,25 +242,6 @@ class WSLManager(BackendBase):
 
         return [check_wsl, check_distro, check_docker, check_compose]
 
-    def check_environment(self):
-        """检测 WSL2 / NekroAgent 发行版 / Docker / Compose 是否就绪"""
-        self.log_received.emit("[环境检测] 开始检测...", "info")
-        funcs = self.get_check_funcs()
-        results = [func() for func in funcs]
-
-        all_ok = all(r[0] for r in results)
-        if all_ok:
-            self.log_received.emit("[环境检测] ✓ 所有环境组件就绪！", "info")
-        else:
-            self.log_received.emit("[环境检测] ✗ 部分环境组件缺失", "error")
-
-        return {
-            "wsl_installed": results[0][0],
-            "distro": results[1][1] if results[1][0] else "",
-            "docker_available": results[2][0],
-            "compose_available": results[3][0],
-        }
-
     def _distro_exists(self):
         """检查 NekroAgent 专用发行版是否已存在"""
         try:
@@ -308,10 +268,6 @@ class WSLManager(BackendBase):
         except Exception as e:
             self.log_received.emit(f"_distro_exists 异常: {e}", "debug")
             return False
-
-    def _get_distro(self):
-        """返回当前使用的发行版名称"""
-        return DISTRO_NAME
 
     def _safe_decode(self, data):
         """安全解码字节数据，智能检测编码"""
@@ -395,7 +351,7 @@ class WSLManager(BackendBase):
         # 没有其他盘符，使用用户目录
         return os.path.join(os.path.expanduser("~"), "NekroAgent", "wsl")
 
-    def create_distro(self, install_dir):
+    def _create_distro(self, install_dir):
         """下载 Ubuntu rootfs 并用 wsl --import 创建专用发行版（同步，在线程中调用）"""
         self.progress_updated.emit("准备创建 NekroAgent 运行环境...")
         self.log_received.emit("[发行版创建] 开始创建 NekroAgent 专用发行版...", "info")
@@ -921,7 +877,7 @@ default = root
         import json
         distro = DISTRO_NAME
 
-        if _mock_has_update:
+        if _mock_has_update or FORCE_MOCK_IMAGE_UPDATES:
             results = [
                 {"image": ref, "name": name, "modes": modes,
                  "local": "sha256:aabbccdd11", "remote": "sha256:eeff99887",
@@ -985,69 +941,6 @@ default = root
 
         threading.Thread(target=_do_check, daemon=True).start()
 
-    def check_update(self):
-        """检测 nekro-agent 镜像是否有更新（对比本地与 Docker Hub digest）"""
-        import json
-        import time
-        distro = DISTRO_NAME
-
-        # 检查缓存（一天一次）
-        cache = self.config.get("update_check_cache") if self.config else None
-        if cache and isinstance(cache, dict):
-            if time.time() - cache.get("ts", 0) < 86400:
-                has_update = cache.get("has_update", False)
-                msg = "有新版本可用！" if has_update else "已是最新版本。"
-                self.update_check_result.emit(has_update, msg)
-                return
-
-        def _do_check():
-            try:
-                image = "kromiose/nekro-agent"
-                tag = "latest"
-
-                # 获取本地 digest
-                local_out = self._wsl_exec(
-                    distro,
-                    f"docker image inspect {image}:{tag} --format '{{{{index .RepoDigests 0}}}}' 2>/dev/null",
-                    timeout=15,
-                ).strip().strip("'")
-                if not local_out or "@" not in local_out:
-                    self.update_check_result.emit(False, "本地镜像未找到，请先部署。")
-                    return
-                local_digest = local_out.split("@")[-1]
-
-                # 获取 Docker Hub token
-                token_req = Request(
-                    f"https://auth.docker.io/token?service=registry.docker.io&scope=repository:{image}:pull",
-                    headers={"User-Agent": "NekroAgent/1.0"},
-                )
-                with urlopen(token_req, timeout=10) as resp:
-                    token = json.loads(resp.read())["token"]
-
-                # 获取远程 manifest digest
-                manifest_req = Request(
-                    f"https://registry-1.docker.io/v2/{image}/manifests/{tag}",
-                    headers={
-                        "Authorization": f"Bearer {token}",
-                        "Accept": "application/vnd.docker.distribution.manifest.v2+json",
-                        "User-Agent": "NekroAgent/1.0",
-                    },
-                )
-                with urlopen(manifest_req, timeout=10) as resp:
-                    remote_digest = resp.headers.get("Docker-Content-Digest", "")
-
-                has_update = bool(remote_digest) and remote_digest != local_digest
-                msg = "有新版本可用！" if has_update else "已是最新版本。"
-
-                # 写入缓存
-                if self.config:
-                    self.config.set("update_check_cache", {"ts": time.time(), "has_update": has_update})
-
-                self.update_check_result.emit(has_update, msg)
-            except Exception as e:
-                self.update_check_result.emit(False, f"检测失败: {e}")
-
-        threading.Thread(target=_do_check, daemon=True).start()
 
     def pull_single_image(self, image_ref):
         """拉取单个镜像，结果通过 image_pull_result 信号发出"""
@@ -1065,52 +958,116 @@ default = root
 
         threading.Thread(target=_do_pull, daemon=True).start()
 
-    def update_services(self):
-        """拉取最新镜像并重启服务"""
+    def run_remote_update(self):
+        """从远端 JSON 拉取更新步骤并执行，optional 步骤通过信号询问用户确认"""
+        from core.update_runner import parse_update_commands
         distro = DISTRO_NAME
-        self.log_received.emit("开始更新服务...", "info")
+        deploy_dir = "/root/nekro_agent"
+
+        def _exec(cmd, timeout=300):
+            """在 deploy_dir 下执行命令，返回 (returncode, output)"""
+            proc = subprocess.run(
+                ["wsl", "-d", distro, "--", "bash", "-c", f"cd {deploy_dir} && {cmd}"],
+                capture_output=True, timeout=timeout,
+                creationflags=self._creation_flags(),
+            )
+            out = self._safe_decode(proc.stdout) + self._safe_decode(proc.stderr)
+            return proc.returncode, out.strip()
 
         def _do_update():
-            try:
-                wsl_home = self._wsl_exec(distro, "echo $HOME").strip()
-                if not wsl_home:
-                    wsl_home = "/root"
-                deploy_dir = f"{wsl_home}/nekro_agent"
+            self._stop_event.clear()
+            self.status_changed.emit("更新中...")
+            steps = parse_update_commands(self.log_received.emit)
+            if not steps:
+                self.status_changed.emit("更新失败")
+                self.update_finished.emit(False, "无法获取更新配置，请检查网络。")
+                return
 
-                # 只更新 nekro-agent 和 sandbox 镜像
-                update_images = [
-                    "kromiose/nekro-agent:latest",
-                    "kromiose/nekro-agent-sandbox",
-                    "kromiose/nekro-cc-sandbox",
-                ]
-                self._emit_pull_progress("start", "准备更新镜像")
-                if not self._pull_images(distro, update_images):
+            for step in steps:
+                step_type = step.get("type")
+                label = step.get("label", "")
+                cmd = step.get("_cmd")
+
+                # notify 步骤只输出日志
+                if step_type == "notify":
+                    self.log_received.emit(step.get("message", label), "info")
+                    continue
+
+                # optional 步骤：先查大小再弹窗确认
+                if step.get("optional"):
+                    size_cmd = step.get("optional_size_cmd", "")
+                    backup_size = "未知"
+                    if size_cmd:
+                        _, size_out = _exec(size_cmd, timeout=30)
+                        if size_out:
+                            backup_size = size_out.splitlines()[0].strip()
+                    prompt = step.get("optional_prompt", f"是否执行：{label}？")
+                    prompt = prompt.replace("{backup_size}", backup_size)
+
+                    # 通过信号让 UI 弹窗，主线程会设置 _update_optional_reply
+                    self._update_optional_reply = None
+                    self.update_optional_confirm.emit(label, prompt)
+                    # 等待 UI 回复（最多 120 秒）
+                    import time as _time
+                    deadline = _time.time() + 120
+                    while self._update_optional_reply is None and _time.time() < deadline:
+                        _time.sleep(0.1)
+                    if self._update_optional_reply is None:
+                        self.log_received.emit(f"[更新] 可选步骤确认超时，已跳过: {label}", "warning")
+                        continue
+                    if not self._update_optional_reply:
+                        self.log_received.emit(f"[更新] 已跳过可选步骤: {label}", "info")
+                        continue
+
+                if cmd is None:
+                    continue
+
+                self.log_received.emit(f"[更新] 执行: {label}", "info")
+                self._emit_pull_progress("stage", label)
+
+                # pull 步骤用带进度的拉取
+                if step_type == "pull":
+                    image = step.get("image", "")
+                    ok = self._pull_images(distro, [image])
+                    if not ok:
+                        self.status_changed.emit("更新失败")
+                        self.update_finished.emit(False, f"镜像拉取失败: {image}")
+                        return
+                    continue
+
+                # 其余命令直接执行
+                try:
+                    rc, out = _exec(cmd, timeout=300)
+                except subprocess.TimeoutExpired:
                     self.status_changed.emit("更新失败")
+                    self.update_finished.emit(False, f"步骤超时: {label}")
+                    return
+                except Exception as e:
+                    self.status_changed.emit("更新失败")
+                    self.update_finished.emit(False, f"步骤异常: {e}")
                     return
 
-                # 重启服务
-                self.log_received.emit("重启服务...", "info")
-                proc = subprocess.run(
-                    ["wsl", "-d", distro, "--", "bash", "-c",
-                     f"cd {deploy_dir} && docker compose -f docker-compose.yml --env-file .env up -d"],
-                    capture_output=True, timeout=120,
-                    creationflags=self._creation_flags(),
-                )
-                if proc.returncode != 0:
-                    self.log_received.emit(f"重启失败: {self._clean_stderr(proc.stderr, 300)}", "error")
+                if out:
+                    self.log_received.emit(out, "info")
+                if rc != 0:
                     self.status_changed.emit("更新失败")
+                    self.update_finished.emit(False, f"步骤失败（返回码 {rc}）: {label}")
                     return
 
-                self.log_received.emit("✓ 服务更新完成", "info")
-                self.status_changed.emit("运行中")
-            except subprocess.TimeoutExpired:
-                self.log_received.emit("更新超时", "error")
-                self.status_changed.emit("更新失败")
-            except Exception as e:
-                self.log_received.emit(f"更新异常: {e}", "error")
-                self.status_changed.emit("更新失败")
+                self.log_received.emit(f"[更新] ✓ {label}", "info")
+
+            self._emit_pull_progress("done", "更新完成")
+            self.is_running = True
+            if self._log_process is None or self._log_process.poll() is not None:
+                threading.Thread(target=self._log_reader, args=(distro, deploy_dir), daemon=True).start()
+            threading.Thread(target=self._health_check, daemon=True).start()
+            self.update_finished.emit(True, "Nekro Agent 更新完成，正在等待服务重新就绪。")
 
         threading.Thread(target=_do_update, daemon=True).start()
+
+    def reply_update_optional(self, confirmed: bool):
+        """UI 调用此方法回复 optional 步骤的用户选择"""
+        self._update_optional_reply = confirmed
 
     def uninstall_environment(self):
         """卸载：停止服务 → 删除容器/镜像 → 删除 WSL 发行版"""
