@@ -3,8 +3,8 @@
 ; =========================
 
 #define MyAppName "Nekro Agent"
-#define MyAppVersion "1.0.0"
-#define MyAppPublisher "Nekro-Agent Team"
+#define MyAppVersion "1.1.0"
+#define MyAppPublisher "Nekro AI"
 #define MyAppExeName "NekroAgent.exe"
 
 [Setup]
