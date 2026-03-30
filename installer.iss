@@ -59,10 +59,44 @@ Filename: "{app}\{#MyAppExeName}"; Description: "启动 {#MyAppName}"; \
 ; ✅ 卸载逻辑全部在 [Code] 中处理，彻底规避 PathRedir Bug
 ; =========================
 [Code]
+procedure DeleteFileIfExists(const FilePath: String);
+begin
+  if FileExists(FilePath) then
+    DeleteFile(FilePath);
+end;
+
+procedure DeleteDirIfExists(const DirPath: String);
+begin
+  if DirExists(DirPath) then
+    DelTree(DirPath, True, True, True);
+end;
+
+procedure CleanupLauncherState();
+var
+  AppDir: String;
+  LocalDataDir: String;
+begin
+  AppDir := AddBackslash(ExpandConstant('{app}'));
+  LocalDataDir := ExpandConstant('{localappdata}\NekroAgent');
+
+  DeleteFileIfExists(AppDir + 'config.json');
+  DeleteFileIfExists(AppDir + 'image_config.json');
+  DeleteFileIfExists(AppDir + 'debug.log');
+
+  DeleteDirIfExists(AppDir + '_internal');
+  DeleteDirIfExists(AppDir + 'browser_profile');
+  DeleteDirIfExists(AppDir + 'runtime_cache');
+  DeleteDirIfExists(AppDir + 'shared');
+  DeleteDirIfExists(AppDir + 'logs');
+  DeleteDirIfExists(LocalDataDir);
+
+  if DirExists(ExpandConstant('{app}')) then
+    RemoveDir(ExpandConstant('{app}'));
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   ResultCode: Integer;
-  InternalDir: String;
 begin
   { ─── 卸载前：强制杀进程 ─── }
   if CurUninstallStep = usUninstall then
@@ -78,11 +112,7 @@ begin
     { ResultCode 不判断，进程不存在时 taskkill 返回非零但无需报错 }
   end;
 
-  { ─── 卸载后：清理 _internal 目录 ─── }
+  { ─── 卸载后：清理启动器本地残留 ─── }
   if CurUninstallStep = usPostUninstall then
-  begin
-    InternalDir := ExpandConstant('{app}\_internal');
-    if DirExists(InternalDir) then
-      DelTree(InternalDir, True, True, True);
-  end;
+    CleanupLauncherState();
 end;
