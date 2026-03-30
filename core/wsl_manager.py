@@ -49,9 +49,6 @@ ROOTFS_URLS = [
     "https://cloud-images.ubuntu.com/wsl/jammy/current/ubuntu-jammy-wsl-amd64-ubuntu22.04lts.rootfs.tar.gz",
 ]
 
-# 测试升级流程用，完成联调后改回 False
-FORCE_MOCK_IMAGE_UPDATES = True
-
 STABLE_IMAGE = "kromiose/nekro-agent:latest"
 PREVIEW_IMAGE = "kromiose/nekro-agent:preview"
 PREVIEW_COMPOSE_IMAGE = STABLE_IMAGE
@@ -931,23 +928,9 @@ default = root
 
         threading.Thread(target=_do_stop, daemon=True).start()
 
-    def check_images_status(self, only_image=None, _mock_has_update=False):
+    def check_images_status(self, only_image=None):
         """检测 MANAGED_IMAGES 各镜像本地/远程状态，结果通过 image_status_result 信号发出
-        only_image: 若传入则只检测该 image_ref
-        _mock_has_update: 测试用，强制所有镜像返回有更新"""
-        import json
-        distro = DISTRO_NAME
-
-        if _mock_has_update or FORCE_MOCK_IMAGE_UPDATES:
-            results = [
-                {"image": ref, "name": name, "modes": modes,
-                 "local": "sha256:aabbccdd11", "remote": "sha256:eeff99887",
-                 "has_update": True, "error": None}
-                for ref, name, desc, modes in self.get_managed_images(self.config)
-                if not only_image or ref == only_image
-            ]
-            self.image_status_result.emit(results)
-            return
+        only_image: 若传入则只检测该 image_ref"""
         import json
         distro = DISTRO_NAME
 
