@@ -1,12 +1,13 @@
 import os
+import re
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                              QPushButton, QWidget, QStackedWidget,
                              QMessageBox, QLineEdit, QFileDialog,
-                             QProgressBar, QSizePolicy)
+                             QSizePolicy)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
 from ui.styles import STYLESHEET
-from ui.widgets import show_notice_dialog
+from ui.widgets import create_install_progress_bar, show_notice_dialog
 
 
 class CheckStepThread(QThread):
@@ -109,13 +110,7 @@ class FirstRunDialog(QDialog):
         layout.addWidget(self.lbl_compose)
 
         # 进度条（安装 Docker 时显示）
-        self.check_progress = QProgressBar()
-        self.check_progress.setRange(0, 0)  # 不确定进度（循环动画）
-        self.check_progress.setFixedHeight(6)
-        self.check_progress.setStyleSheet(
-            "QProgressBar { border: none; background: #e8e9eb; border-radius: 3px; }"
-            "QProgressBar::chunk { background: #0969da; border-radius: 3px; }"
-        )
+        self.check_progress = create_install_progress_bar(0, 0, height=6, radius=3)
         self.check_progress.setVisible(False)
         layout.addWidget(self.check_progress)
 
@@ -327,13 +322,7 @@ class FirstRunDialog(QDialog):
         layout.addWidget(hint)
 
         # 进度条
-        self.create_progress = QProgressBar()
-        self.create_progress.setRange(0, 0)  # 不确定进度
-        self.create_progress.setFixedHeight(8)
-        self.create_progress.setStyleSheet(
-            "QProgressBar { border: none; background: #e8e9eb; border-radius: 4px; }"
-            "QProgressBar::chunk { background: #0969da; border-radius: 4px; }"
-        )
+        self.create_progress = create_install_progress_bar(0, 0, height=8, radius=4)
         self.create_progress.setVisible(False)
         layout.addWidget(self.create_progress)
 
@@ -419,6 +408,7 @@ class FirstRunDialog(QDialog):
         # 检查当前是否在创建页面（页面 1）
         if self.stack.currentIndex() == 1:
             self.lbl_progress.setText(text)
+            self._update_create_progress(text)
             return
 
         # 检测页面的处理
@@ -436,6 +426,21 @@ class FirstRunDialog(QDialog):
 
         if self.check_progress.isVisible():
             self.check_desc.setText(text)
+
+    def _update_create_progress(self, text):
+        progress_match = re.search(r"\((\d+)%\)", text)
+        if progress_match:
+            pct = max(0, min(100, int(progress_match.group(1))))
+            self.create_progress.setRange(0, 100)
+            self.create_progress.setValue(pct)
+            return
+
+        if "下载完成" in text:
+            self.create_progress.setRange(0, 100)
+            self.create_progress.setValue(100)
+            return
+
+        self.create_progress.setRange(0, 0)
 
     def _on_install_error(self, message):
         self.lbl_error.setText(message)

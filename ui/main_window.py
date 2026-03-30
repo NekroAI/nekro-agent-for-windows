@@ -34,7 +34,7 @@ from PyQt6.QtWebEngineWidgets import QWebEngineView
 from core.backend_factory import BackendFactory
 from core.config_manager import ConfigManager
 from ui.styles import STYLESHEET
-from ui.widgets import ActionButton, MetricCard, SectionCard, show_notice_dialog
+from ui.widgets import ActionButton, MetricCard, SectionCard, UpdateProgressDialog, show_notice_dialog
 
 
 def get_resource_path(relative_path):
@@ -60,6 +60,11 @@ class MainWindow(QMainWindow):
         self._last_status = ""
         self._uninstall_in_progress = False
         self._update_in_progress = False
+        self._active_update_dialog = None
+        self._active_update_kind = None
+        self._pending_remote_update_message = ""
+        self._pull_stage_header = ""
+        self._pull_summary_text = ""
         self._pull_layers = OrderedDict()
         self._pull_layer_order = []
         self.browser_urls = {
@@ -153,25 +158,25 @@ class MainWindow(QMainWindow):
         footer_row = QHBoxLayout()
         footer_row.setSpacing(8)
 
-        btn_repo = QPushButton("⌂")
-        btn_repo.setToolTip("主仓库: KroMiose/nekro-agent")
-        btn_repo.setFixedSize(32, 32)
-        btn_repo.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_repo.setStyleSheet(
-            "QPushButton { background: transparent; color: #57606a; font-size: 18px; border: none; border-radius: 6px; }"
+        footer_btn_style = (
+            "QPushButton { background: transparent; color: #57606a; font-size: 13px; font-weight: 600; "
+            "border: none; border-radius: 6px; padding: 6px 10px; text-align: left; }"
             "QPushButton:hover { background: #f0f2f4; color: #24292f; }"
         )
+
+        btn_repo = QPushButton("⌂ 仓库")
+        btn_repo.setToolTip("主仓库: KroMiose/nekro-agent")
+        btn_repo.setFixedHeight(32)
+        btn_repo.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_repo.setStyleSheet(footer_btn_style)
         btn_repo.clicked.connect(lambda: webbrowser.open("https://github.com/KroMiose/nekro-agent"))
         footer_row.addWidget(btn_repo)
 
-        btn_feedback = QPushButton("✉")
+        btn_feedback = QPushButton("✉ 反馈")
         btn_feedback.setToolTip("反馈问题")
-        btn_feedback.setFixedSize(32, 32)
+        btn_feedback.setFixedHeight(32)
         btn_feedback.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_feedback.setStyleSheet(
-            "QPushButton { background: transparent; color: #57606a; font-size: 18px; border: none; border-radius: 6px; }"
-            "QPushButton:hover { background: #f0f2f4; color: #24292f; }"
-        )
+        btn_feedback.setStyleSheet(footer_btn_style)
         btn_feedback.clicked.connect(lambda: webbrowser.open("https://github.com/NekroAI/nekro-agent-for-windows/issues/new"))
         footer_row.addWidget(btn_feedback)
 
@@ -227,8 +232,8 @@ class MainWindow(QMainWindow):
     def _show_notice_dialog(self, title, text, button_text="确定", danger=False):
         show_notice_dialog(self, title, text, button_text, danger)
 
-    def _show_confirm_dialog(self, title, text, confirm_text="确认", cancel_text="取消", danger=False):
-        dialog = QDialog(self)
+    def _show_confirm_dialog(self, title, text, confirm_text="确认", cancel_text="取消", danger=False, parent=None):
+        dialog = QDialog(parent or self)
         dialog.setWindowTitle(title)
         dialog.setMinimumWidth(360)
         dialog.setMaximumWidth(460)
@@ -268,6 +273,118 @@ class MainWindow(QMainWindow):
         layout.addLayout(button_row)
         dialog.adjustSize()
         return dialog.exec() == int(QDialog.DialogCode.Accepted)
+
+    def _create_update_dialog(self, title, text, on_confirm):
+        dialog = UpdateProgressDialog(self, title, text, confirm_text="开始更新")
+        dialog.confirmed.connect(on_confirm)
+        dialog.finished.connect(lambda _result, dlg=dialog: self._on_update_dialog_closed(dlg))
+        return dialog
+
+    def _on_update_dialog_closed(self, dialog):
+        if self._active_update_dialog is dialog and not self._update_in_progress:
+            self._active_update_dialog = None
+            self._active_update_kind = None
+            self._pending_remote_update_message = ""
+
+    def _begin_update_session(self, dialog, kind):
+        self._update_in_progress = True
+        self._active_update_dialog = dialog
+        self._active_update_kind = kind
+        self._pending_remote_update_message = ""
+
+    def _finish_update_session(self, success, message, detail_text=""):
+        dialog = self._active_update_dialog
+        self._update_in_progress = False
+        self._pending_remote_update_message = ""
+        self._active_update_kind = None
+        if dialog:
+            dialog.set_finished(success, message, detail_text)
+
+    def _set_active_update_progress(self, phase, message):
+        if not self._active_update_dialog:
+            return
+
+        header = self._pull_stage_header or message
+        detail_text = self._pull_summary_text
+        if phase in {"start", "stage"}:
+            self._active_update_dialog.set_progress(status_text=header, detail_text="", busy=True)
+        elif phase == "update":
+            if self._pull_layer_order:
+                self._active_update_dialog.set_progress(
+                    status_text=header,
+                    detail_text=detail_text,
+                    value=self.pull_overall_bar.value(),
+                    busy=False,
+                )
+            else:
+                self._active_update_dialog.set_progress(status_text=header, detail_text="", busy=True)
+        elif phase == "done":
+            self._active_update_dialog.set_progress(status_text=header, detail_text=detail_text, value=100, busy=False)
+        elif phase == "error":
+            self._active_update_dialog.set_progress(status_text=message, detail_text="", busy=False)
+
+    def _lookup_image_meta(self, image_ref):
+        from core.wsl_manager import MANAGED_IMAGES
+
+        for ref, name, desc, modes in MANAGED_IMAGES:
+            if ref == image_ref:
+                return name, desc
+        return image_ref, ""
+
+    def _start_remote_update(self, dialog):
+        self._begin_update_session(dialog, "remote")
+        self.log_viewer_app.append("<span style='color:#7ce0a3;'>[INFO]</span> 开始升级 Nekro Agent...")
+        if hasattr(self, "log_preview"):
+            self.log_preview.append("<span style='color:#7ce0a3;'>[INFO]</span> 开始升级 Nekro Agent...")
+        self.btn_update_action.setEnabled(False)
+        self.btn_primary_update.setEnabled(False)
+        self.btn_primary_update.setText("升级中...")
+        self.backend.run_remote_update()
+
+    def _start_single_image_update(self, image_ref, dialog):
+        widgets = self._image_row_widgets.get(image_ref)
+        if widgets:
+            widgets["btn"].setEnabled(False)
+            widgets["btn"].setText(self._img_spinner_frames[0])
+            widgets["status"].setText("更新中")
+        self._begin_update_session(dialog, f"image:{image_ref}")
+        self._img_checking_ref = image_ref
+        self._img_spinner_timer.start(100)
+        self.backend.pull_single_image(image_ref)
+
+    def _show_remote_update_dialog(self):
+        if self._update_in_progress:
+            self._show_notice_dialog("提示", "升级流程正在进行中，请等待当前操作完成。")
+            return
+        if not self.config.get("deploy_mode"):
+            self._show_notice_dialog("提示", "尚未完成部署，无法执行升级。")
+            return
+        if not hasattr(self.backend, "run_remote_update"):
+            self._show_notice_dialog("提示", f"当前后端 {self.backend.display_name} 暂不支持远程升级。")
+            return
+
+        dialog = self._create_update_dialog(
+            "确认升级",
+            "将从远端获取最新升级步骤，拉取最新版 Nekro Agent 镜像并重启服务。\n\n升级过程中可能需要确认是否备份数据目录。",
+            lambda dlg=None: self._start_remote_update(dialog),
+        )
+        dialog.exec()
+
+    def _show_image_update_dialog(self, image_ref):
+        if self._update_in_progress:
+            self._show_notice_dialog("提示", "当前已有更新任务正在进行，请等待完成后再试。")
+            return
+
+        image_name, image_desc = self._lookup_image_meta(image_ref)
+        desc = f"将拉取最新的 {image_name} 镜像并应用更新。"
+        if image_desc:
+            desc += f"\n\n{image_desc}"
+        dialog = self._create_update_dialog(
+            f"确认更新 {image_name}",
+            desc,
+            lambda dlg=None, ref=image_ref: self._start_single_image_update(ref, dialog),
+        )
+        dialog.exec()
 
     def create_sidebar_btn(self, text, index):
         button = QPushButton(text)
@@ -377,9 +494,48 @@ class MainWindow(QMainWindow):
                 if hasattr(self, "pull_spinner_label"):
                     self.pull_spinner_label.setText("⠋")
 
+    def _summarize_pull_layers(self):
+        total = len(self._pull_layer_order)
+        if total <= 0:
+            return ""
+
+        done = 0
+        downloading = 0
+        extracting = 0
+        verifying = 0
+        waiting = 0
+
+        for layer_id in self._pull_layer_order:
+            status = self._pull_layers.get(layer_id, "")
+            if status.startswith(("Pull complete", "Already exists", "Download complete")):
+                done += 1
+            elif status.startswith("Downloading"):
+                downloading += 1
+            elif status.startswith("Extracting"):
+                extracting += 1
+            elif status.startswith("Verifying"):
+                verifying += 1
+            elif status.startswith(("Waiting", "Pulling fs layer")):
+                waiting += 1
+
+        parts = [f"已完成 {done}/{total} 层"]
+        if downloading:
+            parts.append(f"下载中 {downloading} 层")
+        if extracting:
+            parts.append(f"解压中 {extracting} 层")
+        if verifying:
+            parts.append(f"校验中 {verifying} 层")
+        if waiting:
+            parts.append(f"等待中 {waiting} 层")
+        return "，".join(parts)
+
+    def _refresh_pull_status_label(self):
+        text_parts = [part for part in [self._pull_stage_header, self._pull_summary_text] if part]
+        self.pull_status_label.setText("\n".join(text_parts))
+
     def _update_pull_view(self, header="", detail=""):
         if header:
-            self.pull_status_label.setText(header)
+            self._pull_stage_header = header
         if detail:
             layer_match = re.match(r"^([a-f0-9]{6,64}):\s*(.+)$", detail, re.IGNORECASE)
             if layer_match:
@@ -396,9 +552,13 @@ class MainWindow(QMainWindow):
                 )
                 if total > 0:
                     self.pull_overall_bar.setValue(int(done * 100 / total))
+                self._pull_summary_text = self._summarize_pull_layers()
+        self._refresh_pull_status_label()
         self._set_pull_view_visible(True)
 
     def _clear_pull_progress(self):
+        self._pull_stage_header = ""
+        self._pull_summary_text = ""
         self._pull_layers.clear()
         self._pull_layer_order.clear()
         self.pull_status_label.setText("")
@@ -414,6 +574,8 @@ class MainWindow(QMainWindow):
             elif phase == "update":
                 self._update_pull_view(detail=message)
             elif phase == "stage":
+                self._pull_stage_header = message
+                self._pull_summary_text = ""
                 self._pull_layers.clear()
                 self._pull_layer_order.clear()
                 self.pull_overall_bar.setValue(0)
@@ -424,6 +586,7 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(2000, self._clear_pull_progress)
             elif phase == "error":
                 self._update_pull_view(header=message)
+            self._set_active_update_progress(phase, message)
             return
         if text in {"__docker_done__", "__docker_fail__"}:
             self._clear_pull_progress()
@@ -550,6 +713,8 @@ class MainWindow(QMainWindow):
         if running:
             self.btn_primary_deploy.setText("服务运行中")
             self.btn_primary_update.setText("升级 Nekro Agent")
+            if self._active_update_kind == "remote" and self._pending_remote_update_message:
+                self._finish_update_session(True, "升级完成", self._pending_remote_update_message)
             if hasattr(self, "_is_first_deploy") and self._is_first_deploy:
                 self._is_first_deploy = False
             if hasattr(self, "webview") and not was_running:
@@ -563,6 +728,13 @@ class MainWindow(QMainWindow):
             self.btn_log_napcat.setVisible(False)
             self.btn_primary_deploy.setText("开始部署")
             self.btn_primary_update.setText("升级 Nekro Agent" if not updating else "升级中...")
+            if self._active_update_kind == "remote" and status in {"启动失败", "更新失败", "启动超时", "已停止"}:
+                failure_message = (
+                    f"{self._pending_remote_update_message}\n\n最终状态：{status}"
+                    if self._pending_remote_update_message
+                    else f"升级后服务未能恢复：{status}"
+                )
+                self._finish_update_session(False, "升级失败", failure_message)
             if self._quit_after_stop and status in {"已停止", "已卸载"}:
                 self._quit_after_stop = False
                 QApplication.quit()
@@ -590,18 +762,24 @@ class MainWindow(QMainWindow):
             prompt,
             confirm_text="执行",
             cancel_text="跳过",
+            parent=self._active_update_dialog or self,
         )
         self.backend.reply_update_optional(confirmed)
 
     def _on_update_finished(self, success, message):
-        self._update_in_progress = False
         self.btn_primary_update.setText("升级 Nekro Agent")
         self.btn_update_action.setEnabled(bool(self.config.get("deploy_mode")))
         self.btn_primary_update.setEnabled(bool(self.config.get("deploy_mode")))
         if success:
-            self._show_notice_dialog("升级完成", message)
+            self._pending_remote_update_message = message
+            if self._active_update_dialog:
+                self._active_update_dialog.set_progress(
+                    status_text=message,
+                    detail_text="正在等待服务重新就绪...",
+                    busy=True,
+                )
         else:
-            self._show_notice_dialog("升级失败", message, danger=True)
+            self._finish_update_session(False, "升级失败", message)
 
     def init_home_page(self):
         page = QWidget()
@@ -1002,9 +1180,9 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
                 if image_ref == "kromiose/nekro-agent:latest":
-                    widgets["btn"].clicked.connect(lambda checked: self._update_services())
+                    widgets["btn"].clicked.connect(lambda checked: self._show_remote_update_dialog())
                 else:
-                    widgets["btn"].clicked.connect(lambda checked, ref=image_ref: self._do_image_update(ref))
+                    widgets["btn"].clicked.connect(lambda checked, ref=image_ref: self._show_image_update_dialog(ref))
             else:
                 widgets["local"].setText(entry["local"] or "—")
                 widgets["remote"].setText(entry["remote"] or "—")
@@ -1019,14 +1197,7 @@ class MainWindow(QMainWindow):
                 widgets["btn"].clicked.connect(lambda checked, ref=entry["image"]: self._check_single_image(ref))
 
     def _do_image_update(self, image_ref):
-        widgets = self._image_row_widgets.get(image_ref)
-        if widgets:
-            widgets["btn"].setEnabled(False)
-            widgets["btn"].setText(self._img_spinner_frames[0])
-            widgets["status"].setText("更新中")
-        self._img_checking_ref = image_ref
-        self._img_spinner_timer.start(100)
-        self.backend.pull_single_image(image_ref)
+        self._show_image_update_dialog(image_ref)
 
     def _on_image_pull_result(self, image_ref, success, message):
         self._img_spinner_timer.stop()
@@ -1043,21 +1214,17 @@ class MainWindow(QMainWindow):
             widgets["btn"].clicked.connect(lambda checked, ref=image_ref: self._check_single_image(ref))
             widgets["status"].setText("<span style='color:#3fb950;'>已更新</span>")
             widgets["status"].setTextFormat(Qt.TextFormat.RichText)
-            # 镜像特化提示
+            detail_text = ""
             if image_ref == "kromiose/nekro-cc-sandbox":
-                self._show_notice_dialog(
-                    "NA CC 沙盒已更新",
-                    "镜像拉取完成。\n\n请前往 WebUI → 工作区 → 工作区管理 → 对应工作区 → 沙盒容器，手动重建沙盒以应用新版本。"
-                )
+                detail_text = "请前往 WebUI → 工作区 → 工作区管理 → 对应工作区 → 沙盒容器，手动重建沙盒以应用新版本。"
             elif image_ref == "kromiose/nekro-agent-sandbox":
-                self._show_notice_dialog(
-                    "NA 沙盒已更新",
-                    "镜像拉取完成。\n\n沙盒由 Nekro Agent 动态创建销毁，新版本将在下次任务执行时自动生效，无需手动操作。"
-                )
+                detail_text = "沙盒由 Nekro Agent 动态创建销毁，新版本将在下次任务执行时自动生效，无需手动操作。"
+            self._finish_update_session(True, "更新完成", detail_text or message)
         else:
             widgets["btn"].setText("立即更新")
             widgets["status"].setText("<span style='color:#f26f82;'>更新失败</span>")
             widgets["status"].setTextFormat(Qt.TextFormat.RichText)
+            self._finish_update_session(False, "更新失败", message)
 
     def init_settings_page(self):
         page = QWidget()
@@ -1166,33 +1333,7 @@ class MainWindow(QMainWindow):
             self._show_notice_dialog("提示", f"无法打开目录，请确认服务已启动且目录已创建。\n\n路径: {win_path}\n错误: {error}", danger=True)
 
     def _update_services(self):
-        if self._update_in_progress:
-            self._show_notice_dialog("提示", "升级流程正在进行中，请等待当前操作完成。")
-            return
-        if not self.config.get("deploy_mode"):
-            self._show_notice_dialog("提示", "尚未完成部署，无法执行升级。")
-            return
-        if not hasattr(self.backend, "run_remote_update"):
-            self._show_notice_dialog("提示", f"当前后端 {self.backend.display_name} 暂不支持远程升级。")
-            return
-
-        reply = self._show_confirm_dialog(
-            "确认升级",
-            "将从远端获取最新升级步骤，拉取最新版 Nekro Agent 镜像并重启服务。\n\n升级过程中可能需要确认是否备份数据目录。",
-            confirm_text="开始升级",
-        )
-        if not reply:
-            return
-
-        self._update_in_progress = True
-        self.switch_tab(2)
-        self.log_viewer_app.append("<span style='color:#7ce0a3;'>[INFO]</span> 开始升级 Nekro Agent...")
-        if hasattr(self, "log_preview"):
-            self.log_preview.append("<span style='color:#7ce0a3;'>[INFO]</span> 开始升级 Nekro Agent...")
-        self.btn_update_action.setEnabled(False)
-        self.btn_primary_update.setEnabled(False)
-        self.btn_primary_update.setText("升级中...")
-        self.backend.run_remote_update()
+        self._show_remote_update_dialog()
 
     def _uninstall_environment(self):
         reply = self._show_confirm_dialog(

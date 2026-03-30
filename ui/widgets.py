@@ -1,6 +1,6 @@
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
-from PyQt6.QtWidgets import QDialog, QFrame, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QDialog, QFrame, QHBoxLayout, QLabel, QProgressBar, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
 from ui.styles import STYLESHEET
 
@@ -40,6 +40,191 @@ def show_notice_dialog(parent, title, text, button_text="确定", danger=False):
     layout.addLayout(button_row)
     dialog.adjustSize()
     dialog.exec()
+
+
+def create_install_progress_bar(minimum=0, maximum=0, height=8, radius=4):
+    bar = QProgressBar()
+    bar.setRange(minimum, maximum)
+    bar.setFixedHeight(height)
+    bar.setTextVisible(False)
+    bar.setStyleSheet(
+        f"QProgressBar {{ border: none; background: #e8e9eb; border-radius: {radius}px; }}"
+        f"QProgressBar::chunk {{ background: #0969da; border-radius: {radius}px; }}"
+    )
+    return bar
+
+
+class UpdateProgressDialog(QDialog):
+    confirmed = pyqtSignal()
+
+    def __init__(self, parent, title, text, confirm_text="开始更新"):
+        super().__init__(parent)
+        self._running = False
+        self._completed = False
+        self._spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        self._spinner_index = 0
+
+        self.setWindowTitle(title)
+        self.setMinimumWidth(400)
+        self.setMaximumWidth(520)
+        self.setWindowModality(Qt.WindowModality.WindowModal)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint)
+        self.setStyleSheet(STYLESHEET)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
+
+        title_label = QLabel(title)
+        title_label.setProperty("role", "dialog_title")
+        title_label.setWordWrap(True)
+        layout.addWidget(title_label)
+
+        self.desc_label = QLabel(text)
+        self.desc_label.setProperty("role", "dialog_desc")
+        self.desc_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.desc_label.setWordWrap(True)
+        layout.addWidget(self.desc_label)
+
+        progress_row = QHBoxLayout()
+        progress_row.setSpacing(10)
+
+        self.spinner_label = QLabel("⠋")
+        self.spinner_label.setStyleSheet("font-size: 16px; color: #58a6ff;")
+        self.spinner_label.setFixedWidth(20)
+        self.spinner_label.setVisible(False)
+        progress_row.addWidget(self.spinner_label, 0, Qt.AlignmentFlag.AlignTop)
+
+        progress_body = QVBoxLayout()
+        progress_body.setSpacing(8)
+
+        self.status_label = QLabel("")
+        self.status_label.setProperty("role", "dialog_desc")
+        self.status_label.setWordWrap(True)
+        self.status_label.setVisible(False)
+        progress_body.addWidget(self.status_label)
+
+        self.detail_label = QLabel("")
+        self.detail_label.setProperty("role", "dialog_desc")
+        self.detail_label.setWordWrap(True)
+        self.detail_label.setVisible(False)
+        progress_body.addWidget(self.detail_label)
+
+        self.progress_bar = create_install_progress_bar(0, 100, height=8, radius=4)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+        progress_body.addWidget(self.progress_bar)
+
+        progress_row.addLayout(progress_body, 1)
+        layout.addLayout(progress_row)
+
+        button_row = QHBoxLayout()
+        button_row.setSpacing(10)
+        button_row.addStretch()
+
+        self.cancel_button = QPushButton("取消")
+        self.cancel_button.clicked.connect(self.reject)
+        button_row.addWidget(self.cancel_button)
+
+        self.action_button = QPushButton(confirm_text)
+        self.action_button.setProperty("role", "primary")
+        self.action_button.clicked.connect(self._handle_action)
+        button_row.addWidget(self.action_button)
+
+        layout.addLayout(button_row)
+
+        self._spinner_timer = QTimer(self)
+        self._spinner_timer.timeout.connect(self._tick_spinner)
+
+    def _schedule_resize(self):
+        QTimer.singleShot(0, self._refresh_size)
+
+    def _refresh_size(self):
+        layout = self.layout()
+        if layout is None:
+            return
+        layout.activate()
+        self.adjustSize()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._schedule_resize()
+
+    def _handle_action(self):
+        if self._completed:
+            self.accept()
+            return
+        if self._running:
+            return
+        self.begin()
+        self.confirmed.emit()
+
+    def _tick_spinner(self):
+        self._spinner_index = (self._spinner_index + 1) % len(self._spinner_frames)
+        self.spinner_label.setText(self._spinner_frames[self._spinner_index])
+
+    def begin(self, status_text="正在准备更新..."):
+        self._running = True
+        self._completed = False
+        self.spinner_label.setVisible(True)
+        self.status_label.setVisible(True)
+        self.status_label.setText(status_text)
+        self.detail_label.clear()
+        self.detail_label.setVisible(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
+        self.cancel_button.setVisible(False)
+        self.action_button.setText("处理中...")
+        self.action_button.setEnabled(False)
+        self._spinner_timer.start(100)
+        self._schedule_resize()
+
+    def set_progress(self, status_text=None, detail_text=None, value=None, busy=None):
+        self.spinner_label.setVisible(True)
+        self.status_label.setVisible(True)
+        self.progress_bar.setVisible(True)
+
+        if status_text is not None:
+            self.status_label.setText(status_text)
+        if detail_text is not None:
+            self.detail_label.setText(detail_text)
+            self.detail_label.setVisible(bool(detail_text))
+        if busy is True:
+            self.progress_bar.setRange(0, 0)
+        elif busy is False:
+            if self.progress_bar.maximum() == 0:
+                self.progress_bar.setRange(0, 100)
+                if value is None:
+                    value = 0
+        if value is not None and self.progress_bar.maximum() != 0:
+            self.progress_bar.setValue(max(0, min(100, int(value))))
+        self._schedule_resize()
+
+    def set_finished(self, success, status_text, detail_text=""):
+        self._running = False
+        self._completed = True
+        self._spinner_timer.stop()
+        self.spinner_label.setVisible(True)
+        self.spinner_label.setText("✓" if success else "✗")
+        self.spinner_label.setStyleSheet(
+            "font-size: 16px; color: #3fb950;" if success else "font-size: 16px; color: #f26f82;"
+        )
+        self.status_label.setVisible(True)
+        self.status_label.setText(status_text)
+        self.detail_label.setText(detail_text)
+        self.detail_label.setVisible(bool(detail_text))
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(100 if success else max(1, self.progress_bar.value()))
+        self.cancel_button.setVisible(False)
+        self.action_button.setEnabled(True)
+        self.action_button.setText("完成")
+        self._schedule_resize()
+
+    def reject(self):
+        if self._running:
+            return
+        super().reject()
 
 
 class ActionButton(QPushButton):
