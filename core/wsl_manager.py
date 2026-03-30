@@ -17,7 +17,7 @@ from core.backend_base import BackendBase
 DISTRO_NAME = "NekroAgent"
 
 # 各部署模式需要的镜像清单
-REQUIRED_IMAGES = {
+REQUIRED_IMAGES_BASE = {
     "napcat": [
         "postgres:14",
         "qdrant/qdrant:v1.17.1",
@@ -36,11 +36,10 @@ REQUIRED_IMAGES = {
 }
 
 # 镜像管理页面展示的镜像（image, 显示名, 描述, 支持的模式）
-MANAGED_IMAGES = [
+MANAGED_IMAGES_BASE = [
     ("kromiose/nekro-agent:latest",  "Nekro Agent 本体", "NA 核心服务镜像",         ["napcat", "lite"]),
     ("kromiose/nekro-agent-sandbox", "NA 沙盒",          "代码执行沙盒环境",         ["napcat", "lite"]),
     ("kromiose/nekro-cc-sandbox",    "NA CC 沙盒",       "CC 扩展沙盒环境",          ["napcat", "lite"]),
-    ("mlikiowa/napcat-docker",       "NapCat",           "QQ 协议端（完整版专用）",  ["napcat"]),
 ]
 
 # Ubuntu 22.04 WSL rootfs 下载地址（按优先级排列）
@@ -90,6 +89,31 @@ class WSLManager(BackendBase):
         normalized = guest_path or "/"
         return f"\\\\wsl$\\{DISTRO_NAME}{normalized}"
 
+    @staticmethod
+    def get_agent_image_ref(config=None):
+        channel = "stable"
+        if config is not None:
+            try:
+                channel = config.get("release_channel") or "stable"
+            except Exception:
+                channel = "stable"
+        return PREVIEW_IMAGE if channel == "preview" else STABLE_IMAGE
+
+    @classmethod
+    def get_required_images(cls, deploy_mode, config=None):
+        agent_ref = cls.get_agent_image_ref(config)
+        base_images = REQUIRED_IMAGES_BASE.get(deploy_mode, REQUIRED_IMAGES_BASE["lite"])
+        return [agent_ref if image == STABLE_IMAGE else image for image in base_images]
+
+    @classmethod
+    def get_managed_images(cls, config=None):
+        agent_ref = cls.get_agent_image_ref(config)
+        managed = []
+        for image_ref, name, desc, modes in MANAGED_IMAGES_BASE:
+            current_ref = agent_ref if image_ref == STABLE_IMAGE else image_ref
+            managed.append((current_ref, name, desc, modes))
+        return managed
+
     def get_backup_size_hint(self):
         distro = DISTRO_NAME
         existing_targets = self._existing_backup_targets(distro)
@@ -124,7 +148,7 @@ class WSLManager(BackendBase):
 
     def _get_missing_images(self, distro, deploy_mode):
         """对比镜像清单，返回本地缺失的镜像列表"""
-        required = REQUIRED_IMAGES.get(deploy_mode, REQUIRED_IMAGES["lite"])
+        required = self.get_required_images(deploy_mode, self.config)
         local = self._get_local_images(distro)
 
         missing = []
@@ -333,7 +357,8 @@ class WSLManager(BackendBase):
         stripped = text.strip().lstrip('\ufeff\x00')
         # 去掉残留 null 字节后再判断
         stripped_clean = stripped.replace('\x00', '')
-        if stripped_clean.startswith("wsl:"):
+        compact = re.sub(r"\s+", "", stripped_clean).lower()
+        if compact.startswith("wsl:") or compact.startswith("wsl"):
             return True
         # 原文含大量 null 字节说明是 UTF-16 解码残留，直接过滤
         null_ratio = text.count('\x00') / len(text) if text else 0
@@ -360,6 +385,17 @@ class WSLManager(BackendBase):
         """解码并清理 stderr，过滤 WSL 噪音"""
         text = self._safe_decode(data)
         lines = [l for l in text.splitlines() if l.strip() and not self._is_wsl_noise(l)]
+        result = "\n".join(lines)
+        return result[:max_len] if max_len else result
+
+    def _clean_command_output(self, text, max_len=0):
+        """清理命令输出，过滤空白行和 WSL 噪音。"""
+        lines = []
+        for line in self._safe_decode(text).splitlines():
+            cleaned = line.strip()
+            if not cleaned or self._is_wsl_noise(cleaned):
+                continue
+            lines.append(cleaned)
         result = "\n".join(lines)
         return result[:max_len] if max_len else result
 
@@ -907,7 +943,7 @@ default = root
                 {"image": ref, "name": name, "modes": modes,
                  "local": "sha256:aabbccdd11", "remote": "sha256:eeff99887",
                  "has_update": True, "error": None}
-                for ref, name, desc, modes in MANAGED_IMAGES
+                for ref, name, desc, modes in self.get_managed_images(self.config)
                 if not only_image or ref == only_image
             ]
             self.image_status_result.emit(results)
@@ -917,7 +953,7 @@ default = root
 
         def _do_check():
             results = []
-            for image_ref, name, desc, modes in MANAGED_IMAGES:
+            for image_ref, name, desc, modes in self.get_managed_images(self.config):
                 if only_image and image_ref != only_image:
                     continue
                 image = image_ref.split(":")[0]
@@ -996,7 +1032,7 @@ default = root
                 capture_output=True, timeout=timeout,
                 creationflags=self._creation_flags(),
             )
-            out = self._safe_decode(proc.stdout) + self._safe_decode(proc.stderr)
+            out = self._clean_command_output(self._safe_decode(proc.stdout) + self._safe_decode(proc.stderr))
             return proc.returncode, out.strip()
 
         def _do_update():
@@ -1102,7 +1138,7 @@ default = root
                 timeout=timeout,
                 creationflags=self._creation_flags(),
             )
-            out = self._safe_decode(proc.stdout) + self._safe_decode(proc.stderr)
+            out = self._clean_command_output(self._safe_decode(proc.stdout) + self._safe_decode(proc.stderr))
             return proc.returncode, out.strip()
 
         def _emit_cmd_failure(prefix, rc, output):
@@ -1192,7 +1228,7 @@ default = root
                 timeout=timeout,
                 creationflags=self._creation_flags(),
             )
-            out = self._safe_decode(proc.stdout) + self._safe_decode(proc.stderr)
+            out = self._clean_command_output(self._safe_decode(proc.stdout) + self._safe_decode(proc.stderr))
             return proc.returncode, out.strip()
 
         def _rewrite_compose_to_stable():

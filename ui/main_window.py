@@ -1,11 +1,12 @@
 import re
 import os
 import sys
+import json
 import webbrowser
 from collections import OrderedDict
 
-from PyQt6.QtCore import QTimer, Qt, QUrl
-from PyQt6.QtGui import QCloseEvent, QColor, QIcon, QPixmap
+from PyQt6.QtCore import QRect, QSize, QTimer, Qt, QUrl
+from PyQt6.QtGui import QCloseEvent, QColor, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -25,6 +26,11 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QStackedWidget,
     QSystemTrayIcon,
+    QStyle,
+    QTabBar,
+    QStyleOptionTab,
+    QStylePainter,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -43,6 +49,98 @@ def get_resource_path(relative_path):
     else:
         base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, relative_path)
+
+
+class BrowserTabBar(QTabBar):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMovable(True)
+        self.setDrawBase(False)
+        self.setExpanding(False)
+        self.setMouseTracking(True)
+        self._close_rects = {}
+        self._hovered_close_index = -1
+
+    def _close_gap(self, text_width):
+        return max(6, min(14, int(text_width * 0.10)))
+
+    def tabSizeHint(self, index):
+        text = self.tabText(index) or ""
+        text_width = self.fontMetrics().horizontalAdvance(text)
+        width = 16 + text_width + self._close_gap(text_width) + 12 + 12
+        return QSize(max(96, width), 32)
+
+    def paintEvent(self, event):
+        painter = QStylePainter(self)
+        self._close_rects = {}
+        hovered_tab = self.tabAt(self.mapFromGlobal(self.cursor().pos())) if self.underMouse() else -1
+
+        for index in range(self.count()):
+            option = QStyleOptionTab()
+            self.initStyleOption(option, index)
+            rect = self.tabRect(index)
+            if not rect.isValid():
+                continue
+
+            option.text = ""
+            painter.drawControl(QStyle.ControlElement.CE_TabBarTabShape, option)
+
+            text = self.tabText(index) or ""
+            metrics = painter.fontMetrics()
+            raw_text_width = metrics.horizontalAdvance(text)
+            close_size = 12
+            close_gap = self._close_gap(raw_text_width)
+            close_x = min(rect.right() - close_size - 8, rect.x() + 16 + raw_text_width + close_gap)
+            close_rect = QRect(close_x, rect.y() + (rect.height() - close_size) // 2, close_size, close_size)
+            self._close_rects[index] = close_rect
+
+            text_rect = QRect(rect.x() + 14, rect.y(), max(12, close_rect.x() - rect.x() - 20), rect.height())
+            elided_text = metrics.elidedText(text, Qt.TextElideMode.ElideRight, text_rect.width())
+
+            if index == self.currentIndex():
+                text_color = QColor("#274055")
+            elif index == hovered_tab:
+                text_color = QColor("#3f5669")
+            else:
+                text_color = QColor("#607789")
+
+            painter.setPen(text_color)
+            baseline_y = text_rect.y() + (text_rect.height() + metrics.ascent() - metrics.descent()) // 2 + 4
+            painter.drawText(text_rect.x(), baseline_y, elided_text)
+
+            close_color = QColor("#bf655d") if index == self._hovered_close_index else QColor("#90a3b4")
+            painter.setPen(close_color)
+            close_font = painter.font()
+            close_font.setBold(True)
+            close_font.setPointSize(max(9, close_font.pointSize() - 1))
+            painter.setFont(close_font)
+            painter.drawText(close_rect, int(Qt.AlignmentFlag.AlignCenter), "×")
+
+    def mouseMoveEvent(self, event):
+        hovered = -1
+        for index, rect in self._close_rects.items():
+            if rect.contains(event.pos()):
+                hovered = index
+                break
+        if hovered != self._hovered_close_index:
+            self._hovered_close_index = hovered
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        if self._hovered_close_index != -1:
+            self._hovered_close_index = -1
+            self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            for index, rect in self._close_rects.items():
+                if rect.contains(event.pos()):
+                    self.tabCloseRequested.emit(index)
+                    event.accept()
+                    return
+        super().mousePressEvent(event)
 
 
 class MainWindow(QMainWindow):
@@ -67,6 +165,7 @@ class MainWindow(QMainWindow):
         self._pull_summary_text = ""
         self._pull_layers = OrderedDict()
         self._pull_layer_order = []
+        self._sidebar_collapsed = False
         self.browser_urls = {
             "nekro": f"http://localhost:{self.config.get('nekro_port') or 8021}",
             "napcat": f"http://localhost:{self.config.get('napcat_port') or 6099}",
@@ -114,9 +213,7 @@ class MainWindow(QMainWindow):
         sidebar_layout = QVBoxLayout(self.sidebar)
         sidebar_layout.setContentsMargins(22, 24, 22, 24)
         sidebar_layout.setSpacing(10)
-
-        brand_layout = QHBoxLayout()
-        brand_layout.setSpacing(12)
+        self.sidebar_layout = sidebar_layout
 
         self.logo_label = QLabel()
         self.logo_label.setFixedSize(42, 42)
@@ -128,29 +225,57 @@ class MainWindow(QMainWindow):
             self.logo_label.setPixmap(QPixmap(icon_path))
 
         brand_text = QVBoxLayout()
-        eyebrow = QLabel("本地部署控制台")
-        eyebrow.setObjectName("SidebarEyebrow")
-        title = QLabel("Nekro Agent")
-        title.setObjectName("SidebarTitle")
-        subtitle = QLabel("Windows 启动器")
-        subtitle.setObjectName("SidebarSubtitle")
-        brand_text.addWidget(eyebrow)
-        brand_text.addWidget(title)
-        brand_text.addWidget(subtitle)
+        self.sidebar_eyebrow = QLabel("本地部署控制台")
+        self.sidebar_eyebrow.setObjectName("SidebarEyebrow")
+        self.sidebar_title = QLabel("Nekro Agent")
+        self.sidebar_title.setObjectName("SidebarTitle")
+        self.sidebar_subtitle = QLabel("Windows 启动器")
+        self.sidebar_subtitle.setObjectName("SidebarSubtitle")
+        brand_text.addWidget(self.sidebar_eyebrow)
+        brand_text.addWidget(self.sidebar_title)
+        brand_text.addWidget(self.sidebar_subtitle)
 
+        self.sidebar_brand_text = QWidget()
+        self.sidebar_brand_text.setLayout(brand_text)
+
+        self.sidebar_toggle_btn = QPushButton("«")
+        self.sidebar_toggle_btn.setObjectName("SidebarToggle")
+        self.sidebar_toggle_btn.setFixedSize(30, 30)
+        self.sidebar_toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.sidebar_toggle_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.sidebar_toggle_btn.setToolTip("收起侧边栏")
+        self.sidebar_toggle_btn.clicked.connect(self._toggle_sidebar)
+
+        toggle_row = QHBoxLayout()
+        toggle_row.setContentsMargins(0, 0, 0, 0)
+        toggle_row.addStretch()
+        toggle_row.addWidget(self.sidebar_toggle_btn)
+        sidebar_layout.addLayout(toggle_row)
+
+        brand_layout = QHBoxLayout()
+        brand_layout.setSpacing(12)
+        self.sidebar_brand_layout = brand_layout
         brand_layout.addWidget(self.logo_label)
-        brand_layout.addLayout(brand_text, 1)
+        brand_layout.addWidget(self.sidebar_brand_text, 1)
         sidebar_layout.addLayout(brand_layout)
-        sidebar_layout.addSpacing(22)
+        sidebar_layout.addSpacing(18)
 
-        self.btn_home = self.create_sidebar_btn("总览控制台", 0)
-        self.btn_browser = self.create_sidebar_btn("服务访问", 1)
-        self.btn_logs = self.create_sidebar_btn("日志中心", 2)
-        self.btn_files = self.create_sidebar_btn("存储与路径", 3)
-        self.btn_images = self.create_sidebar_btn("镜像管理", 4)
-        self.btn_settings = self.create_sidebar_btn("系统设置", 5)
+        self.btn_home = self.create_sidebar_btn("总览控制台", "总览", 0)
+        self.btn_browser = self.create_sidebar_btn("服务访问", "访问", 1)
+        self.btn_logs = self.create_sidebar_btn("日志中心", "日志", 2)
+        self.btn_files = self.create_sidebar_btn("存储与路径", "存储", 3)
+        self.btn_images = self.create_sidebar_btn("镜像管理", "镜像", 4)
+        self.btn_settings = self.create_sidebar_btn("系统设置", "设置", 5)
+        self._sidebar_nav_buttons = [
+            self.btn_home,
+            self.btn_browser,
+            self.btn_logs,
+            self.btn_files,
+            self.btn_images,
+            self.btn_settings,
+        ]
 
-        for button in [self.btn_home, self.btn_browser, self.btn_logs, self.btn_files, self.btn_images, self.btn_settings]:
+        for button in self._sidebar_nav_buttons:
             sidebar_layout.addWidget(button)
 
         sidebar_layout.addStretch()
@@ -164,26 +289,31 @@ class MainWindow(QMainWindow):
             "QPushButton:hover { background: #f0f2f4; color: #24292f; }"
         )
 
-        btn_repo = QPushButton("⌂ 仓库")
-        btn_repo.setToolTip("主仓库: KroMiose/nekro-agent")
-        btn_repo.setFixedHeight(32)
-        btn_repo.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_repo.setStyleSheet(footer_btn_style)
-        btn_repo.clicked.connect(lambda: webbrowser.open("https://github.com/KroMiose/nekro-agent"))
-        footer_row.addWidget(btn_repo)
+        self.btn_repo = QPushButton("⌂ 仓库")
+        self.btn_repo.setProperty("full_text", "⌂ 仓库")
+        self.btn_repo.setProperty("compact_text", "⌂")
+        self.btn_repo.setToolTip("主仓库: KroMiose/nekro-agent")
+        self.btn_repo.setFixedHeight(32)
+        self.btn_repo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_repo.setStyleSheet(footer_btn_style)
+        self.btn_repo.clicked.connect(lambda: webbrowser.open("https://github.com/KroMiose/nekro-agent"))
+        footer_row.addWidget(self.btn_repo)
 
-        btn_feedback = QPushButton("✉ 反馈")
-        btn_feedback.setToolTip("反馈问题")
-        btn_feedback.setFixedHeight(32)
-        btn_feedback.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_feedback.setStyleSheet(footer_btn_style)
-        btn_feedback.clicked.connect(lambda: webbrowser.open("https://github.com/NekroAI/nekro-agent-for-windows/issues/new"))
-        footer_row.addWidget(btn_feedback)
+        self.btn_feedback = QPushButton("✉ 反馈")
+        self.btn_feedback.setProperty("full_text", "✉ 反馈")
+        self.btn_feedback.setProperty("compact_text", "✉")
+        self.btn_feedback.setToolTip("反馈问题")
+        self.btn_feedback.setFixedHeight(32)
+        self.btn_feedback.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_feedback.setStyleSheet(footer_btn_style)
+        self.btn_feedback.clicked.connect(lambda: webbrowser.open("https://github.com/NekroAI/nekro-agent-for-windows/issues/new"))
+        footer_row.addWidget(self.btn_feedback)
 
         footer_row.addStretch()
         sidebar_layout.addLayout(footer_row)
 
         root_layout.addWidget(self.sidebar)
+        self._apply_sidebar_state()
 
     def _add_page(self, page):
         scroll = QScrollArea()
@@ -202,7 +332,10 @@ class MainWindow(QMainWindow):
         scale = min(1.0, width / 1220.0)
         compact = width < 1040
 
-        sidebar_width = 248 if not compact else 212
+        if self._sidebar_collapsed:
+            sidebar_width = 74 if not compact else 66
+        else:
+            sidebar_width = 248 if not compact else 212
         self.sidebar.setFixedWidth(sidebar_width)
 
         logo_size = 42 if not compact else 34
@@ -210,6 +343,46 @@ class MainWindow(QMainWindow):
 
         for button in self._responsive_buttons:
             button.set_scale(scale)
+
+    def _toggle_sidebar(self):
+        self._sidebar_collapsed = not self._sidebar_collapsed
+        self._apply_sidebar_state()
+        self._apply_responsive_layout()
+
+    def _apply_sidebar_state(self):
+        collapsed = self._sidebar_collapsed
+        if hasattr(self, "sidebar"):
+            self.sidebar.setProperty("collapsed", collapsed)
+            self.sidebar.style().unpolish(self.sidebar)
+            self.sidebar.style().polish(self.sidebar)
+
+        if hasattr(self, "sidebar_brand_text"):
+            self.sidebar_brand_text.setVisible(not collapsed)
+        if hasattr(self, "logo_label"):
+            self.logo_label.setVisible(not collapsed)
+
+        if hasattr(self, "sidebar_toggle_btn"):
+            self.sidebar_toggle_btn.setText("»" if collapsed else "«")
+            self.sidebar_toggle_btn.setToolTip("展开侧边栏" if collapsed else "收起侧边栏")
+
+        if hasattr(self, "sidebar_layout"):
+            margins = (10, 18, 10, 18) if collapsed else (22, 24, 22, 24)
+            self.sidebar_layout.setContentsMargins(*margins)
+            self.sidebar_layout.setSpacing(8 if collapsed else 10)
+        if hasattr(self, "sidebar_brand_layout"):
+            self.sidebar_brand_layout.setSpacing(0 if collapsed else 12)
+
+        for button in getattr(self, "_sidebar_nav_buttons", []):
+            button.setProperty("collapsed", collapsed)
+            button.setText(button.property("compact_text") if collapsed else button.property("full_text"))
+            button.style().unpolish(button)
+            button.style().polish(button)
+
+        for button in [getattr(self, "btn_repo", None), getattr(self, "btn_feedback", None)]:
+            if button is None:
+                continue
+            button.setText(button.property("compact_text") if collapsed else button.property("full_text"))
+            button.setFixedWidth(32 if collapsed else 68)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -246,15 +419,169 @@ class MainWindow(QMainWindow):
                 return "恢复中..."
         return "恢复正式版" if self._release_channel() == "preview" else "切换至预览版"
 
+    def _agent_image_ref(self):
+        from core.wsl_manager import WSLManager
+
+        return WSLManager.get_agent_image_ref(self.config)
+
+    def _managed_images(self):
+        from core.wsl_manager import WSLManager
+
+        return WSLManager.get_managed_images(self.config)
+
+    def _browser_views(self):
+        if not hasattr(self, "browser_tabs"):
+            return []
+        return [
+            self.browser_tabs.widget(index)
+            for index in range(self.browser_tabs.count())
+            if isinstance(self.browser_tabs.widget(index), QWebEngineView)
+        ]
+
+    def _current_webview(self):
+        if not hasattr(self, "browser_tabs"):
+            return None
+        current_view = self.browser_tabs.currentWidget()
+        return current_view if isinstance(current_view, QWebEngineView) else None
+
+    def _browser_current_navigable_url(self):
+        current_view = self._current_webview()
+        if current_view:
+            current_url = current_view.url()
+            if current_url.isValid() and current_url.scheme().lower() in {"http", "https"}:
+                return current_url.toString()
+        return self._target_url()
+
+    def _sync_browser_url_label(self, url=None):
+        if not hasattr(self, "browser_url_label"):
+            return
+
+        display_url = None
+        if isinstance(url, QUrl) and url.isValid() and url.scheme().lower() in {"http", "https"}:
+            display_url = url.toString()
+        if not display_url:
+            display_url = self._browser_current_navigable_url()
+        self.browser_url_label.setText(display_url)
+
+    def _browser_tab_text(self, browser_view, title=None, url=None):
+        title_text = (title or browser_view.title() or "").strip()
+        if title_text:
+            return f"{title_text[:18]}..." if len(title_text) > 18 else title_text
+
+        target = browser_view.property("browser_target")
+        if target in {"nekro", "napcat"}:
+            return self._target_label(target)
+
+        current_url = url or browser_view.url()
+        if isinstance(current_url, QUrl) and current_url.isValid():
+            if current_url.host():
+                return current_url.host()
+            if current_url.toString():
+                return current_url.toString()[:18]
+
+        return "新标签页"
+
+    def _refresh_browser_nav_buttons(self):
+        current_view = self._current_webview()
+        has_view = current_view is not None
+
+        if hasattr(self, "browser_back_btn"):
+            self.browser_back_btn.setEnabled(has_view and current_view.history().canGoBack())
+        if hasattr(self, "browser_forward_btn"):
+            self.browser_forward_btn.setEnabled(has_view and current_view.history().canGoForward())
+        if hasattr(self, "browser_reload_btn"):
+            self.browser_reload_btn.setEnabled(has_view)
+        if hasattr(self, "browser_fill_credentials_btn"):
+            self.browser_fill_credentials_btn.setEnabled(has_view and self._has_fillable_browser_credentials())
+        if hasattr(self, "browser_open_external_btn"):
+            self.browser_open_external_btn.setEnabled(has_view)
+
+    def _has_fillable_browser_credentials(self):
+        info = self.config.get("deploy_info") or {}
+        current_view = self._current_webview()
+        target = current_view.property("browser_target") if current_view else self.current_browser_target
+        if target == "napcat":
+            return bool(info.get("napcat_token"))
+        return bool(info.get("admin_password"))
+
+    def _browser_fill_credentials_payload(self):
+        info = self.config.get("deploy_info") or {}
+        current_view = self._current_webview()
+        target = current_view.property("browser_target") if current_view else self.current_browser_target
+        if target == "napcat":
+            token = info.get("napcat_token", "")
+            if not token:
+                return None
+            return {"username": "", "password": token, "target": "napcat"}
+
+        password = info.get("admin_password", "")
+        if not password:
+            return None
+        return {"username": "admin", "password": password, "target": "nekro"}
+
+    def _update_browser_tab_label(self, browser_view, title=None, url=None):
+        if not hasattr(self, "browser_tabs"):
+            return
+        index = self.browser_tabs.indexOf(browser_view)
+        if index >= 0:
+            self.browser_tabs.setTabText(index, self._browser_tab_text(browser_view, title=title, url=url))
+
+    def _create_browser_tab(self, switch_to=True, title="新标签页"):
+        browser_view = QWebEngineView()
+        browser_view.setMinimumHeight(200)
+        browser_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        browser_view.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        browser_view.setAutoFillBackground(True)
+        browser_view.setStyleSheet("background: #ffffff; border: none;")
+        browser_view.page().setBackgroundColor(QColor("#ffffff"))
+        browser_view.urlChanged.connect(lambda changed_url, view=browser_view: self._on_browser_url_changed(view, changed_url))
+        browser_view.titleChanged.connect(lambda changed_title, view=browser_view: self._on_browser_title_changed(view, changed_title))
+        browser_view.page().newWindowRequested.connect(
+            lambda request, view=browser_view: self._handle_browser_new_window(view, request)
+        )
+
+        index = self.browser_tabs.addTab(browser_view, title)
+        if switch_to:
+            self.browser_tabs.setCurrentIndex(index)
+        self._refresh_browser_nav_buttons()
+        return browser_view
+
+    def _close_browser_tab(self, index):
+        if not hasattr(self, "browser_tabs") or index < 0 or index >= self.browser_tabs.count():
+            return
+
+        widget = self.browser_tabs.widget(index)
+        self.browser_tabs.removeTab(index)
+        if widget is not None:
+            widget.deleteLater()
+
+        if self.browser_tabs.count() == 0:
+            browser_view = self._create_browser_tab(switch_to=True, title=self._target_label(self.current_browser_target))
+            self._set_browser_target(self.current_browser_target, force_reload=True, browser_view=browser_view)
+        else:
+            self._on_browser_tab_changed(self.browser_tabs.currentIndex())
+
+    def _new_browser_tab(self):
+        current_view = self._current_webview()
+        new_view = self._create_browser_tab(switch_to=True, title="新标签页")
+        if current_view:
+            current_url = current_view.url()
+            if current_url.isValid() and current_url.scheme().lower() in {"http", "https"}:
+                new_view.setProperty("browser_target", current_view.property("browser_target"))
+                new_view.setUrl(current_url)
+                return
+        self._set_browser_target(self.current_browser_target, force_reload=True, browser_view=new_view)
+
     def _refresh_advanced_feature_ui(self):
         enabled = self._advanced_features_enabled()
         preview_mode = self._release_channel() == "preview"
         if hasattr(self, "btn_enable_advanced"):
             self.btn_enable_advanced.setText("关闭高级功能" if enabled else "启用高级功能")
             self.btn_enable_advanced.setChecked(enabled)
+            self.btn_enable_advanced.setEnabled(not (enabled and preview_mode))
         if hasattr(self, "advanced_hint"):
             self.advanced_hint.setText(
-                "当前处于预览版模式，可恢复到正式版。"
+                "当前处于预览版模式，高级功能已锁定；恢复到正式版后才可关闭。"
                 if enabled and preview_mode
                 else "已启用后，总览控制台会显示预览版入口。"
                 if enabled
@@ -274,8 +601,14 @@ class MainWindow(QMainWindow):
             self.btn_primary_preview.setVisible(enabled)
             self.btn_primary_preview.setEnabled(enabled and bool(self.config.get("deploy_mode")) and self._last_status != "更新中...")
             self.btn_primary_preview.setText(self._preview_button_label())
+        if hasattr(self, "browser_devtools_btn"):
+            self.browser_devtools_btn.setVisible(enabled)
+        if hasattr(self, "_image_rows_layout"):
+            self._rebuild_image_rows()
 
     def _toggle_advanced_features(self):
+        if self._advanced_features_enabled() and self._release_channel() == "preview":
+            return
         enabled = not self._advanced_features_enabled()
         self.config.set("advanced_features_enabled", enabled)
         self._refresh_advanced_feature_ui()
@@ -477,6 +810,7 @@ class MainWindow(QMainWindow):
         self._update_in_progress = False
         self._pending_remote_update_message = ""
         self._active_update_kind = None
+        self._refresh_advanced_feature_ui()
         if dialog:
             dialog.set_finished(success, message, detail_text)
 
@@ -504,9 +838,7 @@ class MainWindow(QMainWindow):
             self._active_update_dialog.set_progress(status_text=message, detail_text="", busy=False)
 
     def _lookup_image_meta(self, image_ref):
-        from core.wsl_manager import MANAGED_IMAGES
-
-        for ref, name, desc, modes in MANAGED_IMAGES:
+        for ref, name, desc, modes in self._managed_images():
             if ref == image_ref:
                 return name, desc
         return image_ref, ""
@@ -566,13 +898,17 @@ class MainWindow(QMainWindow):
         )
         dialog.exec()
 
-    def create_sidebar_btn(self, text, index):
+    def create_sidebar_btn(self, text, compact_text, index):
         button = QPushButton(text)
         button.setProperty("nav", True)
+        button.setProperty("full_text", text)
+        button.setProperty("compact_text", compact_text)
+        button.setProperty("collapsed", False)
         button.setCheckable(True)
         button.setFixedHeight(46)
         button.setCursor(Qt.CursorShape.PointingHandCursor)
         button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        button.setToolTip(text)
         button.clicked.connect(lambda: self.switch_tab(index))
         return button
 
@@ -788,10 +1124,14 @@ class MainWindow(QMainWindow):
     def _can_access_target(self, target):
         return target == "nekro" or self.config.get("deploy_mode") == "napcat"
 
-    def _set_browser_target(self, target, force_reload=False):
+    def _set_browser_target(self, target, force_reload=False, browser_view=None):
         if not self._can_access_target(target):
             self._show_notice_dialog("提示", "当前部署模式未启用 NapCat。")
             return
+
+        browser_view = browser_view or self._current_webview()
+        if browser_view is None:
+            browser_view = self._create_browser_tab(switch_to=True, title=self._target_label(target))
 
         self.current_browser_target = target
         self.btn_browser_nekro.setChecked(target == "nekro")
@@ -800,27 +1140,208 @@ class MainWindow(QMainWindow):
 
         target_name = self._target_label(target)
         target_url = self._target_url(target)
-        self.browser_url_label.setText(f"当前地址: {target_url}")
-        self.browser_hint.setText(f"内置 WebView 访问 {target_name} 管理界面；服务未就绪时可点击刷新重试。")
+        browser_view.setProperty("browser_target", target)
+        self._update_browser_tab_label(browser_view, title=target_name, url=QUrl(target_url))
+        if browser_view is self._current_webview():
+            self._sync_browser_url_label(QUrl(target_url))
 
         if getattr(self.backend, "is_running", False):
-            current_url = self.webview.url().toString()
+            current_url = browser_view.url().toString()
             if force_reload or current_url != target_url:
-                self.webview.setUrl(QUrl(target_url))
+                browser_view.setUrl(QUrl(target_url))
             else:
-                self.webview.reload()
+                browser_view.reload()
         else:
             placeholder = (
                 f"{target_name} 服务尚未启动。<br><br>"
                 "先在“总览控制台”完成部署，然后回到这里点击“刷新内嵌页面”。"
             )
-            self.webview.setHtml(f"<html><body style='font-family:Segoe UI;padding:24px;color:#243649;'>{placeholder}</body></html>")
+            browser_view.setHtml(f"<html><body style='font-family:Segoe UI;padding:24px;color:#243649;'>{placeholder}</body></html>")
+
+        self._refresh_browser_nav_buttons()
 
     def _reload_browser_view(self):
-        self._set_browser_target(self.current_browser_target, force_reload=True)
+        current_view = self._current_webview()
+        if current_view is None:
+            return
+        current_url = current_view.url()
+        if current_url.isValid() and current_url.scheme().lower() in {"http", "https"}:
+            current_view.reload()
+            return
+        self._set_browser_target(self.current_browser_target, force_reload=True, browser_view=current_view)
+
+    def _browser_go_back(self):
+        current_view = self._current_webview()
+        if current_view:
+            current_view.back()
+
+    def _browser_go_forward(self):
+        current_view = self._current_webview()
+        if current_view:
+            current_view.forward()
 
     def _open_current_in_browser(self):
-        webbrowser.open(self._target_url())
+        webbrowser.open(self._browser_current_navigable_url())
+
+    def _fill_browser_credentials(self):
+        current_view = self._current_webview()
+        if current_view is None:
+            return
+
+        payload = self._browser_fill_credentials_payload()
+        if not payload:
+            self._show_notice_dialog("提示", "尚未找到可用的登录凭据，请先完成部署。")
+            return
+
+        script = f"""
+(() => {{
+    const payload = {json.dumps(payload, ensure_ascii=False)};
+    const normalize = (value) => String(value || "").trim().toLowerCase();
+    const isVisible = (element) => {{
+        if (!element || element.disabled || element.readOnly) return false;
+        if (normalize(element.type) === "hidden") return false;
+        const style = window.getComputedStyle(element);
+        return style.display !== "none" && style.visibility !== "hidden";
+    }};
+    const inputs = Array.from(document.querySelectorAll("input, textarea")).filter(isVisible);
+    const scoreField = (element, hints, allowedTypes) => {{
+        const type = normalize(element.type) || "text";
+        if (allowedTypes && !allowedTypes.includes(type)) return -1;
+        const haystack = [
+            element.type,
+            element.name,
+            element.id,
+            element.placeholder,
+            element.autocomplete,
+            element.getAttribute("aria-label"),
+            element.getAttribute("data-testid"),
+            element.getAttribute("data-test"),
+        ].map(normalize).join(" ");
+        let score = 0;
+        for (const hint of hints) {{
+            if (haystack.includes(hint)) score += 3;
+        }}
+        if (type === "password" && hints.includes("password")) score += 5;
+        return score;
+    }};
+    const pickBest = (hints, allowedTypes) => {{
+        let best = null;
+        let bestScore = -1;
+        for (const element of inputs) {{
+            const score = scoreField(element, hints, allowedTypes);
+            if (score > bestScore) {{
+                best = element;
+                bestScore = score;
+            }}
+        }}
+        return bestScore > 0 ? best : null;
+    }};
+    const setValue = (element, value) => {{
+        if (!element) return false;
+        const prototype = element.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+        if (descriptor && descriptor.set) {{
+            descriptor.set.call(element, value);
+        }} else {{
+            element.value = value;
+        }}
+        element.dispatchEvent(new Event("input", {{ bubbles: true }}));
+        element.dispatchEvent(new Event("change", {{ bubbles: true }}));
+        return true;
+    }};
+
+    const usernameHints = ["username", "user", "account", "login", "admin", "用户名", "账号", "邮箱"];
+    const passwordHints = ["password", "passwd", "pass", "pwd", "密码", "token", "令牌", "access_token", "access token"];
+
+    let usernameField = null;
+    if (payload.username) {{
+        usernameField = pickBest(usernameHints, ["text", "email", "search"]);
+        if (!usernameField) {{
+            usernameField = inputs.find((element) => ["text", "email", "search"].includes(normalize(element.type) || "text")) || null;
+        }}
+    }}
+
+    let passwordField = inputs.find((element) => normalize(element.type) === "password") || null;
+    if (!passwordField) {{
+        passwordField = pickBest(passwordHints, ["password", "text", "search", "textarea"]);
+    }}
+    if (!passwordField && !payload.username && inputs.length === 1) {{
+        passwordField = inputs[0];
+    }}
+
+    const filledUser = payload.username ? setValue(usernameField, payload.username) : false;
+    const filledPass = payload.password ? setValue(passwordField, payload.password) : false;
+
+    return {{
+        filledUser,
+        filledPass,
+        inputCount: inputs.length,
+        target: payload.target,
+    }};
+}})();
+"""
+
+        def _handle_fill_result(result):
+            if not isinstance(result, dict):
+                self._show_notice_dialog("提示", "当前页面暂时无法自动填充登录凭据。")
+                return
+            if result.get("filledUser") or result.get("filledPass"):
+                return
+            self._show_notice_dialog("提示", "当前页面未发现可填充的登录表单。")
+
+        current_view.page().runJavaScript(script, _handle_fill_result)
+
+    def _on_browser_url_changed(self, browser_view, url):
+        self._update_browser_tab_label(browser_view, url=url)
+        if browser_view is self._current_webview():
+            self._sync_browser_url_label(url)
+            self._refresh_browser_nav_buttons()
+
+    def _on_browser_title_changed(self, browser_view, title):
+        self._update_browser_tab_label(browser_view, title=title)
+
+    def _on_browser_tab_changed(self, index):
+        if not hasattr(self, "browser_tabs") or index < 0:
+            return
+        current_view = self._current_webview()
+        if current_view:
+            self._sync_browser_url_label(current_view.url())
+        self._refresh_browser_nav_buttons()
+
+    def _handle_browser_new_window(self, source_view, request):
+        new_view = self._create_browser_tab(switch_to=True, title="新标签页")
+        new_view.setProperty("browser_target", source_view.property("browser_target"))
+        request.openIn(new_view.page())
+
+    def _open_browser_devtools(self):
+        devtools_window = getattr(self, "_devtools_window", None)
+        devtools_view = getattr(self, "_devtools_view", None)
+        current_view = self._current_webview()
+
+        if current_view is None:
+            return
+
+        if devtools_window is None or devtools_view is None:
+            devtools_window = QMainWindow()
+            devtools_window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+            devtools_window.setWindowTitle("WebView DevTools")
+            devtools_window.resize(1100, 720)
+
+            devtools_view = QWebEngineView(devtools_window)
+            devtools_window.setCentralWidget(devtools_view)
+
+            def _clear_devtools_refs(*_args):
+                self._devtools_window = None
+                self._devtools_view = None
+
+            devtools_window.destroyed.connect(_clear_devtools_refs)
+            self._devtools_window = devtools_window
+            self._devtools_view = devtools_view
+
+        self._devtools_view.page().setInspectedPage(current_view.page())
+        self._devtools_window.showNormal()
+        self._devtools_window.raise_()
+        self._devtools_window.activateWindow()
 
     def refresh_dashboard(self):
         if not hasattr(self, "status_badge"):
@@ -901,7 +1422,7 @@ class MainWindow(QMainWindow):
                 self._finish_update_session(True, success_title, self._pending_remote_update_message)
             if hasattr(self, "_is_first_deploy") and self._is_first_deploy:
                 self._is_first_deploy = False
-            if hasattr(self, "webview") and not was_running:
+            if self._current_webview() is not None and not was_running:
                 self.switch_tab(1)
                 self._set_browser_target(self.current_browser_target, force_reload=True)
             self._clear_pull_progress()
@@ -924,7 +1445,7 @@ class MainWindow(QMainWindow):
             if self._quit_after_stop and status in {"已停止", "已卸载"}:
                 self._quit_after_stop = False
                 QApplication.quit()
-            if hasattr(self, "webview") and was_running:
+            if self._current_webview() is not None and was_running:
                 self._set_browser_target(self.current_browser_target, force_reload=False)
             if status in {"启动失败", "更新失败", "启动超时", "已停止", "已卸载"}:
                 self._clear_pull_progress()
@@ -937,10 +1458,7 @@ class MainWindow(QMainWindow):
 
         if hasattr(self, "btn_browser_napcat"):
             self.btn_browser_napcat.setVisible(self.config.get("deploy_mode") == "napcat")
-        if hasattr(self, "browser_open_external_btn"):
-            self.browser_open_external_btn.setEnabled(running)
-        if hasattr(self, "browser_reload_btn"):
-            self.browser_reload_btn.setEnabled(True)
+        self._refresh_browser_nav_buttons()
 
     def _on_update_optional_confirm(self, step_label, prompt):
         confirmed = self._show_confirm_dialog(
@@ -1136,38 +1654,63 @@ class MainWindow(QMainWindow):
         card_layout.addLayout(target_row)
 
         toolbar = QHBoxLayout()
-        self.browser_url_label = QLabel()
-        self.browser_url_label.setObjectName("SectionDesc")
-        toolbar.addWidget(self.browser_url_label, 1)
+        self.browser_back_btn = QPushButton("后退")
+        self.browser_back_btn.setObjectName("SegmentBtn")
+        self.browser_back_btn.clicked.connect(self._browser_go_back)
+        toolbar.addWidget(self.browser_back_btn)
 
-        self.browser_reload_btn = QPushButton("刷新内嵌页面")
+        self.browser_forward_btn = QPushButton("前进")
+        self.browser_forward_btn.setObjectName("SegmentBtn")
+        self.browser_forward_btn.clicked.connect(self._browser_go_forward)
+        toolbar.addWidget(self.browser_forward_btn)
+
+        self.browser_reload_btn = QPushButton("刷新")
         self.browser_reload_btn.setObjectName("SegmentBtn")
         self.browser_reload_btn.clicked.connect(self._reload_browser_view)
         toolbar.addWidget(self.browser_reload_btn)
+
+        self.browser_url_label = QLineEdit()
+        self.browser_url_label.setObjectName("BrowserAddressBar")
+        self.browser_url_label.setReadOnly(True)
+        self.browser_url_label.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.browser_url_label.setMinimumWidth(320)
+        self.browser_url_label.setPlaceholderText("当前页面地址")
+        toolbar.addWidget(self.browser_url_label, 1)
+
+        self.browser_fill_credentials_btn = QPushButton("填充凭据")
+        self.browser_fill_credentials_btn.setObjectName("SegmentBtn")
+        self.browser_fill_credentials_btn.clicked.connect(self._fill_browser_credentials)
+        self.browser_fill_credentials_btn.setToolTip("将已保存的登录凭据填入当前页面")
+        toolbar.addWidget(self.browser_fill_credentials_btn)
 
         self.browser_open_external_btn = QPushButton("在系统浏览器打开")
         self.browser_open_external_btn.setObjectName("SegmentBtn")
         self.browser_open_external_btn.clicked.connect(self._open_current_in_browser)
         toolbar.addWidget(self.browser_open_external_btn)
+
+        self.browser_devtools_btn = QPushButton("开发者工具")
+        self.browser_devtools_btn.setObjectName("SegmentBtn")
+        self.browser_devtools_btn.clicked.connect(self._open_browser_devtools)
+        self.browser_devtools_btn.setVisible(self._advanced_features_enabled())
+        toolbar.addWidget(self.browser_devtools_btn)
         card_layout.addLayout(toolbar)
 
-        self.browser_hint = QLabel()
-        self.browser_hint.setObjectName("SectionDesc")
-        self.browser_hint.setWordWrap(True)
-        card_layout.addWidget(self.browser_hint)
-
-        self.webview = QWebEngineView()
-        self.webview.setMinimumHeight(200)
-        self.webview.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.webview.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
-        self.webview.setAutoFillBackground(True)
-        self.webview.setStyleSheet("background: #f4f7fb; border: 1px solid #dfe7ef; border-radius: 8px;")
-        self.webview.page().setBackgroundColor(QColor("#f4f7fb"))
-        card_layout.addWidget(self.webview, 1)
+        self.browser_tabs = QTabWidget()
+        self.browser_tabs.setObjectName("BrowserTabs")
+        self.browser_tabs.setTabBar(BrowserTabBar(self.browser_tabs))
+        self.browser_tabs.setDocumentMode(False)
+        self.browser_tabs.setMovable(True)
+        self.browser_tabs.setTabsClosable(False)
+        self.browser_tabs.setUsesScrollButtons(True)
+        self.browser_tabs.tabBar().tabCloseRequested.connect(self._close_browser_tab)
+        self.browser_tabs.currentChanged.connect(self._on_browser_tab_changed)
+        card_layout.addWidget(self.browser_tabs, 1)
 
         card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         layout.addWidget(card, 1)
+        self._create_browser_tab(switch_to=True, title=self._target_label("nekro"))
         self._set_browser_target("nekro")
+        self._refresh_browser_nav_buttons()
         self._add_page(page)
 
     def init_logs_page(self):
@@ -1270,9 +1813,45 @@ class MainWindow(QMainWindow):
         card_layout.addLayout(self._image_rows_layout)
         self._image_row_widgets = {}  # image_ref -> dict of labels
 
-        from core.wsl_manager import MANAGED_IMAGES
+        self._rebuild_image_rows()
+
+        btn_row = QHBoxLayout()
+        self.btn_check_images = QPushButton("检查全部更新")
+        self.btn_check_images.setObjectName("HeroSecondary")
+        self.btn_check_images.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_check_images.clicked.connect(self._check_images)
+        self._img_spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        self._img_spinner_idx = 0
+        self._img_spinner_timer = QTimer(self)
+        self._img_spinner_timer.timeout.connect(self._tick_img_spinner)
+        self._img_checking_ref = None  # 当前单独检测的 image_ref，None 表示全量
+        btn_row.addWidget(self.btn_check_images)
+        btn_row.addStretch()
+        card_layout.addLayout(btn_row)
+
+        layout.addWidget(card)
+        layout.addStretch()
+        self._add_page(page)
+
+    def _clear_layout(self, layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            child_layout = item.layout()
+            if widget is not None:
+                widget.deleteLater()
+            elif child_layout is not None:
+                self._clear_layout(child_layout)
+
+    def _rebuild_image_rows(self):
+        if not hasattr(self, "_image_rows_layout"):
+            return
+
+        self._clear_layout(self._image_rows_layout)
+        self._image_row_widgets = {}
+
         deploy_mode = self.config.get("deploy_mode") or "lite"
-        for image_ref, name, desc, modes in MANAGED_IMAGES:
+        for image_ref, name, desc, modes in self._managed_images():
             if deploy_mode not in modes:
                 continue
             row = QHBoxLayout()
@@ -1296,26 +1875,11 @@ class MainWindow(QMainWindow):
             row.addWidget(btn_single, 2)
             self._image_rows_layout.addLayout(row)
             self._image_row_widgets[image_ref] = {
-                "local": local_lbl, "remote": remote_lbl, "status": status_lbl, "btn": btn_single
+                "local": local_lbl,
+                "remote": remote_lbl,
+                "status": status_lbl,
+                "btn": btn_single,
             }
-
-        btn_row = QHBoxLayout()
-        self.btn_check_images = QPushButton("检查全部更新")
-        self.btn_check_images.setObjectName("HeroSecondary")
-        self.btn_check_images.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_check_images.clicked.connect(self._check_images)
-        self._img_spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-        self._img_spinner_idx = 0
-        self._img_spinner_timer = QTimer(self)
-        self._img_spinner_timer.timeout.connect(self._tick_img_spinner)
-        self._img_checking_ref = None  # 当前单独检测的 image_ref，None 表示全量
-        btn_row.addWidget(self.btn_check_images)
-        btn_row.addStretch()
-        card_layout.addLayout(btn_row)
-
-        layout.addWidget(card)
-        layout.addStretch()
-        self._add_page(page)
 
     def _tick_img_spinner(self):
         self._img_spinner_idx = (self._img_spinner_idx + 1) % len(self._img_spinner_frames)
@@ -1390,7 +1954,7 @@ class MainWindow(QMainWindow):
                     widgets["btn"].clicked.disconnect()
                 except Exception:
                     pass
-                if image_ref == "kromiose/nekro-agent:latest":
+                if image_ref == self._agent_image_ref():
                     widgets["btn"].clicked.connect(lambda checked: self._show_remote_update_dialog())
                 else:
                     widgets["btn"].clicked.connect(lambda checked, ref=image_ref: self._show_image_update_dialog(ref))
@@ -1540,9 +2104,10 @@ class MainWindow(QMainWindow):
                 # 刷新内置浏览器地址栏（强制更新 URL，不依赖 is_running 状态）
                 target_url = self._target_url(self.current_browser_target)
                 if hasattr(self, "browser_url_label"):
-                    self.browser_url_label.setText(f"当前地址: {target_url}")
-                if getattr(self.backend, "is_running", False) and hasattr(self, "webview"):
-                    self.webview.setUrl(QUrl(target_url))
+                    self._sync_browser_url_label(QUrl(target_url))
+                current_view = self._current_webview()
+                if getattr(self.backend, "is_running", False) and current_view is not None:
+                    current_view.setUrl(QUrl(target_url))
         except ValueError:
             pass
 

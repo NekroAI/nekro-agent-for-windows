@@ -54,6 +54,20 @@ QFrame#Sidebar {
     border-right: 1px solid #ecd9d6;
 }
 
+QPushButton#SidebarToggle {
+    background: rgba(255, 255, 255, 0.7);
+    border: 1px solid #ecd9d6;
+    border-radius: 8px;
+    color: #bf655d;
+    font-size: 14px;
+    font-weight: 700;
+}
+
+QPushButton#SidebarToggle:hover {
+    background: #ffffff;
+    border-color: #e7beb6;
+}
+
 QLabel#SidebarEyebrow {
     color: #d9807a;
     font-size: 11px;
@@ -93,6 +107,12 @@ QPushButton[nav="true"]:checked {
     background: #ffe8e3;
     border-color: #f1c4bc;
     color: #bf655d;
+}
+
+QPushButton[nav="true"][collapsed="true"] {
+    padding: 12px 0;
+    text-align: center;
+    font-size: 13px;
 }
 
 QLabel#SidebarFootnote {
@@ -193,6 +213,58 @@ QFrame#SectionCard {
     background: #ffffff;
     border: 1px solid #dfe7ef;
     border-radius: 8px;
+}
+
+QTabWidget#BrowserTabs::pane {
+    border: 1px solid #dfe7ef;
+    border-radius: 8px;
+    background: #ffffff;
+    top: 1px;
+}
+
+QTabWidget#BrowserTabs QTabBar {
+    left: 8px;
+}
+
+QTabWidget#BrowserTabs QTabBar::tab {
+    min-height: 32px;
+    padding: 0 14px;
+    margin-right: 4px;
+    margin-top: 6px;
+    background: #eef3f8;
+    border: 1px solid #d7e2ec;
+    border-top-left-radius: 8px;
+    border-top-right-radius: 8px;
+    color: #607789;
+    font-weight: 600;
+}
+
+QTabWidget#BrowserTabs QTabBar::tab:hover {
+    background: #f6f9fc;
+    border-color: #cddae6;
+    color: #3f5669;
+}
+
+QTabWidget#BrowserTabs QTabBar::tab:selected {
+    background: #ffffff;
+    border-color: #dfe7ef;
+    border-bottom-color: #ffffff;
+    color: #274055;
+}
+
+QLineEdit#BrowserAddressBar {
+    background: #f7f9fc;
+    border: 1px solid #d7e2ec;
+    border-radius: 17px;
+    padding: 6px 14px;
+    min-height: 22px;
+    color: #486173;
+    selection-background-color: #c8e6f5;
+}
+
+QLineEdit#BrowserAddressBar:focus {
+    border-color: #8fc5dd;
+    background: #ffffff;
 }
 
 QFrame#MetricCard[accent="blue"] {
