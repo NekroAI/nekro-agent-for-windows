@@ -1391,7 +1391,6 @@ default = root
                     self.config.set("deploy_mode", "")
                     self.config.set("wsl_distro", "")
                     self.config.set("wsl_install_dir", "")
-                    self.config.set("data_dir", "")
                     self.config.set("deploy_info", None)
 
                 self.status_changed.emit("已卸载")

@@ -88,7 +88,7 @@ QLabel#SidebarSubtitle {
 
 QPushButton[nav="true"] {
     background: transparent;
-    border: 1px solid transparent;
+    border: 1px solid #f1e4e0;
     border-radius: 8px;
     padding: 12px 14px;
     text-align: left;
@@ -113,6 +113,23 @@ QPushButton[nav="true"][collapsed="true"] {
     padding: 12px 0;
     text-align: center;
     font-size: 13px;
+}
+
+QPushButton#SidebarFootBtn {
+    background: rgba(255, 255, 255, 0.68);
+    border: 1px solid #eddeda;
+    border-radius: 10px;
+    padding: 6px 12px;
+    color: #586d7e;
+    font-size: 14px;
+    font-weight: 700;
+    text-align: center;
+}
+
+QPushButton#SidebarFootBtn:hover {
+    background: #ffffff;
+    border-color: #e7beb6;
+    color: #bf655d;
 }
 
 QLabel#SidebarFootnote {

@@ -6,6 +6,7 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                              QSizePolicy)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
+from core.port_utils import validate_port_bindings
 from ui.styles import STYLESHEET
 from ui.widgets import create_install_progress_bar, show_notice_dialog
 
@@ -644,8 +645,6 @@ class FirstRunDialog(QDialog):
         self.stack.addWidget(page)
 
     def _confirm_datadir(self):
-        data_dir = "/root/nekro_agent_data"
-
         # 校验端口
         try:
             nekro_port = int(self.nekro_port_edit.text().strip())
@@ -656,8 +655,15 @@ class FirstRunDialog(QDialog):
             self._show_notice_dialog("提示", "端口号必须为 1-65535 之间的整数")
             return
 
+        port_specs = [("Nekro Agent 端口", nekro_port)]
+        if getattr(self, "_selected_mode", "lite") == "napcat":
+            port_specs.append(("NapCat 端口", napcat_port))
+        ok, message = validate_port_bindings(port_specs)
+        if not ok:
+            self._show_notice_dialog("端口冲突", message)
+            return
+
         if self.config:
-            self.config.set("data_dir", data_dir)
             self.config.set("nekro_port", nekro_port)
             self.config.set("napcat_port", napcat_port)
             self.config.set("first_run", False)

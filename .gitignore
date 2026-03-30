@@ -16,6 +16,7 @@ installer/*.exe
 # 配置文件
 config.json
 image_config.json
+browser_profile/
 
 # 日志文件
 debug.log

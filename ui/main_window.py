@@ -35,10 +35,12 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 
 from core.backend_factory import BackendFactory
 from core.config_manager import ConfigManager
+from core.port_utils import validate_port_bindings
 from ui.styles import STYLESHEET
 from ui.widgets import ActionButton, MetricCard, SectionCard, UpdateProgressDialog, show_notice_dialog
 
@@ -171,6 +173,7 @@ class MainWindow(QMainWindow):
             "napcat": f"http://localhost:{self.config.get('napcat_port') or 6099}",
         }
         self.current_browser_target = "nekro"
+        self._init_browser_profile()
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -204,6 +207,21 @@ class MainWindow(QMainWindow):
         self._build_tray_icon()
         QTimer.singleShot(200, self._on_startup)
         QTimer.singleShot(0, self._apply_responsive_layout)
+
+    def _init_browser_profile(self):
+        profile_root = os.path.join(self.config.base_path, "browser_profile")
+        storage_path = os.path.join(profile_root, "storage")
+        cache_path = os.path.join(profile_root, "cache")
+        os.makedirs(storage_path, exist_ok=True)
+        os.makedirs(cache_path, exist_ok=True)
+
+        self.browser_profile = QWebEngineProfile("nekro_launcher", self)
+        self.browser_profile.setPersistentStoragePath(storage_path)
+        self.browser_profile.setCachePath(cache_path)
+        self.browser_profile.setPersistentCookiesPolicy(
+            QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies
+        )
+        self.browser_profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
 
     def _build_sidebar(self, root_layout):
         self.sidebar = QFrame()
@@ -283,33 +301,27 @@ class MainWindow(QMainWindow):
         footer_row = QHBoxLayout()
         footer_row.setSpacing(8)
 
-        footer_btn_style = (
-            "QPushButton { background: transparent; color: #57606a; font-size: 13px; font-weight: 600; "
-            "border: none; border-radius: 6px; padding: 6px 10px; text-align: left; }"
-            "QPushButton:hover { background: #f0f2f4; color: #24292f; }"
-        )
-
-        self.btn_repo = QPushButton("⌂ 仓库")
-        self.btn_repo.setProperty("full_text", "⌂ 仓库")
-        self.btn_repo.setProperty("compact_text", "⌂")
+        self.btn_repo = QPushButton("◧ 仓库")
+        self.btn_repo.setObjectName("SidebarFootBtn")
+        self.btn_repo.setProperty("full_text", "◧ 仓库")
+        self.btn_repo.setProperty("compact_text", "◧")
         self.btn_repo.setToolTip("主仓库: KroMiose/nekro-agent")
         self.btn_repo.setFixedHeight(32)
         self.btn_repo.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_repo.setStyleSheet(footer_btn_style)
         self.btn_repo.clicked.connect(lambda: webbrowser.open("https://github.com/KroMiose/nekro-agent"))
-        footer_row.addWidget(self.btn_repo)
+        footer_row.addWidget(self.btn_repo, 0, Qt.AlignmentFlag.AlignLeft)
 
-        self.btn_feedback = QPushButton("✉ 反馈")
-        self.btn_feedback.setProperty("full_text", "✉ 反馈")
-        self.btn_feedback.setProperty("compact_text", "✉")
+        footer_row.addStretch()
+
+        self.btn_feedback = QPushButton("✦ 反馈")
+        self.btn_feedback.setObjectName("SidebarFootBtn")
+        self.btn_feedback.setProperty("full_text", "✦ 反馈")
+        self.btn_feedback.setProperty("compact_text", "✦")
         self.btn_feedback.setToolTip("反馈问题")
         self.btn_feedback.setFixedHeight(32)
         self.btn_feedback.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_feedback.setStyleSheet(footer_btn_style)
         self.btn_feedback.clicked.connect(lambda: webbrowser.open("https://github.com/NekroAI/nekro-agent-for-windows/issues/new"))
-        footer_row.addWidget(self.btn_feedback)
-
-        footer_row.addStretch()
+        footer_row.addWidget(self.btn_feedback, 0, Qt.AlignmentFlag.AlignRight)
         sidebar_layout.addLayout(footer_row)
 
         root_layout.addWidget(self.sidebar)
@@ -382,7 +394,7 @@ class MainWindow(QMainWindow):
             if button is None:
                 continue
             button.setText(button.property("compact_text") if collapsed else button.property("full_text"))
-            button.setFixedWidth(32 if collapsed else 68)
+            button.setFixedWidth(32 if collapsed else 84)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -528,15 +540,17 @@ class MainWindow(QMainWindow):
 
     def _create_browser_tab(self, switch_to=True, title="新标签页"):
         browser_view = QWebEngineView()
+        browser_page = QWebEnginePage(self.browser_profile, browser_view)
+        browser_view.setPage(browser_page)
         browser_view.setMinimumHeight(200)
         browser_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         browser_view.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         browser_view.setAutoFillBackground(True)
         browser_view.setStyleSheet("background: #ffffff; border: none;")
-        browser_view.page().setBackgroundColor(QColor("#ffffff"))
+        browser_page.setBackgroundColor(QColor("#ffffff"))
         browser_view.urlChanged.connect(lambda changed_url, view=browser_view: self._on_browser_url_changed(view, changed_url))
         browser_view.titleChanged.connect(lambda changed_title, view=browser_view: self._on_browser_title_changed(view, changed_title))
-        browser_view.page().newWindowRequested.connect(
+        browser_page.newWindowRequested.connect(
             lambda request, view=browser_view: self._handle_browser_new_window(view, request)
         )
 
@@ -1348,20 +1362,46 @@ class MainWindow(QMainWindow):
             return
 
         mode_text = self._format_mode_text(self.config.get("deploy_mode"))
-        data_dir = self.config.get("data_dir") or "/root/nekro_agent_data"
-        host_data = self.backend.get_host_access_path(data_dir) or "当前后端暂未提供直接映射"
 
-        self.metric_backend.findChild(QLabel, "MetricValue").setText(self.backend.display_name)
         self.metric_mode.findChild(QLabel, "MetricValue").setText(mode_text)
-        self.metric_data_dir.findChild(QLabel, "MetricValue").setText(data_dir)
-        self.metric_data_dir.findChild(QLabel, "MetricHint").setText(
-            f"宿主机访问路径: {host_data}"
-        )
+        self._refresh_metric_data_dir_card()
 
         if hasattr(self, "mode_display"):
             self.mode_display.setText(mode_text)
         if hasattr(self, "wsldir_edit"):
             self.wsldir_edit.setText(self.config.get("wsl_install_dir") or "未配置")
+
+    def _refresh_metric_data_dir_card(self):
+        if not hasattr(self, "metric_data_dir"):
+            return
+
+        data_dir = "/root/nekro_agent_data"
+        host_data = self.backend.get_host_access_path(data_dir)
+        value_label = self.metric_data_dir.findChild(QLabel, "MetricValue")
+        hint_label = self.metric_data_dir.findChild(QLabel, "MetricHint")
+
+        if value_label is not None:
+            value_label.setText(host_data or "当前后端暂未提供 Windows 映射路径")
+        if hint_label is not None:
+            hint_label.setText("点击打开 Windows 侧文件夹" if host_data else f"容器内路径: {data_dir}")
+
+        self.metric_data_dir.setToolTip(host_data or data_dir)
+        self.metric_data_dir.setCursor(
+            Qt.CursorShape.PointingHandCursor if host_data else Qt.CursorShape.ArrowCursor
+        )
+        self.metric_data_dir.mousePressEvent = (
+            self._open_dashboard_datadir_card if host_data else self._ignore_metric_click
+        )
+
+    def _ignore_metric_click(self, event):
+        event.ignore()
+
+    def _open_dashboard_datadir_card(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._open_datadir_in_explorer()
+            event.accept()
+            return
+        event.ignore()
 
     def start_deploy(self, show_logs=True):
         if self.backend.is_running:
@@ -1567,18 +1607,17 @@ class MainWindow(QMainWindow):
         metrics.setHorizontalSpacing(16)
         metrics.setVerticalSpacing(16)
         self.metric_status = MetricCard("服务状态", "未就绪", "等待部署或启动", "red")
-        self.metric_backend = MetricCard("运行后端", self.backend.display_name, "当前系统配置", "blue")
-        self.metric_mode = MetricCard("部署版本", self._format_mode_text(self.config.get("deploy_mode")), "首次运行向导可修改", "amber")
+        self.metric_mode = MetricCard("部署版本", self._format_mode_text(self.config.get("deploy_mode")), "运行向导可修改", "amber")
         self.metric_data_dir = MetricCard(
             "数据目录",
-            self.config.get("data_dir") or "/root/nekro_agent_data",
-            "宿主机访问路径将在这里显示",
+            self.backend.get_host_access_path("/root/nekro_agent_data")
+            or "当前后端暂未提供 Windows 映射路径",
+            "点击打开 Windows 侧文件夹",
             "green",
         )
         metrics.addWidget(self.metric_status, 0, 0)
-        metrics.addWidget(self.metric_backend, 0, 1)
-        metrics.addWidget(self.metric_mode, 1, 0)
-        metrics.addWidget(self.metric_data_dir, 1, 1)
+        metrics.addWidget(self.metric_mode, 0, 1)
+        metrics.addWidget(self.metric_data_dir, 0, 2)
         layout.addLayout(metrics)
 
         bottom_grid = QGridLayout()
@@ -2052,6 +2091,7 @@ class MainWindow(QMainWindow):
         datadir_box.addWidget(self.datadir_edit)
 
         btn_open_datadir = QPushButton("打开目录")
+        btn_open_datadir.setObjectName("HeroSecondary")
         btn_open_datadir.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_open_datadir.clicked.connect(self._open_datadir_in_explorer)
         datadir_box.addWidget(btn_open_datadir)
@@ -2067,14 +2107,18 @@ class MainWindow(QMainWindow):
         card_layout.addWidget(QLabel("Nekro Agent 端口"))
         self.nekro_port_setting = QLineEdit(str(self.config.get("nekro_port") or 8021))
         self.nekro_port_setting.setPlaceholderText("8021")
-        self.nekro_port_setting.editingFinished.connect(self._save_ports)
         card_layout.addWidget(self.nekro_port_setting)
 
         card_layout.addWidget(QLabel("NapCat 端口"))
         self.napcat_port_setting = QLineEdit(str(self.config.get("napcat_port") or 6099))
         self.napcat_port_setting.setPlaceholderText("6099")
-        self.napcat_port_setting.editingFinished.connect(self._save_ports)
         card_layout.addWidget(self.napcat_port_setting)
+
+        btn_save_ports = QPushButton("保存端口设置")
+        btn_save_ports.setObjectName("HeroSecondary")
+        btn_save_ports.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_save_ports.clicked.connect(self._save_ports)
+        card_layout.addWidget(btn_save_ports, 0, Qt.AlignmentFlag.AlignLeft)
 
         port_hint = QLabel("修改端口后需重新部署服务才能生效。")
         port_hint.setObjectName("SectionDesc")
@@ -2090,26 +2134,46 @@ class MainWindow(QMainWindow):
         try:
             nekro_port = int(self.nekro_port_setting.text().strip())
             napcat_port = int(self.napcat_port_setting.text().strip())
-            if 1 <= nekro_port <= 65535 and 1 <= napcat_port <= 65535:
-                self.config.set("nekro_port", nekro_port)
-                self.config.set("napcat_port", napcat_port)
-                self.browser_urls["nekro"] = f"http://localhost:{nekro_port}"
-                self.browser_urls["napcat"] = f"http://localhost:{napcat_port}"
-                # 同步更新已保存的 deploy_info 里的端口，避免凭据弹窗显示旧端口
-                deploy_info = self.config.get("deploy_info")
-                if deploy_info:
-                    deploy_info["port"] = str(nekro_port)
-                    deploy_info["napcat_port"] = str(napcat_port)
-                    self.config.set("deploy_info", deploy_info)
-                # 刷新内置浏览器地址栏（强制更新 URL，不依赖 is_running 状态）
-                target_url = self._target_url(self.current_browser_target)
-                if hasattr(self, "browser_url_label"):
-                    self._sync_browser_url_label(QUrl(target_url))
-                current_view = self._current_webview()
-                if getattr(self.backend, "is_running", False) and current_view is not None:
-                    current_view.setUrl(QUrl(target_url))
+            if not (1 <= nekro_port <= 65535 and 1 <= napcat_port <= 65535):
+                raise ValueError
+
+            ignore_ports = set()
+            if getattr(self.backend, "is_running", False):
+                current_nekro = int(self.config.get("nekro_port") or 8021)
+                current_napcat = int(self.config.get("napcat_port") or 6099)
+                if nekro_port == current_nekro:
+                    ignore_ports.add(nekro_port)
+                if napcat_port == current_napcat:
+                    ignore_ports.add(napcat_port)
+
+            ok, message = validate_port_bindings(
+                [("Nekro Agent 端口", nekro_port), ("NapCat 端口", napcat_port)],
+                ignore_ports=ignore_ports,
+            )
+            if not ok:
+                self._show_notice_dialog("端口冲突", message)
+                return
+
+            self.config.set("nekro_port", nekro_port)
+            self.config.set("napcat_port", napcat_port)
+            self.browser_urls["nekro"] = f"http://localhost:{nekro_port}"
+            self.browser_urls["napcat"] = f"http://localhost:{napcat_port}"
+            # 同步更新已保存的 deploy_info 里的端口，避免凭据弹窗显示旧端口
+            deploy_info = self.config.get("deploy_info")
+            if deploy_info:
+                deploy_info["port"] = str(nekro_port)
+                deploy_info["napcat_port"] = str(napcat_port)
+                self.config.set("deploy_info", deploy_info)
+            # 刷新内置浏览器地址栏（强制更新 URL，不依赖 is_running 状态）
+            target_url = self._target_url(self.current_browser_target)
+            if hasattr(self, "browser_url_label"):
+                self._sync_browser_url_label(QUrl(target_url))
+            current_view = self._current_webview()
+            if getattr(self.backend, "is_running", False) and current_view is not None:
+                current_view.setUrl(QUrl(target_url))
+            self._show_notice_dialog("保存成功", "端口设置已保存，重新部署服务后生效。")
         except ValueError:
-            pass
+            self._show_notice_dialog("提示", "请输入有效的端口号（1-65535）。")
 
     def _refresh_datadir_hint(self):
         sample_path = self.backend.get_host_access_path("/root/nekro_agent_data")
@@ -2119,8 +2183,7 @@ class MainWindow(QMainWindow):
             self.datadir_hint.setText(f"当前后端 {self.backend.display_name} 暂未提供宿主机侧直接打开路径。")
 
     def _open_datadir_in_explorer(self):
-        data_dir = "/root/nekro_agent_data"
-        win_path = self.backend.get_host_access_path(data_dir)
+        win_path = self.backend.get_host_access_path("/root/nekro_agent_data")
         if not win_path:
             self._show_notice_dialog("提示", f"当前后端 {self.backend.display_name} 暂不支持直接打开宿主机路径。")
             return
@@ -2161,12 +2224,11 @@ class MainWindow(QMainWindow):
         card_layout = card.body_layout()
 
         dirs_info = [
-            ("DATA", "数据目录", "存储数据库、配置、日志等运行数据", "data_dir", "/root/nekro_agent_data"),
-            ("CONF", "部署目录", "存储 docker-compose 和 .env 配置文件", None, "/root/nekro_agent"),
+            ("DATA", "数据目录", "存储数据库、配置、日志等运行数据", "/root/nekro_agent_data"),
+            ("CONF", "部署目录", "存储 docker-compose 和 .env 配置文件", "/root/nekro_agent"),
         ]
-        for badge, title, hint, config_key, default_path in dirs_info:
+        for badge, title, hint, wsl_path in dirs_info:
             button = ActionButton(badge, title, hint)
-            wsl_path = self.config.get(config_key) or default_path if config_key else default_path
             button.clicked.connect(lambda checked, path=wsl_path: self._open_wsl_path(path))
             card_layout.addWidget(button)
             self._register_responsive_buttons(button)

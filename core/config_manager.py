@@ -29,12 +29,14 @@ class ConfigManager:
             "deploy_mode": "",       # "lite" 或 "napcat"
             "wsl_distro": "",        # 检测到的发行版名称
             "wsl_install_dir": "",   # WSL 发行版安装目录 (Windows 路径)
-            "data_dir": "",          # WSL 内数据目录路径
             "nekro_port": 8021,      # Nekro Agent 对外端口
             "napcat_port": 6099,     # NapCat 对外端口
             "runtime_image_cache": "runtime_cache",
         }
         self.config = self.load_config()
+        if "data_dir" in self.config:
+            self.config.pop("data_dir", None)
+            self.save_config()
 
     def load_config(self):
         if os.path.exists(self.config_path):
