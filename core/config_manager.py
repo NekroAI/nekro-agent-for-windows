@@ -22,6 +22,9 @@ class ConfigManager:
             "backend": "wsl",
             "shared_dir": "shared",
             "autostart": False,
+            "advanced_features_enabled": False,
+            "release_channel": "stable",
+            "preview_backup_available": False,
             "first_run": True,
             "deploy_mode": "",       # "lite" 或 "napcat"
             "wsl_distro": "",        # 检测到的发行版名称

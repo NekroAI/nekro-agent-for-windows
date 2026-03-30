@@ -10,11 +10,11 @@
     {
       "step": 2,
       "type": "shell",
-      "label": "创建数据目录备份",
-      "command": "cp -r /root/nekro_agent_data /root/nekro_agent_data_backup",
+      "label": "创建运行数据备份归档",
+      "command": "rm -f /root/na_update_backup.tar.gz && tar -czf /root/na_update_backup.tar.gz -C / root/nekro_agent_data root/nekro_agent",
       "optional": true,
-      "optional_prompt": "是否在更新前备份数据目录？\n备份数据需要占用约 {backup_size} 空间，请确保硬盘具有足够的空间。若需要减少备份数据大小，可在「NekroAgent WebUI > 系统配置 > 空间回收」中清理不必要的资源后再进行备份。",
-      "optional_size_cmd": "du -sh /root/nekro_agent_data | cut -f1"
+      "optional_prompt": "是否在更新前备份当前运行数据与部署配置？\n备份文件将写入 /root/na_update_backup.tar.gz。\n预计占用约 {backup_size} 空间。\n\n备份目录如下：\n/root/nekro_agent_data\n/root/nekro_agent",
+      "optional_size_cmd": "du -shc /root/nekro_agent_data /root/nekro_agent | tail -n1 | cut -f1"
     },
     {
       "step": 3,

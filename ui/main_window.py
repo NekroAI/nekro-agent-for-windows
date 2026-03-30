@@ -232,6 +232,186 @@ class MainWindow(QMainWindow):
     def _show_notice_dialog(self, title, text, button_text="确定", danger=False):
         show_notice_dialog(self, title, text, button_text, danger)
 
+    def _advanced_features_enabled(self):
+        return bool(self.config.get("advanced_features_enabled"))
+
+    def _release_channel(self):
+        return self.config.get("release_channel") or "stable"
+
+    def _preview_button_label(self):
+        if self._update_in_progress:
+            if self._active_update_kind == "preview":
+                return "切换中..."
+            if self._active_update_kind == "restore":
+                return "恢复中..."
+        return "恢复正式版" if self._release_channel() == "preview" else "切换至预览版"
+
+    def _refresh_advanced_feature_ui(self):
+        enabled = self._advanced_features_enabled()
+        preview_mode = self._release_channel() == "preview"
+        if hasattr(self, "btn_enable_advanced"):
+            self.btn_enable_advanced.setText("关闭高级功能" if enabled else "启用高级功能")
+            self.btn_enable_advanced.setChecked(enabled)
+        if hasattr(self, "advanced_hint"):
+            self.advanced_hint.setText(
+                "当前处于预览版模式，可恢复到正式版。"
+                if enabled and preview_mode
+                else "已启用后，总览控制台会显示预览版入口。"
+                if enabled
+                else "开启后会在总览控制台显示“切换至预览版”入口。"
+            )
+        if hasattr(self, "advanced_status_badge"):
+            self.advanced_status_badge.setText("预览版模式" if preview_mode else "高级功能已启用")
+            self.advanced_status_badge.setVisible(enabled)
+        if hasattr(self, "advanced_status_hint"):
+            self.advanced_status_hint.setText(
+                "当前运行的是预览版，可使用备份归档恢复到正式版。"
+                if preview_mode
+                else "预览版入口已开放，可直接切换至预览版。"
+            )
+            self.advanced_status_hint.setVisible(enabled)
+        if hasattr(self, "btn_primary_preview"):
+            self.btn_primary_preview.setVisible(enabled)
+            self.btn_primary_preview.setEnabled(enabled and bool(self.config.get("deploy_mode")) and self._last_status != "更新中...")
+            self.btn_primary_preview.setText(self._preview_button_label())
+
+    def _toggle_advanced_features(self):
+        enabled = not self._advanced_features_enabled()
+        self.config.set("advanced_features_enabled", enabled)
+        self._refresh_advanced_feature_ui()
+
+    def _active_update_result_titles(self):
+        if self._active_update_kind == "preview":
+            return "切换完成", "切换失败"
+        if self._active_update_kind == "restore":
+            return "恢复完成", "恢复失败"
+        return "升级完成", "升级失败"
+
+    def _start_preview_switch(self, dialog, create_backup):
+        self._begin_update_session(dialog, "preview")
+        self.btn_primary_preview.setEnabled(False)
+        self.btn_primary_preview.setText(self._preview_button_label())
+        self.log_viewer_app.append("<span style='color:#7ce0a3;'>[INFO]</span> 开始切换到预览版 Nekro Agent...")
+        if hasattr(self, "log_preview"):
+            self.log_preview.append("<span style='color:#7ce0a3;'>[INFO]</span> 开始切换到预览版 Nekro Agent...")
+        self.backend.switch_to_preview(create_backup=create_backup)
+
+    def _start_restore_stable(self, dialog):
+        self._begin_update_session(dialog, "restore")
+        self.btn_primary_preview.setEnabled(False)
+        self.btn_primary_preview.setText(self._preview_button_label())
+        self.log_viewer_app.append("<span style='color:#7ce0a3;'>[INFO]</span> 开始恢复正式版 Nekro Agent...")
+        if hasattr(self, "log_preview"):
+            self.log_preview.append("<span style='color:#7ce0a3;'>[INFO]</span> 开始恢复正式版 Nekro Agent...")
+        self.backend.restore_stable_from_backup()
+
+    def _show_preview_switch_dialog(self, backup_size):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("确认切换至预览版")
+        dialog.setMinimumWidth(420)
+        dialog.setMaximumWidth(560)
+        dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        dialog.setStyleSheet(STYLESHEET)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
+
+        title_label = QLabel("确认切换至预览版")
+        title_label.setProperty("role", "dialog_title")
+        title_label.setWordWrap(True)
+        layout.addWidget(title_label)
+
+        desc_label = QLabel(
+            "默认会先备份全量数据，再把 Nekro Agent 主容器切换到预览版镜像。\n\n"
+            "备份文件将写入 /root/na_preview_backup.tar.gz。\n"
+            f"预计备份占用约 {backup_size} 空间。\n\n"
+            "如果选择不备份，仍可切换到预览版，但将无法切换回正式版。"
+        )
+        desc_label.setProperty("role", "dialog_desc")
+        desc_label.setWordWrap(True)
+        desc_label.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(desc_label)
+
+        button_row = QHBoxLayout()
+        button_row.setSpacing(10)
+        button_row.addStretch()
+
+        cancel_button = QPushButton("取消")
+        cancel_button.clicked.connect(dialog.reject)
+        button_row.addWidget(cancel_button)
+
+        skip_backup_button = QPushButton("不备份直接切换")
+        skip_backup_button.setProperty("role", "danger")
+        skip_backup_button.clicked.connect(lambda: dialog.done(2))
+        button_row.addWidget(skip_backup_button)
+
+        confirm_button = QPushButton("备份并切换")
+        confirm_button.setProperty("role", "primary")
+        confirm_button.clicked.connect(lambda: dialog.done(1))
+        button_row.addWidget(confirm_button)
+
+        layout.addLayout(button_row)
+        dialog.adjustSize()
+
+        result = dialog.exec()
+        if result == 1:
+            return "backup"
+        if result == 2:
+            return "skip"
+        return None
+
+    def _switch_to_preview_build(self):
+        if self._update_in_progress:
+            self._show_notice_dialog("提示", "当前已有更新任务正在进行，请等待完成后再试。")
+            return
+        if not self.config.get("deploy_mode"):
+            self._show_notice_dialog("提示", "尚未完成部署，无法切换到预览版。")
+            return
+        preview_mode = self._release_channel() == "preview"
+        if preview_mode:
+            if not hasattr(self.backend, "restore_stable_from_backup"):
+                self._show_notice_dialog("提示", f"当前后端 {self.backend.display_name} 暂不支持恢复正式版。")
+                return
+            if not self.config.get("preview_backup_available"):
+                self._show_notice_dialog("提示", "当前预览版是在未备份的情况下切换的，无法恢复到正式版。")
+                return
+            if hasattr(self.backend, "preview_backup_exists") and not self.backend.preview_backup_exists():
+                self._show_notice_dialog("提示", "未找到预览版备份文件，无法恢复到正式版。")
+                return
+
+            dialog = self._create_update_dialog(
+                "确认恢复正式版",
+                "将从 /root/na_preview_backup.tar.gz 恢复正式版所需的数据与配置，然后把 Nekro Agent 主容器切回稳定版镜像。\n\n恢复过程中会短暂停止相关服务。",
+                lambda dlg=None: self._start_restore_stable(dialog),
+                confirm_text="开始恢复",
+            )
+            dialog.exec()
+            return
+
+        if not hasattr(self.backend, "switch_to_preview"):
+            self._show_notice_dialog("提示", f"当前后端 {self.backend.display_name} 暂不支持切换到预览版。")
+            return
+
+        backup_size = "未知"
+        if hasattr(self.backend, "get_backup_size_hint"):
+            try:
+                backup_size = self.backend.get_backup_size_hint()
+            except Exception:
+                backup_size = "未知"
+
+        action = self._show_preview_switch_dialog(backup_size)
+        if not action:
+            return
+
+        dialog = self._create_update_dialog(
+            "切换到预览版",
+            "正在准备切换到预览版 Nekro Agent。",
+            lambda dlg=None, create_backup=(action == "backup"): self._start_preview_switch(dialog, create_backup),
+            confirm_text="开始切换",
+        )
+        dialog.exec()
+
     def _show_confirm_dialog(self, title, text, confirm_text="确认", cancel_text="取消", danger=False, parent=None):
         dialog = QDialog(parent or self)
         dialog.setWindowTitle(title)
@@ -274,8 +454,8 @@ class MainWindow(QMainWindow):
         dialog.adjustSize()
         return dialog.exec() == int(QDialog.DialogCode.Accepted)
 
-    def _create_update_dialog(self, title, text, on_confirm):
-        dialog = UpdateProgressDialog(self, title, text, confirm_text="开始更新")
+    def _create_update_dialog(self, title, text, on_confirm, confirm_text="开始更新"):
+        dialog = UpdateProgressDialog(self, title, text, confirm_text=confirm_text)
         dialog.confirmed.connect(on_confirm)
         dialog.finished.connect(lambda _result, dlg=dialog: self._on_update_dialog_closed(dlg))
         return dialog
@@ -709,12 +889,16 @@ class MainWindow(QMainWindow):
         can_update = bool(self.config.get("deploy_mode")) and not updating
         self.btn_update_action.setEnabled(can_update)
         self.btn_primary_update.setEnabled(can_update)
+        if hasattr(self, "btn_primary_preview"):
+            self.btn_primary_preview.setEnabled(self._advanced_features_enabled() and bool(self.config.get("deploy_mode")) and not updating)
+            self.btn_primary_preview.setText(self._preview_button_label())
 
         if running:
             self.btn_primary_deploy.setText("服务运行中")
             self.btn_primary_update.setText("升级 Nekro Agent")
-            if self._active_update_kind == "remote" and self._pending_remote_update_message:
-                self._finish_update_session(True, "升级完成", self._pending_remote_update_message)
+            if self._active_update_kind in {"remote", "preview", "restore"} and self._pending_remote_update_message:
+                success_title, _failure_title = self._active_update_result_titles()
+                self._finish_update_session(True, success_title, self._pending_remote_update_message)
             if hasattr(self, "_is_first_deploy") and self._is_first_deploy:
                 self._is_first_deploy = False
             if hasattr(self, "webview") and not was_running:
@@ -728,13 +912,15 @@ class MainWindow(QMainWindow):
             self.btn_log_napcat.setVisible(False)
             self.btn_primary_deploy.setText("开始部署")
             self.btn_primary_update.setText("升级 Nekro Agent" if not updating else "升级中...")
-            if self._active_update_kind == "remote" and status in {"启动失败", "更新失败", "启动超时", "已停止"}:
+            if self._active_update_kind in {"remote", "preview", "restore"} and status in {"启动失败", "更新失败", "启动超时", "已停止"}:
+                action_text = "恢复正式版后服务" if self._active_update_kind == "restore" else "升级后服务"
                 failure_message = (
                     f"{self._pending_remote_update_message}\n\n最终状态：{status}"
                     if self._pending_remote_update_message
-                    else f"升级后服务未能恢复：{status}"
+                    else f"{action_text}未能恢复：{status}"
                 )
-                self._finish_update_session(False, "升级失败", failure_message)
+                _success_title, failure_title = self._active_update_result_titles()
+                self._finish_update_session(False, failure_title, failure_message)
             if self._quit_after_stop and status in {"已停止", "已卸载"}:
                 self._quit_after_stop = False
                 QApplication.quit()
@@ -770,6 +956,11 @@ class MainWindow(QMainWindow):
         self.btn_primary_update.setText("升级 Nekro Agent")
         self.btn_update_action.setEnabled(bool(self.config.get("deploy_mode")))
         self.btn_primary_update.setEnabled(bool(self.config.get("deploy_mode")))
+        if hasattr(self, "btn_primary_preview"):
+            self.btn_primary_preview.setText(self._preview_button_label())
+            self.btn_primary_preview.setEnabled(self._advanced_features_enabled() and bool(self.config.get("deploy_mode")))
+        self._refresh_advanced_feature_ui()
+        success_title, failure_title = self._active_update_result_titles()
         if success:
             self._pending_remote_update_message = message
             if self._active_update_dialog:
@@ -779,7 +970,7 @@ class MainWindow(QMainWindow):
                     busy=True,
                 )
         else:
-            self._finish_update_session(False, "升级失败", message)
+            self._finish_update_session(False, failure_title, message)
 
     def init_home_page(self):
         page = QWidget()
@@ -815,6 +1006,21 @@ class MainWindow(QMainWindow):
         hero_top.addWidget(self.status_badge, 0, Qt.AlignmentFlag.AlignTop)
         hero_layout.addLayout(hero_top)
 
+        advanced_row = QHBoxLayout()
+        advanced_row.setSpacing(10)
+        self.advanced_status_badge = QLabel("高级功能已启用")
+        self.advanced_status_badge.setObjectName("FeatureBadge")
+        self.advanced_status_badge.setVisible(False)
+        advanced_row.addWidget(self.advanced_status_badge, 0, Qt.AlignmentFlag.AlignLeft)
+
+        self.advanced_status_hint = QLabel("预览版入口已开放，可直接切换至预览版。")
+        self.advanced_status_hint.setObjectName("SectionDesc")
+        self.advanced_status_hint.setWordWrap(True)
+        self.advanced_status_hint.setVisible(False)
+        advanced_row.addWidget(self.advanced_status_hint, 1)
+        advanced_row.addStretch()
+        hero_layout.addLayout(advanced_row)
+
         hero_actions = QHBoxLayout()
         self.btn_primary_deploy = QPushButton("开始部署")
         self.btn_primary_deploy.setObjectName("HeroPrimary")
@@ -822,15 +1028,20 @@ class MainWindow(QMainWindow):
         self.btn_primary_update = QPushButton("升级 Nekro Agent")
         self.btn_primary_update.setObjectName("HeroSecondary")
         self.btn_primary_update.clicked.connect(self._update_services)
+        self.btn_primary_preview = QPushButton("切换至预览版")
+        self.btn_primary_preview.setObjectName("HeroSecondary")
+        self.btn_primary_preview.clicked.connect(self._switch_to_preview_build)
         self.btn_primary_creds = QPushButton("查看部署凭据")
         self.btn_primary_creds.setObjectName("HeroSecondary")
         self.btn_primary_creds.clicked.connect(self._show_saved_credentials)
 
         hero_actions.addWidget(self.btn_primary_deploy)
         hero_actions.addWidget(self.btn_primary_update)
+        hero_actions.addWidget(self.btn_primary_preview)
         hero_actions.addWidget(self.btn_primary_creds)
         hero_actions.addStretch()
         hero_layout.addLayout(hero_actions)
+        self._refresh_advanced_feature_ui()
 
         layout.addWidget(hero)
 
@@ -1240,6 +1451,26 @@ class MainWindow(QMainWindow):
         self.check_auto.stateChanged.connect(lambda state: self.config.set("autostart", state == 2))
         card_layout.addWidget(self.check_auto)
 
+        advanced_row = QHBoxLayout()
+        advanced_row.setSpacing(12)
+        advanced_label = QLabel("高级功能")
+        advanced_row.addWidget(advanced_label)
+
+        self.btn_enable_advanced = QPushButton()
+        self.btn_enable_advanced.setObjectName("SegmentBtn")
+        self.btn_enable_advanced.setCheckable(True)
+        self.btn_enable_advanced.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_enable_advanced.setFixedWidth(136)
+        self.btn_enable_advanced.clicked.connect(self._toggle_advanced_features)
+        advanced_row.addWidget(self.btn_enable_advanced, 0, Qt.AlignmentFlag.AlignLeft)
+        advanced_row.addStretch()
+        card_layout.addLayout(advanced_row)
+
+        self.advanced_hint = QLabel()
+        self.advanced_hint.setObjectName("SectionDesc")
+        self.advanced_hint.setWordWrap(True)
+        card_layout.addWidget(self.advanced_hint)
+
         card_layout.addWidget(QLabel("部署版本"))
         self.mode_display = QLineEdit(self._format_mode_text(self.config.get("deploy_mode")))
         self.mode_display.setReadOnly(True)
@@ -1289,6 +1520,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(card)
         layout.addStretch()
         self._add_page(page)
+        self._refresh_advanced_feature_ui()
 
     def _save_ports(self):
         try:

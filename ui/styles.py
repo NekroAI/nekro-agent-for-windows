@@ -135,6 +135,16 @@ QLabel#StatusBadge {
     padding: 6px 12px;
 }
 
+QLabel#FeatureBadge {
+    background: #edf8ff;
+    border: 1px solid #c7e3f7;
+    border-radius: 8px;
+    color: #1b6db4;
+    font-size: 12px;
+    font-weight: 700;
+    padding: 6px 12px;
+}
+
 QLabel#QuickLabel {
     color: #cf7a74;
     font-size: 11px;
