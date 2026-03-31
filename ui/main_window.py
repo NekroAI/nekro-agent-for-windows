@@ -1,5 +1,6 @@
 import re
 import os
+import shutil
 import sys
 import json
 import webbrowser
@@ -145,6 +146,19 @@ class BrowserTabBar(QTabBar):
         super().mousePressEvent(event)
 
 
+class LauncherWebPage(QWebEnginePage):
+    def __init__(self, profile, parent=None, console_handler=None):
+        super().__init__(profile, parent)
+        self._console_handler = console_handler
+
+    def javaScriptConsoleMessage(self, level, message, line_number, source_id):
+        if self._console_handler:
+            try:
+                self._console_handler(level, message, line_number, source_id)
+            except Exception:
+                pass
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -168,6 +182,8 @@ class MainWindow(QMainWindow):
         self._pull_layers = OrderedDict()
         self._pull_layer_order = []
         self._sidebar_collapsed = False
+        self._browser_profile_channel = None
+        self._pending_browser_refresh = None
         self.browser_urls = {
             "nekro": f"http://localhost:{self.config.get('nekro_port') or 8021}",
             "napcat": f"http://localhost:{self.config.get('napcat_port') or 6099}",
@@ -208,20 +224,28 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(200, self._on_startup)
         QTimer.singleShot(0, self._apply_responsive_layout)
 
-    def _init_browser_profile(self):
-        profile_root = os.path.join(self.config.base_path, "browser_profile")
+    def _create_browser_profile(self, channel=None, clear_storage=False):
+        channel = channel or self._release_channel()
+        profile_root = os.path.join(self.config.base_path, "browser_profile", channel)
         storage_path = os.path.join(profile_root, "storage")
         cache_path = os.path.join(profile_root, "cache")
+        if clear_storage:
+            shutil.rmtree(profile_root, ignore_errors=True)
         os.makedirs(storage_path, exist_ok=True)
         os.makedirs(cache_path, exist_ok=True)
 
-        self.browser_profile = QWebEngineProfile("nekro_launcher", self)
-        self.browser_profile.setPersistentStoragePath(storage_path)
-        self.browser_profile.setCachePath(cache_path)
-        self.browser_profile.setPersistentCookiesPolicy(
+        browser_profile = QWebEngineProfile(f"nekro_launcher_{channel}", self)
+        browser_profile.setPersistentStoragePath(storage_path)
+        browser_profile.setCachePath(cache_path)
+        browser_profile.setPersistentCookiesPolicy(
             QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies
         )
-        self.browser_profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
+        browser_profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
+        self._browser_profile_channel = channel
+        return browser_profile
+
+    def _init_browser_profile(self):
+        self.browser_profile = self._create_browser_profile()
 
     def _build_sidebar(self, root_layout):
         self.sidebar = QFrame()
@@ -432,23 +456,14 @@ class MainWindow(QMainWindow):
         return "恢复正式版" if self._release_channel() == "preview" else "切换至预览版"
 
     def _agent_image_ref(self):
-        from core.wsl_manager import WSLManager
+        from core.wsl import WSLManager
 
         return WSLManager.get_agent_image_ref(self.config)
 
     def _managed_images(self):
-        from core.wsl_manager import WSLManager
+        from core.wsl import WSLManager
 
         return WSLManager.get_managed_images(self.config)
-
-    def _browser_views(self):
-        if not hasattr(self, "browser_tabs"):
-            return []
-        return [
-            self.browser_tabs.widget(index)
-            for index in range(self.browser_tabs.count())
-            if isinstance(self.browser_tabs.widget(index), QWebEngineView)
-        ]
 
     def _current_webview(self):
         if not hasattr(self, "browser_tabs"):
@@ -540,19 +555,15 @@ class MainWindow(QMainWindow):
 
     def _create_browser_tab(self, switch_to=True, title="新标签页"):
         browser_view = QWebEngineView()
-        browser_page = QWebEnginePage(self.browser_profile, browser_view)
+        browser_page = self._create_browser_page(browser_view)
         browser_view.setPage(browser_page)
         browser_view.setMinimumHeight(200)
         browser_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         browser_view.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         browser_view.setAutoFillBackground(True)
         browser_view.setStyleSheet("background: #ffffff; border: none;")
-        browser_page.setBackgroundColor(QColor("#ffffff"))
         browser_view.urlChanged.connect(lambda changed_url, view=browser_view: self._on_browser_url_changed(view, changed_url))
         browser_view.titleChanged.connect(lambda changed_title, view=browser_view: self._on_browser_title_changed(view, changed_title))
-        browser_page.newWindowRequested.connect(
-            lambda request, view=browser_view: self._handle_browser_new_window(view, request)
-        )
 
         index = self.browser_tabs.addTab(browser_view, title)
         if switch_to:
@@ -574,17 +585,6 @@ class MainWindow(QMainWindow):
             self._set_browser_target(self.current_browser_target, force_reload=True, browser_view=browser_view)
         else:
             self._on_browser_tab_changed(self.browser_tabs.currentIndex())
-
-    def _new_browser_tab(self):
-        current_view = self._current_webview()
-        new_view = self._create_browser_tab(switch_to=True, title="新标签页")
-        if current_view:
-            current_url = current_view.url()
-            if current_url.isValid() and current_url.scheme().lower() in {"http", "https"}:
-                new_view.setProperty("browser_target", current_view.property("browser_target"))
-                new_view.setUrl(current_url)
-                return
-        self._set_browser_target(self.current_browser_target, force_reload=True, browser_view=new_view)
 
     def _refresh_advanced_feature_ui(self):
         enabled = self._advanced_features_enabled()
@@ -729,7 +729,10 @@ class MainWindow(QMainWindow):
 
             dialog = self._create_update_dialog(
                 "确认恢复正式版",
-                "将从 /root/na_preview_backup.tar.gz 恢复正式版所需的数据与配置，然后把 Nekro Agent 主容器切回稳定版镜像。\n\n恢复过程中会短暂停止相关服务。",
+                "将从 /root/na_preview_backup.tar.gz 恢复正式版所需的数据与配置，然后把 Nekro Agent 主容器切回稳定版镜像。\n\n"
+                "警告：预览版期间产生的数据库与相关持久化数据会全部丢失。\n"
+                "当前恢复流程会直接回滚 PostgreSQL、Qdrant 和 /root/nekro_agent_data 到切换预览版前的备份状态；由于数据库不兼容，预览版期间写入的数据不会保留。\n\n"
+                "恢复过程中会短暂停止相关服务。",
                 lambda dlg=None: self._start_restore_stable(dialog),
                 confirm_text="开始恢复",
             )
@@ -818,6 +821,7 @@ class MainWindow(QMainWindow):
         self._active_update_dialog = dialog
         self._active_update_kind = kind
         self._pending_remote_update_message = ""
+        self._pending_browser_refresh = None
 
     def _finish_update_session(self, success, message, detail_text=""):
         dialog = self._active_update_dialog
@@ -956,6 +960,7 @@ class MainWindow(QMainWindow):
             self.nekro_port_setting.setText(str(nekro_port))
         if hasattr(self, "napcat_port_setting"):
             self.napcat_port_setting.setText(str(napcat_port))
+        self._refresh_port_settings_ui()
         self.refresh_dashboard()
         self.start_deploy()
 
@@ -1138,6 +1143,114 @@ class MainWindow(QMainWindow):
     def _can_access_target(self, target):
         return target == "nekro" or self.config.get("deploy_mode") == "napcat"
 
+    def _browser_views(self):
+        if not hasattr(self, "browser_tabs"):
+            return []
+        return [
+            self.browser_tabs.widget(index)
+            for index in range(self.browser_tabs.count())
+            if isinstance(self.browser_tabs.widget(index), QWebEngineView)
+        ]
+
+    def _handle_browser_console_message(self, level, message, line_number, source_id):
+        if not message:
+            return
+        level_name = getattr(level, "name", str(level))
+        source_name = source_id or "inline"
+        if "/webui/assets/" in source_name:
+            source_name = source_name.split("/webui/assets/", 1)[1]
+        else:
+            source_name = os.path.basename(source_name) or "inline"
+        self.append_log(f"[WebView:{level_name}] {message} ({source_name}:{line_number})", "debug")
+
+    def _create_browser_page(self, browser_view):
+        browser_page = LauncherWebPage(
+            self.browser_profile,
+            browser_view,
+            console_handler=self._handle_browser_console_message,
+        )
+        browser_page.setBackgroundColor(QColor("#ffffff"))
+        browser_page.newWindowRequested.connect(
+            lambda request, view=browser_view: self._handle_browser_new_window(view, request)
+        )
+        return browser_page
+
+    def _reload_webview(self, browser_view, bypass_cache=True):
+        if browser_view is None:
+            return
+        current_url = browser_view.url()
+        if current_url.isValid() and current_url.scheme().lower() in {"http", "https"}:
+            if bypass_cache:
+                try:
+                    browser_view.page().triggerAction(QWebEnginePage.WebAction.ReloadAndBypassCache)
+                    return
+                except Exception:
+                    pass
+            browser_view.reload()
+            return
+        self._set_browser_target(
+            browser_view.property("browser_target") or self.current_browser_target,
+            force_reload=True,
+            browser_view=browser_view,
+        )
+
+    def _reload_all_browser_views(self, bypass_cache=True, clear_http_cache=False):
+        if clear_http_cache:
+            try:
+                self.browser_profile.clearHttpCache()
+            except Exception:
+                pass
+        for browser_view in self._browser_views():
+            self._reload_webview(browser_view, bypass_cache=bypass_cache)
+
+    def _reset_browser_profile(self, clear_storage=False):
+        old_profile = getattr(self, "browser_profile", None)
+        tab_states = [
+            {
+                "view": browser_view,
+                "target": browser_view.property("browser_target"),
+                "url": browser_view.url().toString(),
+                "title": browser_view.title(),
+            }
+            for browser_view in self._browser_views()
+        ]
+
+        self.browser_profile = self._create_browser_profile(clear_storage=clear_storage)
+
+        for state in tab_states:
+            browser_view = state["view"]
+            old_page = browser_view.page()
+            browser_view.setPage(self._create_browser_page(browser_view))
+            if old_page is not None:
+                old_page.deleteLater()
+            self._update_browser_tab_label(browser_view, title=state["title"] or None)
+
+        if old_profile is not None and old_profile is not self.browser_profile:
+            old_profile.deleteLater()
+
+        for state in tab_states:
+            browser_view = state["view"]
+            target = state["target"]
+            url = state["url"]
+            if target in {"nekro", "napcat"}:
+                self._set_browser_target(target, force_reload=True, browser_view=browser_view)
+            elif url:
+                browser_view.setUrl(QUrl(url))
+
+        self._refresh_browser_nav_buttons()
+
+    def _refresh_browser_after_update(self):
+        refresh_mode = self._pending_browser_refresh
+        if not refresh_mode:
+            return
+
+        self._pending_browser_refresh = None
+        if refresh_mode == "profile" or self._browser_profile_channel != self._release_channel():
+            self._reset_browser_profile(clear_storage=True)
+            return
+
+        self._reload_all_browser_views(bypass_cache=True, clear_http_cache=True)
+
     def _set_browser_target(self, target, force_reload=False, browser_view=None):
         if not self._can_access_target(target):
             self._show_notice_dialog("提示", "当前部署模式未启用 NapCat。")
@@ -1161,10 +1274,12 @@ class MainWindow(QMainWindow):
 
         if getattr(self.backend, "is_running", False):
             current_url = browser_view.url().toString()
-            if force_reload or current_url != target_url:
+            if force_reload and current_url == target_url:
+                self._reload_webview(browser_view, bypass_cache=True)
+            elif force_reload or current_url != target_url:
                 browser_view.setUrl(QUrl(target_url))
             else:
-                browser_view.reload()
+                self._reload_webview(browser_view, bypass_cache=False)
         else:
             placeholder = (
                 f"{target_name} 服务尚未启动。<br><br>"
@@ -1178,11 +1293,7 @@ class MainWindow(QMainWindow):
         current_view = self._current_webview()
         if current_view is None:
             return
-        current_url = current_view.url()
-        if current_url.isValid() and current_url.scheme().lower() in {"http", "https"}:
-            current_view.reload()
-            return
-        self._set_browser_target(self.current_browser_target, force_reload=True, browser_view=current_view)
+        self._reload_webview(current_view, bypass_cache=True)
 
     def _browser_go_back(self):
         current_view = self._current_webview()
@@ -1370,6 +1481,7 @@ class MainWindow(QMainWindow):
             self.mode_display.setText(mode_text)
         if hasattr(self, "wsldir_edit"):
             self.wsldir_edit.setText(self.config.get("wsl_install_dir") or "未配置")
+        self._refresh_port_settings_ui()
 
     def _refresh_metric_data_dir_card(self):
         if not hasattr(self, "metric_data_dir"):
@@ -1455,6 +1567,7 @@ class MainWindow(QMainWindow):
             self.btn_primary_preview.setText(self._preview_button_label())
 
         if running:
+            self._refresh_browser_after_update()
             self.btn_primary_deploy.setText("服务运行中")
             self.btn_primary_update.setText("升级 Nekro Agent")
             if self._active_update_kind in {"remote", "preview", "restore"} and self._pending_remote_update_message:
@@ -1511,6 +1624,7 @@ class MainWindow(QMainWindow):
         self.backend.reply_update_optional(confirmed)
 
     def _on_update_finished(self, success, message):
+        update_kind = self._active_update_kind
         self.btn_primary_update.setText("升级 Nekro Agent")
         self.btn_update_action.setEnabled(bool(self.config.get("deploy_mode")))
         self.btn_primary_update.setEnabled(bool(self.config.get("deploy_mode")))
@@ -1520,6 +1634,10 @@ class MainWindow(QMainWindow):
         self._refresh_advanced_feature_ui()
         success_title, failure_title = self._active_update_result_titles()
         if success:
+            if update_kind in {"preview", "restore"}:
+                self._pending_browser_refresh = "profile"
+            elif update_kind == "remote":
+                self._pending_browser_refresh = "cache"
             self._pending_remote_update_message = message
             if self._active_update_dialog:
                 self._active_update_dialog.set_progress(
@@ -2010,9 +2128,6 @@ class MainWindow(QMainWindow):
                     pass
                 widgets["btn"].clicked.connect(lambda checked, ref=entry["image"]: self._check_single_image(ref))
 
-    def _do_image_update(self, image_ref):
-        self._show_image_update_dialog(image_ref)
-
     def _on_image_pull_result(self, image_ref, success, message):
         self._img_spinner_timer.stop()
         widgets = self._image_row_widgets.get(image_ref)
@@ -2104,12 +2219,14 @@ class MainWindow(QMainWindow):
         self._refresh_datadir_hint()
 
         # 端口配置
-        card_layout.addWidget(QLabel("Nekro Agent 端口"))
+        self.nekro_port_label = QLabel("Nekro Agent 端口")
+        card_layout.addWidget(self.nekro_port_label)
         self.nekro_port_setting = QLineEdit(str(self.config.get("nekro_port") or 8021))
         self.nekro_port_setting.setPlaceholderText("8021")
         card_layout.addWidget(self.nekro_port_setting)
 
-        card_layout.addWidget(QLabel("NapCat 端口"))
+        self.napcat_port_label = QLabel("NapCat 端口")
+        card_layout.addWidget(self.napcat_port_label)
         self.napcat_port_setting = QLineEdit(str(self.config.get("napcat_port") or 6099))
         self.napcat_port_setting.setPlaceholderText("6099")
         card_layout.addWidget(self.napcat_port_setting)
@@ -2120,34 +2237,56 @@ class MainWindow(QMainWindow):
         btn_save_ports.clicked.connect(self._save_ports)
         card_layout.addWidget(btn_save_ports, 0, Qt.AlignmentFlag.AlignLeft)
 
-        port_hint = QLabel("修改端口后需重新部署服务才能生效。")
-        port_hint.setObjectName("SectionDesc")
-        port_hint.setWordWrap(True)
-        card_layout.addWidget(port_hint)
+        self.port_hint_label = QLabel()
+        self.port_hint_label.setObjectName("SectionDesc")
+        self.port_hint_label.setWordWrap(True)
+        card_layout.addWidget(self.port_hint_label)
 
         layout.addWidget(card)
         layout.addStretch()
         self._add_page(page)
+        self._refresh_port_settings_ui()
         self._refresh_advanced_feature_ui()
 
+    def _refresh_port_settings_ui(self):
+        show_napcat = self.config.get("deploy_mode") == "napcat"
+        if hasattr(self, "napcat_port_label"):
+            self.napcat_port_label.setVisible(show_napcat)
+        if hasattr(self, "napcat_port_setting"):
+            self.napcat_port_setting.setVisible(show_napcat)
+        if hasattr(self, "port_hint_label"):
+            hint = "修改端口后需重新部署服务才能生效。"
+            if not show_napcat:
+                hint = "Lite 模式仅使用 Nekro Agent 端口。修改端口后需重新部署服务才能生效。"
+            self.port_hint_label.setText(hint)
+
     def _save_ports(self):
+        deploy_mode = self.config.get("deploy_mode") or "lite"
         try:
             nekro_port = int(self.nekro_port_setting.text().strip())
-            napcat_port = int(self.napcat_port_setting.text().strip())
-            if not (1 <= nekro_port <= 65535 and 1 <= napcat_port <= 65535):
+            if not (1 <= nekro_port <= 65535):
                 raise ValueError
+            napcat_port = int(self.config.get("napcat_port") or 6099)
+            if deploy_mode == "napcat":
+                napcat_port = int(self.napcat_port_setting.text().strip())
+                if not (1 <= napcat_port <= 65535):
+                    raise ValueError
 
             ignore_ports = set()
             if getattr(self.backend, "is_running", False):
                 current_nekro = int(self.config.get("nekro_port") or 8021)
-                current_napcat = int(self.config.get("napcat_port") or 6099)
                 if nekro_port == current_nekro:
                     ignore_ports.add(nekro_port)
-                if napcat_port == current_napcat:
-                    ignore_ports.add(napcat_port)
+                if deploy_mode == "napcat":
+                    current_napcat = int(self.config.get("napcat_port") or 6099)
+                    if napcat_port == current_napcat:
+                        ignore_ports.add(napcat_port)
 
+            port_specs = [("Nekro Agent 端口", nekro_port)]
+            if deploy_mode == "napcat":
+                port_specs.append(("NapCat 端口", napcat_port))
             ok, message = validate_port_bindings(
-                [("Nekro Agent 端口", nekro_port), ("NapCat 端口", napcat_port)],
+                port_specs,
                 ignore_ports=ignore_ports,
             )
             if not ok:
@@ -2155,14 +2294,16 @@ class MainWindow(QMainWindow):
                 return
 
             self.config.set("nekro_port", nekro_port)
-            self.config.set("napcat_port", napcat_port)
+            if deploy_mode == "napcat":
+                self.config.set("napcat_port", napcat_port)
             self.browser_urls["nekro"] = f"http://localhost:{nekro_port}"
             self.browser_urls["napcat"] = f"http://localhost:{napcat_port}"
             # 同步更新已保存的 deploy_info 里的端口，避免凭据弹窗显示旧端口
             deploy_info = self.config.get("deploy_info")
             if deploy_info:
                 deploy_info["port"] = str(nekro_port)
-                deploy_info["napcat_port"] = str(napcat_port)
+                if deploy_mode == "napcat":
+                    deploy_info["napcat_port"] = str(napcat_port)
                 self.config.set("deploy_info", deploy_info)
             # 刷新内置浏览器地址栏（强制更新 URL，不依赖 is_running 状态）
             target_url = self._target_url(self.current_browser_target)

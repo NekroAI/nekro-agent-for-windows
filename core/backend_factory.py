@@ -1,4 +1,4 @@
-from core.wsl_manager import WSLManager
+from core.wsl import WSLManager
 
 
 class BackendFactory:

@@ -61,10 +61,3 @@ class ConfigManager:
     def set(self, key, value):
         self.config[key] = value
         self.save_config()
-
-    def get_absolute_path(self, key):
-        """获取配置中路径的绝对路径"""
-        value = self.get(key)
-        if value and not os.path.isabs(value):
-            return os.path.join(self.base_path, value)
-        return value

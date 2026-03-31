@@ -50,6 +50,7 @@ class FirstRunDialog(QDialog):
         self.config = config
         self.env_result = None
         self._check_in_progress = False
+        self._selected_mode = self.config.get("deploy_mode") or "lite"
 
         self.setWindowTitle("Nekro Agent 环境配置向导")
         self.resize(660, 560)
@@ -537,7 +538,18 @@ class FirstRunDialog(QDialog):
         self._selected_mode = mode
         if self.config:
             self.config.set("deploy_mode", mode)
+        self._update_port_inputs_for_mode(mode)
         self.stack.setCurrentIndex(3)  # 跳转到数据目录配置页
+
+    def _update_port_inputs_for_mode(self, mode):
+        show_napcat = mode == "napcat"
+        if hasattr(self, "napcat_port_row"):
+            self.napcat_port_row.setVisible(show_napcat)
+        if hasattr(self, "port_hint_label"):
+            hint = "如无特殊需求保持默认即可。端口冲突时可修改。"
+            if not show_napcat:
+                hint = "Lite 模式仅需配置 Nekro Agent 端口，如无特殊需求保持默认即可。"
+            self.port_hint_label.setText(hint)
 
     # ------------------------------------------------------------------ #
     #  页面 3: 数据目录配置
@@ -594,7 +606,9 @@ class FirstRunDialog(QDialog):
         port_row1.addStretch()
         layout.addLayout(port_row1)
 
-        port_row2 = QHBoxLayout()
+        self.napcat_port_row = QWidget()
+        port_row2 = QHBoxLayout(self.napcat_port_row)
+        port_row2.setContentsMargins(0, 0, 0, 0)
         port_row2.addWidget(QLabel("NapCat 端口:"))
         self.napcat_port_edit = QLineEdit(str(self.config.get("napcat_port") or 6099))
         self.napcat_port_edit.setFixedWidth(100)
@@ -604,11 +618,12 @@ class FirstRunDialog(QDialog):
         )
         port_row2.addWidget(self.napcat_port_edit)
         port_row2.addStretch()
-        layout.addLayout(port_row2)
+        layout.addWidget(self.napcat_port_row)
 
-        port_hint = QLabel("如无特殊需求保持默认即可。端口冲突时可修改。")
-        port_hint.setStyleSheet("font-size: 12px; color: #8b949e;")
-        layout.addWidget(port_hint)
+        self.port_hint_label = QLabel()
+        self.port_hint_label.setStyleSheet("font-size: 12px; color: #8b949e;")
+        layout.addWidget(self.port_hint_label)
+        self._update_port_inputs_for_mode(self._selected_mode)
 
         layout.addStretch()
 
@@ -645,18 +660,24 @@ class FirstRunDialog(QDialog):
         self.stack.addWidget(page)
 
     def _confirm_datadir(self):
+        mode = getattr(self, "_selected_mode", "lite")
+
         # 校验端口
         try:
             nekro_port = int(self.nekro_port_edit.text().strip())
-            napcat_port = int(self.napcat_port_edit.text().strip())
-            if not (1 <= nekro_port <= 65535) or not (1 <= napcat_port <= 65535):
+            if not (1 <= nekro_port <= 65535):
                 raise ValueError
+            napcat_port = int(self.config.get("napcat_port") or 6099)
+            if mode == "napcat":
+                napcat_port = int(self.napcat_port_edit.text().strip())
+                if not (1 <= napcat_port <= 65535):
+                    raise ValueError
         except ValueError:
             self._show_notice_dialog("提示", "端口号必须为 1-65535 之间的整数")
             return
 
         port_specs = [("Nekro Agent 端口", nekro_port)]
-        if getattr(self, "_selected_mode", "lite") == "napcat":
+        if mode == "napcat":
             port_specs.append(("NapCat 端口", napcat_port))
         ok, message = validate_port_bindings(port_specs)
         if not ok:
@@ -665,9 +686,10 @@ class FirstRunDialog(QDialog):
 
         if self.config:
             self.config.set("nekro_port", nekro_port)
-            self.config.set("napcat_port", napcat_port)
+            if mode == "napcat":
+                self.config.set("napcat_port", napcat_port)
             self.config.set("first_run", False)
-        self.deploy_requested.emit(self._selected_mode)
+        self.deploy_requested.emit(mode)
         self.accept()
 
     def _check_item_labels(self):
