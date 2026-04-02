@@ -2,7 +2,7 @@ import os
 import subprocess
 import threading
 
-from core.wsl.constants import DISTRO_NAME
+from core.wsl.constants import DISTRO_NAME, STABLE_IMAGE
 
 
 class WSLDeployMixin:
@@ -36,15 +36,19 @@ class WSLDeployMixin:
                 self._wsl_exec(distro, f"mkdir -p {data_dir}")
 
                 env_exists = self._wsl_exec(distro, f"test -f {deploy_dir}/.env && echo yes").strip()
+                existing_env_content = ""
+                if env_exists == "yes":
+                    existing_env_content = self._wsl_exec(distro, f"cat {deploy_dir}/.env")
 
                 if env_exists == "yes":
-                    self.log_received.emit("检测到已有部署配置，复用现有配置", "info")
-                    env_content = self._wsl_exec(distro, f"cat {deploy_dir}/.env")
+                    self.log_received.emit("检测到已有部署配置，将保留旧凭据并按当前设置重写部署文件", "info")
                 else:
                     self.log_received.emit("首次部署，写入配置文件", "info")
-                    self._copy_to_wsl(distro, compose_src, f"{deploy_dir}/docker-compose.yml")
-                    env_content = self._prepare_env(env_src, data_dir)
-                    self._write_to_wsl(distro, env_content, f"{deploy_dir}/.env")
+
+                compose_content = self._prepare_compose_content(compose_src)
+                env_content = self._prepare_env(env_src, data_dir, existing_env_content)
+                self._write_to_wsl(distro, compose_content, f"{deploy_dir}/docker-compose.yml")
+                self._write_to_wsl(distro, env_content, f"{deploy_dir}/.env")
 
                 ls_output = self._wsl_exec(distro, f"ls -la {deploy_dir}")
                 self.log_received.emit(f"部署目录内容:\n{ls_output}", "debug")
@@ -72,7 +76,15 @@ class WSLDeployMixin:
                 self.log_received.emit("启动 Docker Compose 服务...", "info")
                 self.progress_updated.emit("启动 Compose 服务...")
                 proc = subprocess.run(
-                    ["wsl", "-d", distro, "--", "bash", "-c", f"cd {deploy_dir} && docker compose -f docker-compose.yml --env-file .env up -d"],
+                    [
+                        "wsl",
+                        "-d",
+                        distro,
+                        "--",
+                        "bash",
+                        "-c",
+                        f"cd {deploy_dir} && docker compose -f docker-compose.yml --env-file .env up -d --force-recreate --remove-orphans",
+                    ],
                     capture_output=True,
                     timeout=120,
                     creationflags=self._creation_flags(),
@@ -236,12 +248,7 @@ class WSLDeployMixin:
 
     def _parse_deploy_info(self, env_content, deploy_mode):
         """从 .env 内容中解析部署凭据信息"""
-        env_vars = {}
-        for line in env_content.splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, value = line.split("=", 1)
-                env_vars[key.strip()] = value.strip()
+        env_vars = self._parse_env_values(env_content)
 
         info = {
             "port": env_vars.get("NEKRO_EXPOSE_PORT", "8021"),
@@ -254,13 +261,37 @@ class WSLDeployMixin:
 
         return info
 
-    def _prepare_env(self, env_template_path, data_dir):
+    def _parse_env_values(self, env_content):
+        env_vars = {}
+        for line in env_content.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                env_vars[key.strip()] = value.strip()
+        return env_vars
+
+    def _prepare_compose_content(self, compose_template_path):
+        content = ""
+        if os.path.exists(compose_template_path):
+            with open(compose_template_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+        agent_image = self.get_agent_image_ref(self.config)
+        if agent_image != STABLE_IMAGE:
+            content = content.replace(
+                f"image: {STABLE_IMAGE}",
+                f"image: {agent_image}",
+            )
+        return content
+
+    def _prepare_env(self, env_template_path, data_dir, existing_env_content=""):
         """读取 env 模板文件，填充必要值，返回最终 .env 内容"""
         content = ""
         if os.path.exists(env_template_path):
             with open(env_template_path, "r", encoding="utf-8") as f:
                 content = f.read()
 
+        existing_env = self._parse_env_values(existing_env_content or "")
         lines = content.splitlines()
         new_lines = []
         for line in lines:
@@ -270,20 +301,24 @@ class WSLDeployMixin:
                 continue
 
             key = stripped.split("=", 1)[0].strip()
-            value = stripped.split("=", 1)[1].strip()
+            existing_value = existing_env.get(key, "").strip()
 
-            if key == "NEKRO_DATA_DIR" and not value:
+            if key == "NEKRO_DATA_DIR":
                 new_lines.append(f"NEKRO_DATA_DIR={data_dir}")
-            elif key == "QDRANT_API_KEY" and not value:
-                new_lines.append(f"QDRANT_API_KEY={self._random_token(32)}")
-            elif key == "ONEBOT_ACCESS_TOKEN" and not value:
-                new_lines.append(f"ONEBOT_ACCESS_TOKEN={self._random_token(32)}")
-            elif key == "NEKRO_ADMIN_PASSWORD" and not value:
-                new_lines.append(f"NEKRO_ADMIN_PASSWORD={self._random_token(16)}")
             elif key == "NEKRO_EXPOSE_PORT":
                 new_lines.append(f"NEKRO_EXPOSE_PORT={self.config.get('nekro_port') or 8021}")
             elif key == "NAPCAT_EXPOSE_PORT":
                 new_lines.append(f"NAPCAT_EXPOSE_PORT={self.config.get('napcat_port') or 6099}")
+            elif key == "QDRANT_API_KEY":
+                new_lines.append(f"QDRANT_API_KEY={existing_value or self._random_token(32)}")
+            elif key == "ONEBOT_ACCESS_TOKEN":
+                new_lines.append(f"ONEBOT_ACCESS_TOKEN={existing_value or self._random_token(32)}")
+            elif key == "NEKRO_ADMIN_PASSWORD":
+                new_lines.append(f"NEKRO_ADMIN_PASSWORD={existing_value or self._random_token(16)}")
+            elif key == "INSTANCE_NAME":
+                new_lines.append(f"{key}={existing_value}")
+            elif key in {"POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DATABASE"} and existing_value:
+                new_lines.append(f"{key}={existing_value}")
             else:
                 new_lines.append(line)
 

@@ -34,6 +34,7 @@ STABLE_IMAGE = "kromiose/nekro-agent:latest"
 PREVIEW_IMAGE = "kromiose/nekro-agent:preview"
 PREVIEW_COMPOSE_IMAGE = STABLE_IMAGE
 PREVIEW_BACKUP_ARCHIVE_PATH = "/root/na_preview_backup.tar.gz"
+UPDATE_BACKUP_ARCHIVE_PATH = "/root/na_update_backup.tar.gz"
 NA_BACKUP_TARGETS = [
     "/var/lib/docker/volumes/nekro_postgres_data",
     "/var/lib/docker/volumes/nekro_qdrant_data",
@@ -51,4 +52,5 @@ __all__ = [
     "REQUIRED_IMAGES_BASE",
     "ROOTFS_URLS",
     "STABLE_IMAGE",
+    "UPDATE_BACKUP_ARCHIVE_PATH",
 ]

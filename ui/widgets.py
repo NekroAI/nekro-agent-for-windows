@@ -1,6 +1,6 @@
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
-from PyQt6.QtWidgets import QDialog, QFrame, QHBoxLayout, QLabel, QProgressBar, QPushButton, QSizePolicy, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QComboBox, QDialog, QFrame, QHBoxLayout, QLabel, QListView, QProgressBar, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
 from ui.styles import STYLESHEET
 
@@ -297,6 +297,19 @@ class ActionButton(QPushButton):
         self._layout.setSpacing(int(14 * scale))
         self._text_layout.setSpacing(max(2, int(4 * scale)))
         self.setMinimumHeight(int(self._base_min_height * scale))
+
+
+class StyledComboBox(QComboBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("FieldSelect")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumHeight(38)
+
+        popup_view = QListView(self)
+        popup_view.setObjectName("FieldSelectPopup")
+        popup_view.setFrameShape(QFrame.Shape.NoFrame)
+        self.setView(popup_view)
 
 
 class MetricCard(QFrame):

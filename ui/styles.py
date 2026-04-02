@@ -493,6 +493,11 @@ QComboBox QAbstractItemView {
     outline: none;
 }
 
+QComboBox#FieldSelect {
+    min-width: 148px;
+    padding-right: 34px;
+}
+
 QCheckBox {
     color: #274055;
     font-size: 14px;

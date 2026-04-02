@@ -10,6 +10,7 @@ from core.wsl.constants import (
     PREVIEW_COMPOSE_IMAGE,
     PREVIEW_IMAGE,
     STABLE_IMAGE,
+    UPDATE_BACKUP_ARCHIVE_PATH,
 )
 
 
@@ -63,8 +64,8 @@ class WSLUpdateMixin:
         return self._wsl_exec(distro, f"test -f {shlex.quote(PREVIEW_BACKUP_ARCHIVE_PATH)} && echo yes").strip() == "yes"
 
     def run_remote_update(self):
-        """从远端 JSON 拉取更新步骤并执行，optional 步骤通过信号询问用户确认"""
-        from core.update_runner import parse_update_commands
+        """执行内置升级流程，optional 步骤通过信号询问用户确认。"""
+        from core.update_runner import build_update_plan, log_update_plan
 
         distro = DISTRO_NAME
         deploy_dir = "/root/nekro_agent"
@@ -79,53 +80,61 @@ class WSLUpdateMixin:
             out = self._clean_command_output(self._safe_decode(proc.stdout) + self._safe_decode(proc.stderr))
             return proc.returncode, out.strip()
 
+        def _wait_optional_reply(label, prompt):
+            self._update_optional_reply = None
+            self.update_optional_confirm.emit(label, prompt)
+
+            import time as _time
+
+            deadline = _time.time() + 120
+            while self._update_optional_reply is None and _time.time() < deadline:
+                _time.sleep(0.1)
+            return self._update_optional_reply
+
         def _do_update():
             self._stop_event.clear()
             self.status_changed.emit("更新中...")
-            steps = parse_update_commands(self.log_received.emit)
+            agent_image = self.get_agent_image_ref(self.config)
+            steps = build_update_plan(agent_image)
+            log_update_plan(self.log_received.emit, steps)
             if not steps:
                 self.status_changed.emit("更新失败")
-                self.update_finished.emit(False, "无法获取更新配置，请检查网络。")
+                self.update_finished.emit(False, "未找到可用的升级步骤。")
                 return
 
             for step in steps:
                 step_type = step.get("type")
                 label = step.get("label", "")
-                cmd = step.get("_cmd")
 
                 if step_type == "notify":
                     self.log_received.emit(step.get("message", label), "info")
                     continue
 
-                if step.get("optional"):
-                    size_cmd = step.get("optional_size_cmd", "")
-                    backup_size = "未知"
-                    if size_cmd:
-                        _, size_out = _exec(size_cmd, timeout=30)
-                        if size_out:
-                            backup_size = size_out.splitlines()[0].strip()
-                    prompt = step.get("optional_prompt", f"是否执行：{label}？")
-                    prompt = prompt.replace("{backup_size}", backup_size)
-
-                    self._update_optional_reply = None
-                    self.update_optional_confirm.emit(label, prompt)
-                    import time as _time
-
-                    deadline = _time.time() + 120
-                    while self._update_optional_reply is None and _time.time() < deadline:
-                        _time.sleep(0.1)
-                    if self._update_optional_reply is None:
-                        self.log_received.emit(f"[更新] 可选步骤确认超时，已跳过: {label}", "warning")
-                        continue
-                    if not self._update_optional_reply:
-                        self.log_received.emit(f"[更新] 已跳过可选步骤: {label}", "info")
-                        continue
-
-                if cmd is None:
-                    continue
-
                 self.log_received.emit(f"[更新] 执行: {label}", "info")
                 self._emit_pull_progress("stage", label)
+
+                if step_type == "backup":
+                    if step.get("optional"):
+                        backup_size = self.get_backup_size_hint()
+                        prompt = step.get("optional_prompt", f"是否执行：{label}？").replace("{backup_size}", backup_size)
+                        reply = _wait_optional_reply(label, prompt)
+                        if reply is None:
+                            self.log_received.emit(f"[更新] 可选步骤确认超时，已跳过: {label}", "warning")
+                            continue
+                        if not reply:
+                            self.log_received.emit(f"[更新] 已跳过可选步骤: {label}", "info")
+                            continue
+
+                    ok, backup_message = self._backup_nekro_archive(
+                        distro,
+                        step.get("archive_path", UPDATE_BACKUP_ARCHIVE_PATH),
+                    )
+                    if not ok:
+                        self.status_changed.emit("更新失败")
+                        self.update_finished.emit(False, backup_message)
+                        return
+                    self.log_received.emit(f"[更新] {backup_message}", "info")
+                    continue
 
                 if step_type == "pull":
                     image = step.get("image", "")
@@ -136,25 +145,35 @@ class WSLUpdateMixin:
                         return
                     continue
 
-                try:
-                    rc, out = _exec(cmd, timeout=300)
-                except subprocess.TimeoutExpired:
-                    self.status_changed.emit("更新失败")
-                    self.update_finished.emit(False, f"步骤超时: {label}")
-                    return
-                except Exception as e:
-                    self.status_changed.emit("更新失败")
-                    self.update_finished.emit(False, f"步骤异常: {e}")
-                    return
+                if step_type == "compose_up":
+                    services = step.get("services", [])
+                    service_args = " ".join(shlex.quote(service) for service in services)
+                    cmd = (
+                        "docker compose -f docker-compose.yml --env-file .env "
+                        f"up -d --no-deps --force-recreate {service_args}"
+                    ).strip()
+                    try:
+                        rc, out = _exec(cmd, timeout=300)
+                    except subprocess.TimeoutExpired:
+                        self.status_changed.emit("更新失败")
+                        self.update_finished.emit(False, f"步骤超时: {label}")
+                        return
+                    except Exception as e:
+                        self.status_changed.emit("更新失败")
+                        self.update_finished.emit(False, f"步骤异常: {e}")
+                        return
 
-                if out:
-                    self.log_received.emit(out, "info")
-                if rc != 0:
-                    self.status_changed.emit("更新失败")
-                    self.update_finished.emit(False, f"步骤失败（返回码 {rc}）: {label}")
-                    return
+                    if out:
+                        self.log_received.emit(out, "info")
+                    if rc != 0:
+                        self.status_changed.emit("更新失败")
+                        self.update_finished.emit(False, f"步骤失败（返回码 {rc}）: {label}")
+                        return
 
-                self.log_received.emit(f"[更新] ✓ {label}", "info")
+                    self.log_received.emit(f"[更新] ✓ {label}", "info")
+                    continue
+
+                self.log_received.emit(f"[更新] 未知步骤类型，已跳过: {step_type}", "warning")
 
             self._emit_pull_progress("done", "更新完成")
             self.is_running = True

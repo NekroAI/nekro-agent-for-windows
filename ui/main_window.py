@@ -3,6 +3,7 @@ import os
 import shutil
 import sys
 import json
+import time
 import webbrowser
 from collections import OrderedDict
 
@@ -11,7 +12,6 @@ from PyQt6.QtGui import QCloseEvent, QColor, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
-    QComboBox,
     QDialog,
     QFrame,
     QGridLayout,
@@ -43,7 +43,7 @@ from core.backend_factory import BackendFactory
 from core.config_manager import ConfigManager
 from core.port_utils import validate_port_bindings
 from ui.styles import STYLESHEET
-from ui.widgets import ActionButton, MetricCard, SectionCard, UpdateProgressDialog, show_notice_dialog
+from ui.widgets import ActionButton, MetricCard, SectionCard, StyledComboBox, UpdateProgressDialog, show_notice_dialog
 
 
 def get_resource_path(relative_path):
@@ -184,12 +184,16 @@ class MainWindow(QMainWindow):
         self._sidebar_collapsed = False
         self._browser_profile_channel = None
         self._pending_browser_refresh = None
+        self._image_status_request_kind = None
         self.browser_urls = {
             "nekro": f"http://localhost:{self.config.get('nekro_port') or 8021}",
             "napcat": f"http://localhost:{self.config.get('napcat_port') or 6099}",
         }
         self.current_browser_target = "nekro"
         self._init_browser_profile()
+        self._auto_image_check_timer = QTimer(self)
+        self._auto_image_check_timer.setSingleShot(True)
+        self._auto_image_check_timer.timeout.connect(self._run_scheduled_image_check)
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -221,12 +225,13 @@ class MainWindow(QMainWindow):
         self.backend.update_finished.connect(self._on_update_finished)
 
         self._build_tray_icon()
+        self._schedule_next_image_update_check()
         QTimer.singleShot(200, self._on_startup)
         QTimer.singleShot(0, self._apply_responsive_layout)
 
     def _create_browser_profile(self, channel=None, clear_storage=False):
         channel = channel or self._release_channel()
-        profile_root = os.path.join(self.config.base_path, "browser_profile", channel)
+        profile_root = os.path.join(self.config.browser_profile_dir, channel)
         storage_path = os.path.join(profile_root, "storage")
         cache_path = os.path.join(profile_root, "cache")
         if clear_storage:
@@ -489,6 +494,9 @@ class MainWindow(QMainWindow):
         if not display_url:
             display_url = self._browser_current_navigable_url()
         self.browser_url_label.setText(display_url)
+
+    def _can_show_foreground_notice(self):
+        return self.isVisible() and not self.isMinimized()
 
     def _browser_tab_text(self, browser_view, title=None, url=None):
         title_text = (title or browser_view.title() or "").strip()
@@ -890,12 +898,12 @@ class MainWindow(QMainWindow):
             self._show_notice_dialog("提示", "尚未完成部署，无法执行升级。")
             return
         if not hasattr(self.backend, "run_remote_update"):
-            self._show_notice_dialog("提示", f"当前后端 {self.backend.display_name} 暂不支持远程升级。")
+            self._show_notice_dialog("提示", f"当前后端 {self.backend.display_name} 暂不支持升级。")
             return
 
         dialog = self._create_update_dialog(
             "确认升级",
-            "将从远端获取最新升级步骤，拉取最新版 Nekro Agent 镜像并重启服务。\n\n升级过程中可能需要确认是否备份数据目录。",
+            "将按内置升级流程拉取当前通道的 Nekro Agent 镜像并重建主容器。\n\n升级过程中可能需要确认是否备份当前运行数据。",
             lambda dlg=None: self._start_remote_update(dialog),
         )
         dialog.exec()
@@ -962,6 +970,7 @@ class MainWindow(QMainWindow):
             self.napcat_port_setting.setText(str(napcat_port))
         self._refresh_port_settings_ui()
         self.refresh_dashboard()
+        self._schedule_next_image_update_check()
         self.start_deploy()
 
     def append_log(self, msg, level="info"):
@@ -1482,6 +1491,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "wsldir_edit"):
             self.wsldir_edit.setText(self.config.get("wsl_install_dir") or "未配置")
         self._refresh_port_settings_ui()
+        self._schedule_next_image_update_check()
 
     def _refresh_metric_data_dir_card(self):
         if not hasattr(self, "metric_data_dir"):
@@ -1570,6 +1580,8 @@ class MainWindow(QMainWindow):
             self._refresh_browser_after_update()
             self.btn_primary_deploy.setText("服务运行中")
             self.btn_primary_update.setText("升级 Nekro Agent")
+            if not was_running:
+                self._schedule_next_image_update_check(delay_ms=5000)
             if self._active_update_kind in {"remote", "preview", "restore"} and self._pending_remote_update_message:
                 success_title, _failure_title = self._active_update_result_titles()
                 self._finish_update_session(True, success_title, self._pending_remote_update_message)
@@ -1582,6 +1594,8 @@ class MainWindow(QMainWindow):
             self.btn_log_nekro.setVisible(True)
             self.btn_log_napcat.setVisible(self.config.get("deploy_mode") == "napcat")
         else:
+            if hasattr(self, "_auto_image_check_timer"):
+                self._auto_image_check_timer.stop()
             self.btn_log_nekro.setVisible(False)
             self.btn_log_napcat.setVisible(False)
             self.btn_primary_deploy.setText("开始部署")
@@ -2037,6 +2051,7 @@ class MainWindow(QMainWindow):
                 "status": status_lbl,
                 "btn": btn_single,
             }
+        self._apply_cached_image_status_to_rows()
 
     def _tick_img_spinner(self):
         self._img_spinner_idx = (self._img_spinner_idx + 1) % len(self._img_spinner_frames)
@@ -2048,12 +2063,95 @@ class MainWindow(QMainWindow):
             if widgets:
                 widgets["btn"].setText(f"{frame}")
 
+    def _image_update_check_interval_options(self):
+        return [
+            (0, "不自动检查"),
+            (1, "每 1 小时"),
+            (6, "每 6 小时"),
+            (12, "每 12 小时"),
+            (24, "每 24 小时"),
+        ]
+
+    def _image_update_check_interval_hours(self):
+        try:
+            return max(0, int(self.config.get("image_update_check_interval_hours") or 0))
+        except (TypeError, ValueError):
+            return 24
+
+    def _image_update_check_interval_label(self, hours=None):
+        current = self._image_update_check_interval_hours() if hours is None else hours
+        for value, label in self._image_update_check_interval_options():
+            if value == current:
+                return label
+        return f"每 {current} 小时"
+
+    def _refresh_image_update_check_hint(self):
+        if not hasattr(self, "image_update_check_hint"):
+            return
+
+        interval_hours = self._image_update_check_interval_hours()
+        if interval_hours <= 0:
+            text = "已关闭自动检查。仅在启动器运行期间生效，不会自动拉取更新。"
+        else:
+            text = f"当前：{self._image_update_check_interval_label(interval_hours)}。仅在启动器运行期间自动检查镜像状态，不会自动拉取更新。"
+            last_check_ts = int(self.config.get("last_image_update_check_ts") or 0)
+            if last_check_ts > 0:
+                last_text = time.strftime("%Y-%m-%d %H:%M", time.localtime(last_check_ts))
+                text += f"\n上次检查：{last_text}"
+        self.image_update_check_hint.setText(text)
+
+    def _schedule_next_image_update_check(self, delay_ms=None):
+        if not hasattr(self, "_auto_image_check_timer"):
+            return
+
+        self._auto_image_check_timer.stop()
+        interval_hours = self._image_update_check_interval_hours()
+        if interval_hours <= 0 or not self.config.get("deploy_mode") or self._last_status != "运行中":
+            self._refresh_image_update_check_hint()
+            return
+
+        if delay_ms is None:
+            interval_ms = interval_hours * 60 * 60 * 1000
+            last_check_ts = int(self.config.get("last_image_update_check_ts") or 0)
+            if last_check_ts > 0:
+                elapsed_ms = max(0, int((time.time() - last_check_ts) * 1000))
+                delay_ms = max(5000, interval_ms - elapsed_ms)
+            else:
+                delay_ms = 5000
+
+        delay_ms = max(1000, min(int(delay_ms), 2147483647))
+        self._auto_image_check_timer.start(delay_ms)
+        self._refresh_image_update_check_hint()
+
+    def _run_scheduled_image_check(self):
+        if self._image_status_request_kind is not None or self._update_in_progress:
+            self._schedule_next_image_update_check(delay_ms=5 * 60 * 1000)
+            return
+        if not self.config.get("deploy_mode") or self._last_status != "运行中":
+            self._schedule_next_image_update_check()
+            return
+
+        self._image_status_request_kind = "auto"
+        self.backend.check_images_status()
+
+    def _on_image_update_interval_changed(self):
+        if not hasattr(self, "image_update_interval_combo"):
+            return
+
+        hours = int(self.image_update_interval_combo.currentData() or 0)
+        self.config.set("image_update_check_interval_hours", hours)
+        if hours <= 0:
+            self.config.set("last_image_update_check_ts", 0)
+        self._schedule_next_image_update_check()
+
     def _check_single_image(self, image_ref):
-        if self._img_spinner_timer.isActive():
+        if self._image_status_request_kind is not None:
+            self._show_notice_dialog("提示", "镜像状态检测正在进行中，请稍后再试。")
             return
         widgets = self._image_row_widgets.get(image_ref)
         if not widgets:
             return
+        self._image_status_request_kind = "single"
         self._img_checking_ref = image_ref
         widgets["btn"].setEnabled(False)
         widgets["btn"].setText(self._img_spinner_frames[0])
@@ -2064,8 +2162,10 @@ class MainWindow(QMainWindow):
         self.backend.check_images_status(only_image=image_ref)
 
     def _check_images(self):
-        if self._img_spinner_timer.isActive():
+        if self._image_status_request_kind is not None:
+            self._show_notice_dialog("提示", "镜像状态检测正在进行中，请稍后再试。")
             return
+        self._image_status_request_kind = "all"
         self._img_checking_ref = None
         self.btn_check_images.setEnabled(False)
         self.btn_check_images.setText(f"{self._img_spinner_frames[0]} 检测中...")
@@ -2077,56 +2177,153 @@ class MainWindow(QMainWindow):
         self._img_spinner_timer.start(100)
         self.backend.check_images_status()
 
+    def _cached_image_status_map(self):
+        cached = self.config.get("image_status_cache") or {}
+        return cached if isinstance(cached, dict) else {}
+
+    def _cache_image_status_results(self, results):
+        cached = dict(self._cached_image_status_map())
+        checked_at = int(time.time())
+        for entry in results:
+            image_ref = entry.get("image")
+            if not image_ref:
+                continue
+            cached[image_ref] = {
+                "image": image_ref,
+                "name": entry.get("name", ""),
+                "modes": list(entry.get("modes", [])),
+                "local": entry.get("local"),
+                "remote": entry.get("remote"),
+                "has_update": bool(entry.get("has_update")),
+                "error": entry.get("error"),
+                "checked_at": checked_at,
+            }
+        self.config.set("image_status_cache", cached)
+
+    def _set_image_row_action(self, image_ref, action):
+        widgets = self._image_row_widgets.get(image_ref)
+        if not widgets:
+            return
+        try:
+            widgets["btn"].clicked.disconnect()
+        except Exception:
+            pass
+
+        if action == "update":
+            if image_ref == self._agent_image_ref():
+                widgets["btn"].clicked.connect(lambda checked=False: self._show_remote_update_dialog())
+            else:
+                widgets["btn"].clicked.connect(lambda checked=False, ref=image_ref: self._show_image_update_dialog(ref))
+        else:
+            widgets["btn"].clicked.connect(lambda checked=False, ref=image_ref: self._check_single_image(ref))
+
+    def _apply_image_status_entry(self, entry):
+        image_ref = entry.get("image")
+        widgets = self._image_row_widgets.get(image_ref)
+        if not widgets:
+            return
+
+        widgets["btn"].setEnabled(True)
+        if entry.get("error"):
+            widgets["local"].setText("—")
+            widgets["remote"].setText("—")
+            widgets["status"].setText("<span style='color:#f26f82;'>错误</span>")
+            widgets["status"].setTextFormat(Qt.TextFormat.RichText)
+            widgets["btn"].setText("检查更新")
+            self._set_image_row_action(image_ref, "check")
+            return
+
+        if entry.get("local") is None:
+            widgets["local"].setText("未安装")
+            widgets["remote"].setText(entry.get("remote") or "—")
+            widgets["status"].setText("<span style='color:#d29922;'>未拉取</span>")
+            widgets["status"].setTextFormat(Qt.TextFormat.RichText)
+            widgets["btn"].setText("检查更新")
+            self._set_image_row_action(image_ref, "check")
+            return
+
+        widgets["local"].setText(entry.get("local") or "—")
+        widgets["remote"].setText(entry.get("remote") or "—")
+        if entry.get("has_update"):
+            widgets["status"].setText("<span style='color:#58a6ff;'>有更新</span>")
+            widgets["status"].setTextFormat(Qt.TextFormat.RichText)
+            widgets["btn"].setText("立即更新")
+            self._set_image_row_action(image_ref, "update")
+        else:
+            widgets["status"].setText("<span style='color:#3fb950;'>最新</span>")
+            widgets["status"].setTextFormat(Qt.TextFormat.RichText)
+            widgets["btn"].setText("检查更新")
+            self._set_image_row_action(image_ref, "check")
+
+    def _apply_cached_image_status_to_rows(self):
+        cached = self._cached_image_status_map()
+        for image_ref, widgets in self._image_row_widgets.items():
+            entry = cached.get(image_ref)
+            if not entry:
+                widgets["local"].setText("—")
+                widgets["remote"].setText("—")
+                widgets["status"].setText("未检测")
+                widgets["status"].setTextFormat(Qt.TextFormat.PlainText)
+                widgets["btn"].setEnabled(True)
+                widgets["btn"].setText("检查更新")
+                self._set_image_row_action(image_ref, "check")
+                continue
+            self._apply_image_status_entry(entry)
+
+    def _update_available_image_entries(self, results):
+        updates = []
+        for entry in results:
+            if entry.get("has_update"):
+                updates.append(entry)
+        return updates
+
+    def _image_update_alert_signature(self, entries):
+        parts = []
+        for entry in sorted(entries, key=lambda item: item.get("image", "")):
+            parts.append(f"{entry.get('image', '')}|{entry.get('remote', '')}")
+        return "\n".join(parts)
+
+    def _notify_image_updates_if_needed(self, results, request_kind):
+        if request_kind != "auto":
+            return
+        if self._last_status != "运行中":
+            return
+
+        updates = self._update_available_image_entries(results)
+        if not updates:
+            self.config.set("image_update_last_alert_signature", "")
+            return
+
+        signature = self._image_update_alert_signature(updates)
+        if signature == (self.config.get("image_update_last_alert_signature") or ""):
+            return
+
+        self.config.set("image_update_last_alert_signature", signature)
+        if not self._can_show_foreground_notice():
+            return
+        names = [entry.get("name") or entry.get("image", "") for entry in updates]
+        summary = "、".join(names[:3])
+        if len(names) > 3:
+            summary += f" 等 {len(names)} 个镜像"
+        self._show_notice_dialog(
+            "发现镜像更新",
+            f"检测到以下镜像有可用更新：\n{summary}\n\n可前往“镜像管理”页面查看详情并手动更新。",
+        )
+
     def _on_image_status_result(self, results):
+        request_kind = self._image_status_request_kind
+        self._image_status_request_kind = None
         self._img_spinner_timer.stop()
         self.btn_check_images.setEnabled(True)
         self.btn_check_images.setText("检查全部更新")
+        self._cache_image_status_results(results)
         for entry in results:
-            widgets = self._image_row_widgets.get(entry["image"])
-            if not widgets:
-                continue
-            if entry["error"]:
-                widgets["local"].setText("—")
-                widgets["remote"].setText("—")
-                widgets["status"].setText("<span style='color:#f26f82;'>错误</span>")
-                widgets["status"].setTextFormat(Qt.TextFormat.RichText)
-                widgets["btn"].setEnabled(True)
-                widgets["btn"].setText("检查更新")
-            elif entry["local"] is None:
-                widgets["local"].setText("未安装")
-                widgets["remote"].setText(entry["remote"] or "—")
-                widgets["status"].setText("<span style='color:#d29922;'>未拉取</span>")
-                widgets["status"].setTextFormat(Qt.TextFormat.RichText)
-                widgets["btn"].setEnabled(True)
-                widgets["btn"].setText("检查更新")
-            elif entry["has_update"]:
-                widgets["local"].setText(entry["local"] or "—")
-                widgets["remote"].setText(entry["remote"] or "—")
-                widgets["status"].setText("<span style='color:#58a6ff;'>有更新</span>")
-                widgets["status"].setTextFormat(Qt.TextFormat.RichText)
-                image_ref = entry["image"]
-                widgets["btn"].setEnabled(True)
-                widgets["btn"].setText("立即更新")
-                try:
-                    widgets["btn"].clicked.disconnect()
-                except Exception:
-                    pass
-                if image_ref == self._agent_image_ref():
-                    widgets["btn"].clicked.connect(lambda checked: self._show_remote_update_dialog())
-                else:
-                    widgets["btn"].clicked.connect(lambda checked, ref=image_ref: self._show_image_update_dialog(ref))
-            else:
-                widgets["local"].setText(entry["local"] or "—")
-                widgets["remote"].setText(entry["remote"] or "—")
-                widgets["status"].setText("<span style='color:#3fb950;'>最新</span>")
-                widgets["status"].setTextFormat(Qt.TextFormat.RichText)
-                widgets["btn"].setEnabled(True)
-                widgets["btn"].setText("检查更新")
-                try:
-                    widgets["btn"].clicked.disconnect()
-                except Exception:
-                    pass
-                widgets["btn"].clicked.connect(lambda checked, ref=entry["image"]: self._check_single_image(ref))
+            self._apply_image_status_entry(entry)
+        if request_kind in {"all", "auto"}:
+            self.config.set("last_image_update_check_ts", int(time.time()))
+        self._notify_image_updates_if_needed(results, request_kind)
+        self._refresh_image_update_check_hint()
+        self._schedule_next_image_update_check()
 
     def _on_image_pull_result(self, image_ref, success, message):
         self._img_spinner_timer.stop()
@@ -2143,6 +2340,23 @@ class MainWindow(QMainWindow):
             widgets["btn"].clicked.connect(lambda checked, ref=image_ref: self._check_single_image(ref))
             widgets["status"].setText("<span style='color:#3fb950;'>已更新</span>")
             widgets["status"].setTextFormat(Qt.TextFormat.RichText)
+            cached = dict(self._cached_image_status_map())
+            cached_entry = dict(cached.get(image_ref) or {})
+            cached_entry.update({
+                "image": image_ref,
+                "has_update": False,
+                "error": None,
+                "checked_at": int(time.time()),
+            })
+            if cached_entry.get("remote"):
+                cached_entry["local"] = cached_entry["remote"]
+            cached[image_ref] = cached_entry
+            self.config.set("image_status_cache", cached)
+            remaining_updates = self._update_available_image_entries(list(cached.values()))
+            self.config.set(
+                "image_update_last_alert_signature",
+                self._image_update_alert_signature(remaining_updates) if remaining_updates else "",
+            )
             detail_text = ""
             if image_ref == "kromiose/nekro-cc-sandbox":
                 detail_text = "请前往 WebUI → 工作区 → 工作区管理 → 对应工作区 → 沙盒容器，手动重建沙盒以应用新版本。"
@@ -2168,6 +2382,30 @@ class MainWindow(QMainWindow):
         self.check_auto.setChecked(self.config.get("autostart"))
         self.check_auto.stateChanged.connect(lambda state: self.config.set("autostart", state == 2))
         card_layout.addWidget(self.check_auto)
+
+        image_check_row = QHBoxLayout()
+        image_check_row.setSpacing(12)
+        image_check_label = QLabel("镜像更新检查")
+        image_check_row.addWidget(image_check_label)
+
+        self.image_update_interval_combo = StyledComboBox()
+        for hours, label in self._image_update_check_interval_options():
+            self.image_update_interval_combo.addItem(label, hours)
+        current_hours = self._image_update_check_interval_hours()
+        current_index = self.image_update_interval_combo.findData(current_hours)
+        if current_index < 0:
+            current_index = self.image_update_interval_combo.findData(24)
+        self.image_update_interval_combo.setCurrentIndex(max(0, current_index))
+        self.image_update_interval_combo.currentIndexChanged.connect(lambda _index: self._on_image_update_interval_changed())
+        image_check_row.addWidget(self.image_update_interval_combo, 0, Qt.AlignmentFlag.AlignLeft)
+        image_check_row.addStretch()
+        card_layout.addLayout(image_check_row)
+
+        self.image_update_check_hint = QLabel()
+        self.image_update_check_hint.setObjectName("SectionDesc")
+        self.image_update_check_hint.setWordWrap(True)
+        card_layout.addWidget(self.image_update_check_hint)
+        self._refresh_image_update_check_hint()
 
         advanced_row = QHBoxLayout()
         advanced_row.setSpacing(12)
@@ -2305,14 +2543,18 @@ class MainWindow(QMainWindow):
                 if deploy_mode == "napcat":
                     deploy_info["napcat_port"] = str(napcat_port)
                 self.config.set("deploy_info", deploy_info)
-            # 刷新内置浏览器地址栏（强制更新 URL，不依赖 is_running 状态）
-            target_url = self._target_url(self.current_browser_target)
-            if hasattr(self, "browser_url_label"):
-                self._sync_browser_url_label(QUrl(target_url))
             current_view = self._current_webview()
-            if getattr(self.backend, "is_running", False) and current_view is not None:
-                current_view.setUrl(QUrl(target_url))
-            self._show_notice_dialog("保存成功", "端口设置已保存，重新部署服务后生效。")
+            if getattr(self.backend, "is_running", False):
+                if hasattr(self, "browser_url_label"):
+                    self._sync_browser_url_label()
+                self._show_notice_dialog("保存成功", "端口设置已保存，重新部署服务后生效。当前运行中的服务仍使用旧端口。")
+            else:
+                target_url = self._target_url(self.current_browser_target)
+                if hasattr(self, "browser_url_label"):
+                    self._sync_browser_url_label(QUrl(target_url))
+                if current_view is not None:
+                    current_view.setUrl(QUrl(target_url))
+                self._show_notice_dialog("保存成功", "端口设置已保存，重新部署服务后生效。")
         except ValueError:
             self._show_notice_dialog("提示", "请输入有效的端口号（1-65535）。")
 
