@@ -1,6 +1,8 @@
+import json
 import os
 import subprocess
 import threading
+import time
 
 from core.wsl.constants import DISTRO_NAME, STABLE_IMAGE
 
@@ -31,14 +33,20 @@ class WSLDeployMixin:
             try:
                 deploy_dir = "/root/nekro_agent"
                 data_dir = "/root/nekro_agent_data"
+                compose_dest = f"{deploy_dir}/docker-compose.yml"
+                env_dest = f"{deploy_dir}/.env"
 
                 self._wsl_exec(distro, f"mkdir -p {deploy_dir}")
                 self._wsl_exec(distro, f"mkdir -p {data_dir}")
 
-                env_exists = self._wsl_exec(distro, f"test -f {deploy_dir}/.env && echo yes").strip()
+                env_exists = self._wsl_exec(distro, f"test -f {env_dest} && echo yes").strip()
+                compose_exists = self._wsl_exec(distro, f"test -f {compose_dest} && echo yes").strip()
                 existing_env_content = ""
+                existing_compose_content = ""
                 if env_exists == "yes":
-                    existing_env_content = self._wsl_exec(distro, f"cat {deploy_dir}/.env")
+                    existing_env_content = self._wsl_exec(distro, f"cat {env_dest}")
+                if compose_exists == "yes":
+                    existing_compose_content = self._wsl_exec(distro, f"cat {compose_dest}")
 
                 if env_exists == "yes":
                     self.log_received.emit("检测到已有部署配置，将保留旧凭据并按当前设置重写部署文件", "info")
@@ -47,8 +55,20 @@ class WSLDeployMixin:
 
                 compose_content = self._prepare_compose_content(compose_src)
                 env_content = self._prepare_env(env_src, data_dir, existing_env_content)
-                self._write_to_wsl(distro, compose_content, f"{deploy_dir}/docker-compose.yml")
-                self._write_to_wsl(distro, env_content, f"{deploy_dir}/.env")
+                reuse_existing_runtime = (
+                    env_exists == "yes"
+                    and compose_exists == "yes"
+                    and existing_env_content.strip() == env_content.strip()
+                    and existing_compose_content.strip() == compose_content.strip()
+                )
+
+                if reuse_existing_runtime:
+                    self.log_received.emit("检测到部署配置未变化，本次启动将复用现有容器，不强制重建", "info")
+                elif env_exists == "yes":
+                    self.log_received.emit("检测到部署配置发生变化，将重建 Compose 服务以应用新配置", "info")
+
+                self._write_to_wsl(distro, compose_content, compose_dest)
+                self._write_to_wsl(distro, env_content, env_dest)
 
                 ls_output = self._wsl_exec(distro, f"ls -la {deploy_dir}")
                 self.log_received.emit(f"部署目录内容:\n{ls_output}", "debug")
@@ -75,6 +95,9 @@ class WSLDeployMixin:
 
                 self.log_received.emit("启动 Docker Compose 服务...", "info")
                 self.progress_updated.emit("启动 Compose 服务...")
+                compose_cmd = "docker compose -f docker-compose.yml --env-file .env up -d --remove-orphans"
+                if not reuse_existing_runtime:
+                    compose_cmd = f"{compose_cmd} --force-recreate"
                 proc = subprocess.run(
                     [
                         "wsl",
@@ -83,7 +106,7 @@ class WSLDeployMixin:
                         "--",
                         "bash",
                         "-c",
-                        f"cd {deploy_dir} && docker compose -f docker-compose.yml --env-file .env up -d --force-recreate --remove-orphans",
+                        f"cd {deploy_dir} && {compose_cmd}",
                     ],
                     capture_output=True,
                     timeout=120,
@@ -323,3 +346,158 @@ class WSLDeployMixin:
                 new_lines.append(line)
 
         return "\n".join(new_lines) + "\n"
+
+    def configure_napcat_network(self, payload):
+        """直接写入 NapCat 配置文件并重启 NapCat 容器。"""
+        if not isinstance(payload, dict) or not payload.get("token"):
+            self.napcat_network_config_finished.emit(
+                {
+                    "status": "missing_token",
+                    "message": "未找到 OneBot 令牌，无法执行一键配网。",
+                }
+            )
+            return
+
+        if not self._distro_exists():
+            self.napcat_network_config_finished.emit(
+                {
+                    "status": "runtime_missing",
+                    "message": "NekroAgent 发行版不存在，请先完成环境部署。",
+                }
+            )
+            return
+
+        def _emit(status, message, **extra):
+            self.napcat_network_config_finished.emit({"status": status, "message": message, **extra})
+
+        def _configure():
+            distro = DISTRO_NAME
+            config_dir = "/root/nekro_agent_data/napcat_data/napcat"
+            desired_client = {
+                "enable": True,
+                "name": payload.get("name") or "Nekro Agent",
+                "url": payload.get("url") or "ws://nekro_agent:8021/onebot/v11/ws",
+                "reportSelfMessage": False,
+                "messagePostFormat": "array",
+                "token": payload["token"],
+                "debug": False,
+                "heartInterval": 30000,
+                "reconnectInterval": 30000,
+            }
+
+            try:
+                config_exists = self._wsl_exec(distro, f'test -d "{config_dir}" && echo yes').strip()
+                if config_exists != "yes":
+                    _emit("config_missing", "未找到 NapCat 配置目录，请先完成 NapCat 部署。")
+                    return
+
+                files_output = self._wsl_exec(
+                    distro,
+                    f'find "{config_dir}" -maxdepth 1 -type f -name \'onebot11_*.json\' | sort',
+                )
+                onebot_paths = [line.strip() for line in self._clean_command_output(files_output).splitlines() if line.strip()]
+                if not onebot_paths:
+                    _emit("login_required", "尚未检测到 NapCat 账号配置，请先登录一次 QQ。")
+                    return
+
+                backup_dir = f"{config_dir}/_launcher_backup_{time.strftime('%Y%m%d-%H%M%S')}"
+                self._wsl_exec(distro, f'mkdir -p "{backup_dir}"')
+
+                configured_accounts = []
+                for path in onebot_paths:
+                    content = self._wsl_exec(distro, f'cat "{path}"')
+                    if not content.strip():
+                        _emit("config_read_failed", f"读取 NapCat 配置失败: {os.path.basename(path)}")
+                        return
+
+                    try:
+                        data = json.loads(content)
+                    except json.JSONDecodeError:
+                        _emit("config_invalid", f"NapCat 配置文件格式异常: {os.path.basename(path)}")
+                        return
+
+                    self._wsl_exec(distro, f'cp "{path}" "{backup_dir}/"')
+
+                    network = data.setdefault("network", {})
+                    existing_clients = network.get("websocketClients")
+                    if not isinstance(existing_clients, list):
+                        existing_clients = []
+
+                    fallback_index = None
+                    updated_clients = []
+                    replaced = False
+                    for client in existing_clients:
+                        if not isinstance(client, dict):
+                            updated_clients.append(client)
+                            continue
+
+                        if client.get("name") == desired_client["name"] or client.get("url") == desired_client["url"]:
+                            if not replaced:
+                                merged = dict(client)
+                                merged.update(desired_client)
+                                updated_clients.append(merged)
+                                replaced = True
+                            continue
+
+                        updated_clients.append(client)
+                        if fallback_index is None and client.get("url") == "ws://localhost:8082":
+                            fallback_index = len(updated_clients) - 1
+
+                    if not replaced and fallback_index is not None:
+                        merged = dict(updated_clients[fallback_index])
+                        merged.update(desired_client)
+                        updated_clients[fallback_index] = merged
+                        replaced = True
+
+                    if not replaced:
+                        updated_clients.append(desired_client)
+
+                    network["websocketClients"] = updated_clients
+                    self._write_to_wsl(distro, json.dumps(data, ensure_ascii=False, indent=2) + "\n", path)
+
+                    filename = os.path.basename(path)
+                    account = filename[len("onebot11_"):-len(".json")]
+                    if account:
+                        configured_accounts.append(account)
+
+                wsl_home = self._wsl_exec(distro, "echo $HOME").strip() or "/root"
+                deploy_dir = f"{wsl_home}/nekro_agent"
+                proc = subprocess.run(
+                    [
+                        "wsl",
+                        "-d",
+                        distro,
+                        "--",
+                        "bash",
+                        "-c",
+                        f'cd "{deploy_dir}" && docker compose -f docker-compose.yml restart nekro_napcat',
+                    ],
+                    capture_output=True,
+                    timeout=60,
+                    creationflags=self._creation_flags(),
+                )
+
+                if proc.returncode != 0:
+                    stderr_text = self._clean_stderr(proc.stderr, 0)
+                    self.log_received.emit("NapCat 配置文件已写入，但重启 NapCat 失败", "warn")
+                    if stderr_text:
+                        self.log_received.emit(stderr_text, "debug")
+                    _emit(
+                        "restart_failed",
+                        "NapCat 配置已写入，但重启服务失败，请手动重启 NapCat 后再验证。",
+                        backup_dir=backup_dir,
+                    )
+                    return
+
+                self.log_received.emit("NapCat 配置文件已更新，并已重启 NapCat 服务", "info")
+                message = "NapCat 配置已写入并重启生效。"
+                _emit(
+                    "saved",
+                    message,
+                    accounts=configured_accounts,
+                    backup_dir=backup_dir,
+                )
+            except Exception as exc:
+                _emit("error", f"NapCat 一键配网失败: {exc}")
+
+        threading.Thread(target=_configure, daemon=True).start()

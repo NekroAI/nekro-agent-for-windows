@@ -684,6 +684,14 @@ class FirstRunDialog(QDialog):
             self._show_notice_dialog("端口冲突", message)
             return
 
+        if mode == "napcat":
+            self._show_notice_dialog(
+                "NapCat 登录提示",
+                "NapCat 模式在关闭启动器并重新启动后，可能需要重新进行登录。\n\n"
+                "在部分情况下，QQ 还可能触发新设备风控。这属于当前 NapCat 运行方式下的已知现象，请在部署前知悉。",
+                button_text="我知道了",
+            )
+
         if self.config:
             self.config.set("nekro_port", nekro_port)
             if mode == "napcat":

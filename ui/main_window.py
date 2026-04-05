@@ -184,6 +184,7 @@ class MainWindow(QMainWindow):
         self._sidebar_collapsed = False
         self._browser_profile_channel = None
         self._pending_browser_refresh = None
+        self._napcat_network_config_in_progress = False
         self._image_status_request_kind = None
         self.browser_urls = {
             "nekro": f"http://localhost:{self.config.get('nekro_port') or 8021}",
@@ -219,6 +220,7 @@ class MainWindow(QMainWindow):
         self.backend.progress_updated.connect(self._on_backend_progress)
         self.backend.status_changed.connect(self.update_status_ui)
         self.backend.deploy_info_ready.connect(self._show_credentials_dialog)
+        self.backend.napcat_network_config_finished.connect(self._finish_napcat_network_config)
         self.backend.image_status_result.connect(self._on_image_status_result)
         self.backend.image_pull_result.connect(self._on_image_pull_result)
         self.backend.update_optional_confirm.connect(self._on_update_optional_confirm)
@@ -519,6 +521,8 @@ class MainWindow(QMainWindow):
     def _refresh_browser_nav_buttons(self):
         current_view = self._current_webview()
         has_view = current_view is not None
+        target = current_view.property("browser_target") if current_view else self.current_browser_target
+        napcat_visible = bool(has_view and target == "napcat" and self.config.get("deploy_mode") == "napcat")
 
         if hasattr(self, "browser_back_btn"):
             self.browser_back_btn.setEnabled(has_view and current_view.history().canGoBack())
@@ -528,6 +532,14 @@ class MainWindow(QMainWindow):
             self.browser_reload_btn.setEnabled(has_view)
         if hasattr(self, "browser_fill_credentials_btn"):
             self.browser_fill_credentials_btn.setEnabled(has_view and self._has_fillable_browser_credentials())
+        if hasattr(self, "browser_config_napcat_btn"):
+            self.browser_config_napcat_btn.setVisible(napcat_visible)
+            self.browser_config_napcat_btn.setEnabled(
+                napcat_visible
+                and self._has_napcat_network_config_payload()
+                and not self._napcat_network_config_in_progress
+            )
+            self.browser_config_napcat_btn.setText("配网中..." if self._napcat_network_config_in_progress else "一键配网")
         if hasattr(self, "browser_open_external_btn"):
             self.browser_open_external_btn.setEnabled(has_view)
 
@@ -553,6 +565,21 @@ class MainWindow(QMainWindow):
         if not password:
             return None
         return {"username": "admin", "password": password, "target": "nekro"}
+
+    def _has_napcat_network_config_payload(self):
+        info = self.config.get("deploy_info") or {}
+        return bool(info.get("onebot_token"))
+
+    def _browser_napcat_network_config_payload(self):
+        info = self.config.get("deploy_info") or {}
+        onebot_token = info.get("onebot_token", "")
+        if not onebot_token:
+            return None
+        return {
+            "name": "Nekro Agent",
+            "url": "ws://nekro_agent:8021/onebot/v11/ws",
+            "token": onebot_token,
+        }
 
     def _update_browser_tab_label(self, browser_view, title=None, url=None):
         if not hasattr(self, "browser_tabs"):
@@ -1425,6 +1452,52 @@ class MainWindow(QMainWindow):
 
         current_view.page().runJavaScript(script, _handle_fill_result)
 
+    def _configure_napcat_network(self):
+        current_view = self._current_webview()
+        if current_view is None:
+            return
+
+        target = current_view.property("browser_target") if current_view else self.current_browser_target
+        if target != "napcat":
+            self._show_notice_dialog("提示", "请先切换到 NapCat 页面，再执行一键配网。")
+            return
+        if not getattr(self.backend, "is_running", False):
+            self._show_notice_dialog("提示", "当前服务未启动，请先完成部署并等待 NapCat 可访问。")
+            return
+        if self._napcat_network_config_in_progress:
+            return
+
+        payload = self._browser_napcat_network_config_payload()
+        if not payload:
+            self._show_notice_dialog("提示", "未找到 OneBot 令牌，无法执行一键配网。")
+            return
+
+        self._napcat_network_config_in_progress = True
+        self._refresh_browser_nav_buttons()
+        self.backend.configure_napcat_network(payload)
+
+    def _finish_napcat_network_config(self, result):
+        self._napcat_network_config_in_progress = False
+        self._refresh_browser_nav_buttons()
+
+        if not isinstance(result, dict):
+            self._show_notice_dialog("提示", "NapCat 一键配网未返回结果，请稍后重试。")
+            return
+
+        status = result.get("status") or "unknown"
+        message = result.get("message") or "NapCat 一键配网失败，请稍后重试。"
+        if status == "saved":
+            self._show_notice_dialog("配网完成", message)
+            return
+        if status == "login_required":
+            self._show_notice_dialog("请先登录", message)
+            return
+        if status == "restart_failed":
+            self._show_notice_dialog("需要手动重启", message)
+            return
+
+        self._show_notice_dialog("配网失败", message)
+
     def _on_browser_url_changed(self, browser_view, url):
         self._update_browser_tab_label(browser_view, url=url)
         if browser_view is self._current_webview():
@@ -1547,6 +1620,30 @@ class MainWindow(QMainWindow):
 
         self.backend.start_services(deploy_mode)
 
+    def _stop_services_for_mode_change(self):
+        if self._update_in_progress:
+            self._show_notice_dialog("提示", "当前有更新任务正在进行，请等待完成后再关闭服务。")
+            return
+        if not self.backend.is_running:
+            self._show_notice_dialog("提示", "当前服务未在运行。")
+            return
+
+        reply = self._show_confirm_dialog(
+            "关闭 NekroAgent",
+            "将停止当前 docker compose 服务。\n\n"
+            "运行环境、镜像和已保存配置不会删除。停止后可重新运行初始化向导以修改部署模式。\n\n"
+            "确定要继续吗？",
+            confirm_text="确认关闭",
+        )
+        if not reply:
+            return
+
+        self.switch_tab(2)
+        self.log_viewer_app.append("<span style='color:#7ce0a3;'>[INFO]</span> 开始停止服务，用于修改部署模式...")
+        if hasattr(self, "log_preview"):
+            self.log_preview.append("<span style='color:#7ce0a3;'>[INFO]</span> 开始停止服务，用于修改部署模式...")
+        self.backend.stop_services()
+
     def update_status_ui(self, status):
         previous_status = self._last_status
         self._last_status = status
@@ -1570,6 +1667,8 @@ class MainWindow(QMainWindow):
         self.btn_deploy_action.setEnabled(not running and not updating)
         self.btn_primary_deploy.setEnabled(not running and not updating)
         can_update = bool(self.config.get("deploy_mode")) and not updating
+        if hasattr(self, "btn_stop_action"):
+            self.btn_stop_action.setEnabled(running and not updating)
         self.btn_update_action.setEnabled(can_update)
         self.btn_primary_update.setEnabled(can_update)
         if hasattr(self, "btn_primary_preview"):
@@ -1757,6 +1856,7 @@ class MainWindow(QMainWindow):
         bottom_grid.setVerticalSpacing(16)
 
         actions_card = SectionCard("快速操作", "保留最常用的部署与维护入口。")
+        actions_card.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         actions_layout = actions_card.body_layout()
         actions_grid = QGridLayout()
         actions_grid.setHorizontalSpacing(14)
@@ -1764,18 +1864,21 @@ class MainWindow(QMainWindow):
 
         self.btn_env_check = ActionButton("CHK", "环境检查", f"重新运行 {self.backend.display_name} 初始化向导")
         self.btn_deploy_action = ActionButton("RUN", "一键部署", "启动容器并写入运行配置", "primary")
+        self.btn_stop_action = ActionButton("STOP", "关闭服务", "停止 docker compose 以便修改部署模式")
         self.btn_update_action = ActionButton("UPD", "升级 Nekro Agent", "拉取镜像并重启服务")
         self.btn_uninstall_action = ActionButton("DEL", "卸载清理", "删除容器、镜像和运行环境", "danger")
 
         self.btn_env_check.clicked.connect(self._show_first_run_dialog)
         self.btn_deploy_action.clicked.connect(self.start_deploy)
+        self.btn_stop_action.clicked.connect(self._stop_services_for_mode_change)
         self.btn_update_action.clicked.connect(self._update_services)
         self.btn_uninstall_action.clicked.connect(self._uninstall_environment)
 
         actions_grid.addWidget(self.btn_env_check, 0, 0)
         actions_grid.addWidget(self.btn_deploy_action, 0, 1)
-        actions_grid.addWidget(self.btn_update_action, 1, 0)
-        actions_grid.addWidget(self.btn_uninstall_action, 1, 1)
+        actions_grid.addWidget(self.btn_stop_action, 1, 0)
+        actions_grid.addWidget(self.btn_update_action, 1, 1)
+        actions_grid.addWidget(self.btn_uninstall_action, 2, 0, 1, 2)
         actions_layout.addLayout(actions_grid)
 
         activity_card = SectionCard("实时摘要", "显示最近的应用日志，完整内容在日志中心查看。")
@@ -1786,13 +1889,14 @@ class MainWindow(QMainWindow):
         self.log_preview.setMinimumHeight(250)
         activity_layout.addWidget(self.log_preview)
 
-        bottom_grid.addWidget(actions_card, 0, 0)
+        bottom_grid.addWidget(actions_card, 0, 0, Qt.AlignmentFlag.AlignTop)
         bottom_grid.addWidget(activity_card, 0, 1)
         layout.addLayout(bottom_grid)
 
         self._register_responsive_buttons(
             self.btn_env_check,
             self.btn_deploy_action,
+            self.btn_stop_action,
             self.btn_update_action,
             self.btn_uninstall_action,
         )
@@ -1853,6 +1957,13 @@ class MainWindow(QMainWindow):
         self.browser_fill_credentials_btn.clicked.connect(self._fill_browser_credentials)
         self.browser_fill_credentials_btn.setToolTip("将已保存的登录凭据填入当前页面")
         toolbar.addWidget(self.browser_fill_credentials_btn)
+
+        self.browser_config_napcat_btn = QPushButton("一键配网")
+        self.browser_config_napcat_btn.setObjectName("SegmentBtn")
+        self.browser_config_napcat_btn.clicked.connect(self._configure_napcat_network)
+        self.browser_config_napcat_btn.setToolTip("直接写入 NapCat 配置文件并重启 NapCat 服务")
+        self.browser_config_napcat_btn.setVisible(False)
+        toolbar.addWidget(self.browser_config_napcat_btn)
 
         self.browser_open_external_btn = QPushButton("在系统浏览器打开")
         self.browser_open_external_btn.setObjectName("SegmentBtn")
@@ -2631,7 +2742,7 @@ class MainWindow(QMainWindow):
             self._show_notice_dialog("提示", f"无法打开目录，请确认服务已启动且目录已创建。\n\n路径: {win_path}\n错误: {error}", danger=True)
 
     def _ask_close_action(self):
-        """返回 1=最小化到托盘, 2=停止并退出, 其他=取消"""
+        """返回 1=最小化到托盘, 2=停止服务并退出, 其他=取消"""
         choice = QDialog(self)
         choice.setWindowTitle("选择操作")
         choice.setMinimumWidth(360)
