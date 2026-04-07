@@ -281,7 +281,8 @@ default = root
 
             self.progress_updated.emit("启动 Docker 服务...")
             self.log_received.emit("[Docker 安装] 5/5 启动 Docker 服务...", "info")
-            _run_step("systemctl daemon-reload && systemctl restart docker", "Docker 服务启动", timeout=60)
+            if not _run_step("systemctl daemon-reload && systemctl restart docker", "Docker 服务启动", timeout=60):
+                return False
             self.log_received.emit("[Docker 安装] ✓ Docker 服务已启动", "info")
 
             self.log_received.emit("[Docker 安装] 等待 Docker daemon 就绪...", "info")
@@ -302,15 +303,24 @@ default = root
     def remove_distro(self):
         """删除专用 WSL 发行版"""
         try:
-            subprocess.run(
+            proc = subprocess.run(
                 ["wsl", "--unregister", DISTRO_NAME],
                 capture_output=True,
                 timeout=30,
                 creationflags=self._creation_flags(),
             )
+            if proc.returncode != 0:
+                stderr_text = self._clean_stderr(proc.stderr, 300)
+                if stderr_text:
+                    self.log_received.emit(f"删除发行版失败: {stderr_text}", "error")
+                else:
+                    self.log_received.emit(f"删除发行版失败，返回码: {proc.returncode}", "error")
+                return False
             self.log_received.emit(f"已删除 WSL 发行版 {DISTRO_NAME}", "info")
+            return True
         except Exception as e:
             self.log_received.emit(f"删除发行版失败: {e}", "error")
+            return False
 
     def install_wsl(self):
         """以管理员权限安装 WSL2（通过 ShellExecute runas）"""

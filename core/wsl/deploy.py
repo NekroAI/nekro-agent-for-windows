@@ -149,7 +149,6 @@ class WSLDeployMixin:
         """停止 Docker Compose 服务"""
         self._stop_event.set()
         was_running = self.is_running
-        self.is_running = False
 
         if self._log_process and self._log_process.poll() is None:
             try:
@@ -159,41 +158,70 @@ class WSLDeployMixin:
             self._log_process = None
 
         if not was_running:
+            self.is_running = False
             self.status_changed.emit("已停止")
             return
 
         distro = DISTRO_NAME
         self.log_received.emit("正在停止服务...", "info")
+        self.status_changed.emit("停止中...")
 
         def _do_stop():
+            deploy_dir = "/root/nekro_agent"
+
+            def _restore_runtime_state():
+                self.is_running = True
+                self._stop_event.clear()
+                if self._log_process is None or self._log_process.poll() is not None:
+                    threading.Thread(target=self._log_reader, args=(distro, deploy_dir), daemon=True).start()
+
             try:
                 wsl_home = self._wsl_exec(distro, "echo $HOME").strip()
                 if not wsl_home:
                     wsl_home = "/root"
                 deploy_dir = f"{wsl_home}/nekro_agent"
 
-                subprocess.run(
+                stop_proc = subprocess.run(
                     ["wsl", "-d", distro, "--", "bash", "-c", f"cd {deploy_dir} && docker compose -f docker-compose.yml stop"],
                     capture_output=True,
                     timeout=60,
                     creationflags=self._creation_flags(),
                 )
+                if stop_proc.returncode != 0:
+                    stderr_text = self._clean_stderr(stop_proc.stderr, 0)
+                    stdout_text = self._clean_command_output(stop_proc.stdout, 0)
+                    detail = stderr_text or stdout_text or f"返回码: {stop_proc.returncode}"
+                    self.log_received.emit(f"停止 Compose 服务失败: {detail}", "error")
+                    _restore_runtime_state()
+                    self.status_changed.emit("停止失败")
+                    return
+
+                self.is_running = False
                 self.log_received.emit("服务已停止", "info")
 
                 self.log_received.emit(f"关闭 {distro} 发行版...", "info")
-                subprocess.run(
+                terminate_proc = subprocess.run(
                     ["wsl", "--terminate", distro],
                     capture_output=True,
                     timeout=30,
                     creationflags=self._creation_flags(),
                 )
-                self.log_received.emit(f"{distro} 已关闭", "info")
+                if terminate_proc.returncode != 0:
+                    stderr_text = self._clean_stderr(terminate_proc.stderr, 0)
+                    stdout_text = self._clean_command_output(terminate_proc.stdout, 0)
+                    detail = stderr_text or stdout_text or f"返回码: {terminate_proc.returncode}"
+                    self.log_received.emit(f"关闭 {distro} 发行版失败，将保留已停止状态: {detail}", "warn")
+                else:
+                    self.log_received.emit(f"{distro} 已关闭", "info")
+                self.status_changed.emit("已停止")
             except subprocess.TimeoutExpired:
                 self.log_received.emit("停止服务超时", "warn")
+                _restore_runtime_state()
+                self.status_changed.emit("停止失败")
             except Exception as e:
                 self.log_received.emit(f"停止服务异常: {e}", "error")
-            finally:
-                self.status_changed.emit("已停止")
+                _restore_runtime_state()
+                self.status_changed.emit("停止失败")
 
         threading.Thread(target=_do_stop, daemon=True).start()
 
@@ -233,7 +261,9 @@ class WSLDeployMixin:
                 self.log_received.emit("[卸载] ✓ 部署文件已清理", "info")
 
                 self.log_received.emit("[卸载] 3/3 删除 WSL 发行版...", "info")
-                self.remove_distro()
+                if not self.remove_distro():
+                    self.status_changed.emit("卸载失败")
+                    return
                 self.log_received.emit("[卸载] ✓ 环境卸载完成", "info")
 
                 if self.config:
@@ -241,6 +271,11 @@ class WSLDeployMixin:
                     self.config.set("deploy_mode", "")
                     self.config.set("wsl_distro", "")
                     self.config.set("wsl_install_dir", "")
+                    self.config.set("release_channel", "stable")
+                    self.config.set("preview_backup_available", False)
+                    self.config.set("image_status_cache", {})
+                    self.config.set("image_update_last_alert_signature", "")
+                    self.config.set("last_image_update_check_ts", 0)
                     self.config.set("deploy_info", None)
 
                 self.status_changed.emit("已卸载")
@@ -386,12 +421,15 @@ class WSLDeployMixin:
             }
 
             try:
-                config_exists = self._wsl_exec(distro, f'test -d "{config_dir}" && echo yes').strip()
+                config_exists = self._wsl_exec_checked(
+                    distro,
+                    f'[ -d "{config_dir}" ] && printf yes || printf no',
+                ).strip()
                 if config_exists != "yes":
                     _emit("config_missing", "未找到 NapCat 配置目录，请先完成 NapCat 部署。")
                     return
 
-                files_output = self._wsl_exec(
+                files_output = self._wsl_exec_checked(
                     distro,
                     f'find "{config_dir}" -maxdepth 1 -type f -name \'onebot11_*.json\' | sort',
                 )
@@ -401,11 +439,11 @@ class WSLDeployMixin:
                     return
 
                 backup_dir = f"{config_dir}/_launcher_backup_{time.strftime('%Y%m%d-%H%M%S')}"
-                self._wsl_exec(distro, f'mkdir -p "{backup_dir}"')
+                self._wsl_exec_checked(distro, f'mkdir -p "{backup_dir}"')
 
                 configured_accounts = []
                 for path in onebot_paths:
-                    content = self._wsl_exec(distro, f'cat "{path}"')
+                    content = self._wsl_exec_checked(distro, f'cat "{path}"')
                     if not content.strip():
                         _emit("config_read_failed", f"读取 NapCat 配置失败: {os.path.basename(path)}")
                         return
@@ -416,14 +454,13 @@ class WSLDeployMixin:
                         _emit("config_invalid", f"NapCat 配置文件格式异常: {os.path.basename(path)}")
                         return
 
-                    self._wsl_exec(distro, f'cp "{path}" "{backup_dir}/"')
+                    self._wsl_exec_checked(distro, f'cp "{path}" "{backup_dir}/"')
 
                     network = data.setdefault("network", {})
                     existing_clients = network.get("websocketClients")
                     if not isinstance(existing_clients, list):
                         existing_clients = []
 
-                    fallback_index = None
                     updated_clients = []
                     replaced = False
                     for client in existing_clients:
@@ -440,14 +477,6 @@ class WSLDeployMixin:
                             continue
 
                         updated_clients.append(client)
-                        if fallback_index is None and client.get("url") == "ws://localhost:8082":
-                            fallback_index = len(updated_clients) - 1
-
-                    if not replaced and fallback_index is not None:
-                        merged = dict(updated_clients[fallback_index])
-                        merged.update(desired_client)
-                        updated_clients[fallback_index] = merged
-                        replaced = True
 
                     if not replaced:
                         updated_clients.append(desired_client)
@@ -460,7 +489,7 @@ class WSLDeployMixin:
                     if account:
                         configured_accounts.append(account)
 
-                wsl_home = self._wsl_exec(distro, "echo $HOME").strip() or "/root"
+                wsl_home = self._wsl_exec_checked(distro, "echo $HOME").strip() or "/root"
                 deploy_dir = f"{wsl_home}/nekro_agent"
                 proc = subprocess.run(
                     [

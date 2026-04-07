@@ -89,6 +89,7 @@ begin
   DeleteDirIfExists(AppDir + 'shared');
   DeleteDirIfExists(AppDir + 'logs');
   DeleteDirIfExists(LocalDataDir);
+  RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'NekroAgentLauncher');
 
   if DirExists(ExpandConstant('{app}')) then
     RemoveDir(ExpandConstant('{app}'));

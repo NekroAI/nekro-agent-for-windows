@@ -10,6 +10,18 @@ from core.wsl.constants import DISTRO_NAME
 
 
 class WSLShellMixin:
+    def runtime_exists(self):
+        return self._distro_exists()
+
+    def _wsl_run(self, distro, cmd, timeout=60):
+        """在 WSL 发行版中执行命令并返回原始进程结果。"""
+        return subprocess.run(
+            ["wsl", "-d", distro, "--", "bash", "-c", cmd],
+            capture_output=True,
+            timeout=timeout,
+            creationflags=self._creation_flags(),
+        )
+
     def _distro_exists(self):
         """检查 NekroAgent 专用发行版是否已存在"""
         try:
@@ -114,15 +126,20 @@ class WSLShellMixin:
     def _wsl_exec(self, distro, cmd, timeout=60):
         """在 WSL 发行版中执行命令并返回 stdout"""
         try:
-            proc = subprocess.run(
-                ["wsl", "-d", distro, "--", "bash", "-c", cmd],
-                capture_output=True,
-                timeout=timeout,
-                creationflags=self._creation_flags(),
-            )
+            proc = self._wsl_run(distro, cmd, timeout=timeout)
             return self._safe_decode(proc.stdout)
         except Exception:
             return ""
+
+    def _wsl_exec_checked(self, distro, cmd, timeout=60):
+        """在 WSL 中执行命令，失败时抛出异常。"""
+        proc = self._wsl_run(distro, cmd, timeout=timeout)
+        stdout = self._safe_decode(proc.stdout)
+        if proc.returncode != 0:
+            stderr = self._clean_stderr(proc.stderr, 0)
+            detail = stderr or self._clean_command_output(stdout, 0) or f"返回码: {proc.returncode}"
+            raise RuntimeError(detail)
+        return stdout
 
     def _copy_to_wsl(self, distro, local_path, wsl_path):
         """将 Windows 本地文件复制到 WSL 内"""
@@ -138,7 +155,7 @@ class WSLShellMixin:
     def _write_to_wsl(self, distro, content, wsl_path):
         """将字符串内容写入 WSL 内文件"""
         encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
-        self._wsl_exec(distro, f'echo "{encoded}" | base64 -d > "{wsl_path}"')
+        self._wsl_exec_checked(distro, f'echo "{encoded}" | base64 -d > "{wsl_path}"')
 
     @staticmethod
     def _random_token(length=32):

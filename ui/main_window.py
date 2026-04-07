@@ -39,6 +39,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 
+from core.autostart import set_autostart_enabled
 from core.backend_factory import BackendFactory
 from core.config_manager import ConfigManager
 from core.port_utils import validate_port_bindings
@@ -227,6 +228,8 @@ class MainWindow(QMainWindow):
         self.backend.update_finished.connect(self._on_update_finished)
 
         self._build_tray_icon()
+        self._sync_autostart_setting(silent=True)
+        self.update_status_ui("未就绪")
         self._schedule_next_image_update_check()
         QTimer.singleShot(200, self._on_startup)
         QTimer.singleShot(0, self._apply_responsive_layout)
@@ -448,6 +451,33 @@ class MainWindow(QMainWindow):
     def _show_notice_dialog(self, title, text, button_text="确定", danger=False):
         show_notice_dialog(self, title, text, button_text, danger)
 
+    def _sync_autostart_setting(self, enabled=None, silent=False):
+        desired = bool(self.config.get("autostart") if enabled is None else enabled)
+        try:
+            set_autostart_enabled(desired)
+            if self.config.get("autostart") != desired:
+                self.config.set("autostart", desired)
+            return True
+        except Exception as error:
+            if not silent:
+                self._show_notice_dialog(
+                    "启动项设置失败",
+                    f"无法更新系统启动项，请检查权限或安装位置。\n\n错误: {error}",
+                    danger=True,
+                )
+            return False
+
+    def _on_autostart_changed(self, state):
+        desired = state == int(Qt.CheckState.Checked.value)
+        previous = bool(self.config.get("autostart"))
+        if self._sync_autostart_setting(enabled=desired, silent=False):
+            return
+
+        if hasattr(self, "check_auto"):
+            self.check_auto.blockSignals(True)
+            self.check_auto.setChecked(previous)
+            self.check_auto.blockSignals(False)
+
     def _advanced_features_enabled(self):
         return bool(self.config.get("advanced_features_enabled"))
 
@@ -581,6 +611,52 @@ class MainWindow(QMainWindow):
             "token": onebot_token,
         }
 
+    def _guard_napcat_network_config_busy(self, action_text):
+        if not self._napcat_network_config_in_progress:
+            return True
+        self._show_notice_dialog("提示", f"NapCat 一键配网进行中，请等待完成后再{action_text}。")
+        return False
+
+    def _blocking_status_detail(self, status=None):
+        current_status = status if status is not None else self._last_status
+        return {
+            "启动中...": "服务正在启动",
+            "停止中...": "服务正在停止",
+            "卸载中...": "运行环境正在卸载",
+            "安装 Docker...": "Docker 正在安装",
+            "更新中...": "更新任务正在执行",
+        }.get(current_status, "")
+
+    def _guard_blocking_status_idle(self, action_text):
+        detail = self._blocking_status_detail()
+        if not detail:
+            return True
+        self._show_notice_dialog("提示", f"{detail}，请等待完成后再{action_text}。")
+        return False
+
+    def _service_active(self):
+        return bool(getattr(self.backend, "is_running", False))
+
+    def _service_ready(self):
+        return self._service_active() and self._last_status == "运行中"
+
+    def _backend_runtime_exists(self):
+        runtime_exists = getattr(self.backend, "runtime_exists", None)
+        if callable(runtime_exists):
+            try:
+                return bool(runtime_exists())
+            except Exception:
+                return False
+
+        distro_exists = getattr(self.backend, "_distro_exists", None)
+        if callable(distro_exists):
+            try:
+                return bool(distro_exists())
+            except Exception:
+                return False
+
+        return True
+
     def _update_browser_tab_label(self, browser_view, title=None, url=None):
         if not hasattr(self, "browser_tabs"):
             return
@@ -648,7 +724,13 @@ class MainWindow(QMainWindow):
             self.advanced_status_hint.setVisible(enabled)
         if hasattr(self, "btn_primary_preview"):
             self.btn_primary_preview.setVisible(enabled)
-            self.btn_primary_preview.setEnabled(enabled and bool(self.config.get("deploy_mode")) and self._last_status != "更新中...")
+            self.btn_primary_preview.setEnabled(
+                enabled
+                and self._service_ready()
+                and bool(self.config.get("deploy_mode"))
+                and not self._napcat_network_config_in_progress
+                and not self._blocking_status_detail()
+            )
             self.btn_primary_preview.setText(self._preview_button_label())
         if hasattr(self, "browser_devtools_btn"):
             self.browser_devtools_btn.setVisible(enabled)
@@ -744,11 +826,18 @@ class MainWindow(QMainWindow):
         return None
 
     def _switch_to_preview_build(self):
+        if not self._guard_napcat_network_config_busy("切换预览版"):
+            return
+        if not self._guard_blocking_status_idle("切换预览版"):
+            return
         if self._update_in_progress:
             self._show_notice_dialog("提示", "当前已有更新任务正在进行，请等待完成后再试。")
             return
         if not self.config.get("deploy_mode"):
             self._show_notice_dialog("提示", "尚未完成部署，无法切换到预览版。")
+            return
+        if not self._service_ready():
+            self._show_notice_dialog("提示", "服务未处于运行中，无法切换预览版。请先启动并等待服务就绪。")
             return
         preview_mode = self._release_channel() == "preview"
         if preview_mode:
@@ -918,11 +1007,18 @@ class MainWindow(QMainWindow):
         self.backend.pull_single_image(image_ref)
 
     def _show_remote_update_dialog(self):
+        if not self._guard_napcat_network_config_busy("升级服务"):
+            return
+        if not self._guard_blocking_status_idle("升级服务"):
+            return
         if self._update_in_progress:
             self._show_notice_dialog("提示", "升级流程正在进行中，请等待当前操作完成。")
             return
         if not self.config.get("deploy_mode"):
             self._show_notice_dialog("提示", "尚未完成部署，无法执行升级。")
+            return
+        if not self._service_ready():
+            self._show_notice_dialog("提示", "服务未处于运行中，无法执行升级。请先启动并等待服务就绪。")
             return
         if not hasattr(self.backend, "run_remote_update"):
             self._show_notice_dialog("提示", f"当前后端 {self.backend.display_name} 暂不支持升级。")
@@ -974,8 +1070,18 @@ class MainWindow(QMainWindow):
     def _on_startup(self):
         if self.config.get("first_run") or not self.config.get("deploy_mode"):
             self._show_first_run_dialog()
-        else:
-            self.start_deploy(show_logs=False)
+            return
+
+        if not self._backend_runtime_exists():
+            self._show_notice_dialog(
+                "运行环境缺失",
+                "检测到本地仍保存了部署配置，但 WSL 运行环境不存在。\n\n请先重新创建运行环境，再继续部署。",
+                danger=True,
+            )
+            self._show_first_run_dialog()
+            return
+
+        self.start_deploy(show_logs=False)
 
     def _show_first_run_dialog(self):
         from ui.first_run_dialog import FirstRunDialog
@@ -1599,6 +1705,10 @@ class MainWindow(QMainWindow):
         event.ignore()
 
     def start_deploy(self, show_logs=True):
+        if not self._guard_napcat_network_config_busy("开始部署"):
+            return
+        if not self._guard_blocking_status_idle("开始部署"):
+            return
         if self.backend.is_running:
             self._show_notice_dialog("提示", "服务已在运行中")
             return
@@ -1606,9 +1716,15 @@ class MainWindow(QMainWindow):
         deploy_mode = self.config.get("deploy_mode")
         if not deploy_mode:
             self._show_first_run_dialog()
-            deploy_mode = self.config.get("deploy_mode")
-            if not deploy_mode:
-                return
+            return
+        if not self._backend_runtime_exists():
+            self._show_notice_dialog(
+                "运行环境缺失",
+                "当前保存的部署配置仍在，但 WSL 运行环境不存在。\n\n请先重新创建运行环境，再继续部署。",
+                danger=True,
+            )
+            self._show_first_run_dialog()
+            return
 
         if show_logs:
             self.switch_tab(2)
@@ -1621,6 +1737,10 @@ class MainWindow(QMainWindow):
         self.backend.start_services(deploy_mode)
 
     def _stop_services_for_mode_change(self):
+        if not self._guard_napcat_network_config_busy("关闭服务"):
+            return
+        if not self._guard_blocking_status_idle("关闭服务"):
+            return
         if self._update_in_progress:
             self._show_notice_dialog("提示", "当前有更新任务正在进行，请等待完成后再关闭服务。")
             return
@@ -1649,12 +1769,20 @@ class MainWindow(QMainWindow):
         self._last_status = status
         self.status_badge.setText(f"状态: {status}")
 
+        blocking = self._blocking_status_detail(status)
         updating = status == "更新中..."
         running = status == "运行中"
+        service_active = self._service_active()
         was_running = previous_status == "运行中"
         self.metric_status.findChild(QLabel, "MetricValue").setText(status)
         if updating:
             metric_hint = "正在执行升级步骤"
+            accent = "amber"
+        elif blocking:
+            metric_hint = blocking
+            accent = "amber"
+        elif service_active:
+            metric_hint = "服务状态异常，请查看日志"
             accent = "amber"
         else:
             metric_hint = "服务可访问" if running else "等待部署或启动"
@@ -1664,15 +1792,28 @@ class MainWindow(QMainWindow):
         self.metric_status.style().unpolish(self.metric_status)
         self.metric_status.style().polish(self.metric_status)
 
-        self.btn_deploy_action.setEnabled(not running and not updating)
-        self.btn_primary_deploy.setEnabled(not running and not updating)
-        can_update = bool(self.config.get("deploy_mode")) and not updating
+        self.btn_deploy_action.setEnabled(not service_active and not blocking)
+        self.btn_primary_deploy.setEnabled(not service_active and not blocking)
+        can_update = (
+            bool(self.config.get("deploy_mode"))
+            and running
+            and not blocking
+            and not self._napcat_network_config_in_progress
+        )
         if hasattr(self, "btn_stop_action"):
-            self.btn_stop_action.setEnabled(running and not updating)
+            self.btn_stop_action.setEnabled(service_active and not blocking and not self._napcat_network_config_in_progress)
         self.btn_update_action.setEnabled(can_update)
         self.btn_primary_update.setEnabled(can_update)
+        if hasattr(self, "btn_uninstall_action"):
+            self.btn_uninstall_action.setEnabled(not self._napcat_network_config_in_progress and not blocking)
         if hasattr(self, "btn_primary_preview"):
-            self.btn_primary_preview.setEnabled(self._advanced_features_enabled() and bool(self.config.get("deploy_mode")) and not updating)
+            self.btn_primary_preview.setEnabled(
+                self._advanced_features_enabled()
+                and running
+                and bool(self.config.get("deploy_mode"))
+                and not blocking
+                and not self._napcat_network_config_in_progress
+            )
             self.btn_primary_preview.setText(self._preview_button_label())
 
         if running:
@@ -1695,11 +1836,16 @@ class MainWindow(QMainWindow):
         else:
             if hasattr(self, "_auto_image_check_timer"):
                 self._auto_image_check_timer.stop()
-            self.btn_log_nekro.setVisible(False)
-            self.btn_log_napcat.setVisible(False)
-            self.btn_primary_deploy.setText("开始部署")
+            self.btn_log_nekro.setVisible(service_active)
+            self.btn_log_napcat.setVisible(service_active and self.config.get("deploy_mode") == "napcat")
+            self.btn_primary_deploy.setText("服务仍在运行" if service_active else "开始部署")
             self.btn_primary_update.setText("升级 Nekro Agent" if not updating else "升级中...")
-            if self._active_update_kind in {"remote", "preview", "restore"} and status in {"启动失败", "更新失败", "启动超时", "已停止"}:
+            update_recovery_failed = (
+                self._active_update_kind in {"remote", "preview", "restore"}
+                and status in {"启动失败", "更新失败", "启动超时", "已停止"}
+                and (not service_active or status == "启动超时")
+            )
+            if update_recovery_failed:
                 action_text = "恢复正式版后服务" if self._active_update_kind == "restore" else "升级后服务"
                 failure_message = (
                     f"{self._pending_remote_update_message}\n\n最终状态：{status}"
@@ -1711,7 +1857,10 @@ class MainWindow(QMainWindow):
             if self._quit_after_stop and status in {"已停止", "已卸载"}:
                 self._quit_after_stop = False
                 QApplication.quit()
-            if self._current_webview() is not None and was_running:
+            if self._quit_after_stop and status == "停止失败":
+                self._quit_after_stop = False
+                self._show_notice_dialog("关闭失败", "服务停止失败，启动器将继续保持打开。", danger=True)
+            if self._current_webview() is not None and was_running and not service_active:
                 self._set_browser_target(self.current_browser_target, force_reload=False)
             if status in {"启动失败", "更新失败", "启动超时", "已停止", "已卸载"}:
                 self._clear_pull_progress()
@@ -1721,6 +1870,8 @@ class MainWindow(QMainWindow):
             if self._uninstall_in_progress:
                 self._uninstall_in_progress = False
                 self._show_notice_dialog("卸载完成", "运行环境已卸载完成。")
+        elif status == "卸载失败" and self._uninstall_in_progress:
+            self._uninstall_in_progress = False
 
         if hasattr(self, "btn_browser_napcat"):
             self.btn_browser_napcat.setVisible(self.config.get("deploy_mode") == "napcat")
@@ -1739,11 +1890,8 @@ class MainWindow(QMainWindow):
     def _on_update_finished(self, success, message):
         update_kind = self._active_update_kind
         self.btn_primary_update.setText("升级 Nekro Agent")
-        self.btn_update_action.setEnabled(bool(self.config.get("deploy_mode")))
-        self.btn_primary_update.setEnabled(bool(self.config.get("deploy_mode")))
         if hasattr(self, "btn_primary_preview"):
             self.btn_primary_preview.setText(self._preview_button_label())
-            self.btn_primary_preview.setEnabled(self._advanced_features_enabled() and bool(self.config.get("deploy_mode")))
         self._refresh_advanced_feature_ui()
         success_title, failure_title = self._active_update_result_titles()
         if success:
@@ -1760,6 +1908,7 @@ class MainWindow(QMainWindow):
                 )
         else:
             self._finish_update_session(False, failure_title, message)
+        self.update_status_ui(self._last_status)
 
     def init_home_page(self):
         page = QWidget()
@@ -2491,7 +2640,7 @@ class MainWindow(QMainWindow):
 
         self.check_auto = QCheckBox("开机自动启动 Nekro Agent 管理系统")
         self.check_auto.setChecked(self.config.get("autostart"))
-        self.check_auto.stateChanged.connect(lambda state: self.config.set("autostart", state == 2))
+        self.check_auto.stateChanged.connect(self._on_autostart_changed)
         card_layout.addWidget(self.check_auto)
 
         image_check_row = QHBoxLayout()
@@ -2690,6 +2839,10 @@ class MainWindow(QMainWindow):
         self._show_remote_update_dialog()
 
     def _uninstall_environment(self):
+        if not self._guard_napcat_network_config_busy("卸载环境"):
+            return
+        if not self._guard_blocking_status_idle("卸载环境"):
+            return
         reply = self._show_confirm_dialog(
             "确认卸载",
             "此操作将：\n"
@@ -2785,6 +2938,12 @@ class MainWindow(QMainWindow):
         return choice.exec()
 
     def closeEvent(self, event: QCloseEvent):
+        if not self._guard_napcat_network_config_busy("退出启动器"):
+            event.ignore()
+            return
+        if not self._guard_blocking_status_idle("退出启动器"):
+            event.ignore()
+            return
         if self.backend.is_running:
             result = self._ask_close_action()
             if result == 1:
@@ -2807,6 +2966,10 @@ class MainWindow(QMainWindow):
             self.tray_icon.hide()
 
     def _quit_app(self):
+        if not self._guard_napcat_network_config_busy("退出启动器"):
+            return
+        if not self._guard_blocking_status_idle("退出启动器"):
+            return
         if self.backend.is_running:
             reply = self._show_confirm_dialog(
                 "确认退出",
@@ -2903,12 +3066,27 @@ class MainWindow(QMainWindow):
             _spin_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
             _spin = [0]
             _timer = QTimer(dialog)
+            _signal_cleaned = [False]
 
             def _tick():
                 boot_status.setText(
                     f"<span style='color:#58a6ff;'>{_spin_frames[_spin[0] % len(_spin_frames)]} 等待服务启动...</span>"
                 )
                 _spin[0] += 1
+
+            def _cleanup_boot_signals():
+                if _signal_cleaned[0]:
+                    return
+                _signal_cleaned[0] = True
+                try:
+                    self.backend.boot_finished.disconnect(_on_boot_finished)
+                except Exception:
+                    pass
+                try:
+                    self.backend.status_changed.disconnect(_on_timeout)
+                except Exception:
+                    pass
+
             _timer.timeout.connect(_tick)
             _timer.start(100)
             _tick()
@@ -2917,23 +3095,18 @@ class MainWindow(QMainWindow):
                 _timer.stop()
                 boot_status.setText("<span style='color:#3fb950;'>✓ 服务已就绪，可以开始使用</span>")
                 btn_close.setEnabled(True)
-                try:
-                    self.backend.boot_finished.disconnect(_on_boot_finished)
-                except Exception:
-                    pass
+                _cleanup_boot_signals()
 
             def _on_timeout(status):
                 if status in {"启动超时", "启动失败"}:
                     _timer.stop()
                     boot_status.setText(f"<span style='color:#f26f82;'>✗ {status}，请检查日志</span>")
                     btn_close.setEnabled(True)
-                    try:
-                        self.backend.status_changed.disconnect(_on_timeout)
-                    except Exception:
-                        pass
+                    _cleanup_boot_signals()
 
             self.backend.boot_finished.connect(_on_boot_finished)
             self.backend.status_changed.connect(_on_timeout)
+            dialog.finished.connect(lambda _result: _cleanup_boot_signals())
         else:
             boot_status.setVisible(False)
 

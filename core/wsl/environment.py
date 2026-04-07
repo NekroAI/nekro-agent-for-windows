@@ -50,17 +50,17 @@ class WSLEnvironmentMixin:
                 return (False, "")
             try:
                 proc = subprocess.run(
-                    ["wsl", "-d", DISTRO_NAME, "--", "bash", "-c", "docker info"],
+                    ["wsl", "-d", DISTRO_NAME, "--", "bash", "-c", "docker --version"],
                     capture_output=True,
-                    timeout=30,
+                    timeout=10,
                     creationflags=self._creation_flags(),
                 )
                 ok = proc.returncode == 0
                 ctx["docker"] = ok
                 if ok:
-                    self.log_received.emit("[环境检测] ✓ Docker 可用", "info")
+                    self.log_received.emit("[环境检测] ✓ Docker CLI 已安装", "info")
                 else:
-                    self.log_received.emit("[环境检测] ✗ Docker 检测失败", "error")
+                    self.log_received.emit("[环境检测] ✗ Docker CLI 检测失败", "error")
                     self.log_received.emit(f"返回码: {proc.returncode}", "error")
                     self.log_received.emit(f"STDERR: {self._clean_stderr(proc.stderr, 300)}", "error")
                 return (ok, "")
