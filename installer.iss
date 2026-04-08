@@ -2,8 +2,8 @@
 ; Nekro-Agent 稳定安装脚本（工业级）
 ; =========================
 
-#define MyAppName "Nekro Agent"
-#define MyAppVersion "1.1.0"
+#define MyAppName "Nekro Agent 安装器"
+#define MyAppVersion "1.2.0"
 #define MyAppPublisher "Nekro AI"
 #define MyAppExeName "NekroAgent.exe"
 
@@ -15,7 +15,7 @@ AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 OutputDir=installer
-OutputBaseFilename=NekroAgent-Setup
+OutputBaseFilename=NekroAgent安装器-Setup
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
