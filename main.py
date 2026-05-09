@@ -1,10 +1,11 @@
 import sys
 import os
 import argparse
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QPalette, QColor
 from PyQt6.QtWidgets import QApplication
 from ui.main_window import MainWindow
+from ui.splash import SplashScreen
 
 # 全局 debug 标志
 DEBUG_MODE = False
@@ -63,45 +64,21 @@ def main():
     # 解析命令行参数
     parser = argparse.ArgumentParser()
     parser.add_argument('--debug', action='store_true', help='启用 debug 日志')
-    parser.add_argument(
-        '--disable-webview-gpu',
-        action='store_true',
-        help='禁用内置 WebView GPU 加速，仅在出现闪烁或渲染异常时使用',
-    )
     args = parser.parse_args()
     DEBUG_MODE = args.debug
 
-    # 强制设置控制台编码为 UTF-8（Windows 兼容）
     if sys.platform == 'win32':
         os.environ['PYTHONIOENCODING'] = 'utf-8'
 
-    # 设置日志文件（放到用户目录，避免权限问题）
     log_dir = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "NekroAgent")
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, "debug.log")
 
-    # 重定向 stdout 和 stderr 到日志文件和控制台
     redirector = LogRedirector(log_file)
     sys.stdout = redirector
     sys.stderr = redirector
 
     print(f"[LOG] 程序启动，日志文件: {log_file}")
-
-    # 尝试禁用无障碍功能以规避某些 Windows 环境下的刷屏报错
-    os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = "--disable-features=Accessibility"
-
-    chromium_flags = ["--disable-features=CalculateNativeWinOcclusion"]
-
-    # 默认保留 GPU 加速，避免内置 WebView 退化为软件渲染导致明显卡顿。
-    # 同时关闭 Windows 原生遮挡检测，减少部分机器上的偶发闪烁。
-    # 仅在个别机器出现驱动兼容问题时允许手动降级。
-    if args.disable_webview_gpu:
-        chromium_flags.append("--disable-gpu")
-        print("[LOG] 已按参数禁用 WebView GPU 加速")
-    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join(chromium_flags)
-
-    # WebEngine 官方要求在创建 QApplication 前设置，能减少多窗口/嵌入场景的图形问题。
-    QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
 
     app = QApplication(sys.argv)
 
@@ -123,10 +100,17 @@ def main():
     light_palette.setColor(QPalette.ColorRole.HighlightedText, QColor(255, 255, 255))
     app.setPalette(light_palette)
 
-    # 实例化并显示主窗口
-    window = MainWindow()
-    window.debug_mode = DEBUG_MODE
-    window.show()
+    splash = SplashScreen()
+    splash.start()
+
+    window = None
+
+    def _create_main():
+        nonlocal window
+        window = MainWindow(splash=splash)
+        window.debug_mode = DEBUG_MODE
+
+    QTimer.singleShot(600, _create_main)
 
     sys.exit(app.exec())
 
