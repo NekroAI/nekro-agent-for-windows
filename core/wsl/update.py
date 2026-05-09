@@ -16,7 +16,7 @@ from core.wsl.constants import (
 
 class WSLUpdateMixin:
     def _backup_target_candidates(self, distro):
-        deploy_dir = "/root/nekro_agent"
+        deploy_dir, data_dir, _ = self._get_active_deploy_paths()
         env_path = f"{deploy_dir}/.env"
         instance_name = ""
 
@@ -40,11 +40,10 @@ class WSLUpdateMixin:
         targets = [
             postgres_volume,
             qdrant_volume,
-            "/root/nekro_agent_data",
-            "/root/nekro_agent",
+            data_dir,
+            deploy_dir,
         ]
 
-        # 兼容旧逻辑，避免历史无前缀数据目录漏备份。
         for target in NA_BACKUP_TARGETS:
             if target not in targets:
                 targets.append(target)
@@ -68,7 +67,7 @@ class WSLUpdateMixin:
         from core.update_runner import build_update_plan, log_update_plan
 
         distro = DISTRO_NAME
-        deploy_dir = "/root/nekro_agent"
+        deploy_dir, _, _ = self._get_active_deploy_paths()
 
         def _exec(cmd, timeout=300):
             proc = subprocess.run(
@@ -187,7 +186,7 @@ class WSLUpdateMixin:
     def switch_to_preview(self, create_backup=True):
         """备份数据与配置后，将 Nekro Agent 主容器切换到预览版镜像。"""
         distro = DISTRO_NAME
-        deploy_dir = "/root/nekro_agent"
+        deploy_dir, _, _ = self._get_active_deploy_paths()
 
         def _exec(cmd, timeout=300):
             proc = subprocess.run(
@@ -277,7 +276,7 @@ class WSLUpdateMixin:
     def restore_stable_from_backup(self):
         """从预览版备份恢复正式版。"""
         distro = DISTRO_NAME
-        deploy_dir = "/root/nekro_agent"
+        deploy_dir, _, _ = self._get_active_deploy_paths()
 
         def _exec(cmd, timeout=300):
             proc = subprocess.run(

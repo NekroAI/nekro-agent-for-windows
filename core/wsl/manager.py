@@ -4,6 +4,7 @@ import threading
 
 from core.backend_base import BackendBase
 from core.wsl.deploy import WSLDeployMixin
+from core.wsl.discovery import WSLDiscoveryMixin
 from core.wsl.environment import WSLEnvironmentMixin
 from core.wsl.images import WSLImageMixin
 from core.wsl.monitor import WSLMonitorMixin
@@ -19,6 +20,7 @@ class WSLManager(
     WSLDeployMixin,
     WSLUpdateMixin,
     WSLMonitorMixin,
+    WSLDiscoveryMixin,
     WSLShellMixin,
     BackendBase,
 ):
@@ -38,6 +40,7 @@ class WSLManager(
                     self.base_path = os.path.dirname(os.path.dirname(self.base_path))
 
         self.is_running = False
+        self._deploying = False
         self._log_process = None
         self._stop_event = threading.Event()
         self._pending_deploy_info = None

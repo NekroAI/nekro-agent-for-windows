@@ -13,10 +13,17 @@ class WSLShellMixin:
     def runtime_exists(self):
         return self._distro_exists()
 
-    def _wsl_run(self, distro, cmd, timeout=60):
-        """在 WSL 发行版中执行命令并返回原始进程结果。"""
+    def _wsl_run(self, distro, cmd, timeout=60, user=None):
+        """在 WSL 发行版中执行命令并返回原始进程结果。
+
+        user: 可选，指定运行用户（如 "root"）。不传则使用发行版默认用户。
+        """
+        args = ["wsl", "-d", distro]
+        if user:
+            args += ["-u", user]
+        args += ["--", "bash", "-c", cmd]
         return subprocess.run(
-            ["wsl", "-d", distro, "--", "bash", "-c", cmd],
+            args,
             capture_output=True,
             timeout=timeout,
             creationflags=self._creation_flags(),
@@ -123,17 +130,17 @@ class WSLShellMixin:
         result = "\n".join(lines)
         return result[:max_len] if max_len else result
 
-    def _wsl_exec(self, distro, cmd, timeout=60):
+    def _wsl_exec(self, distro, cmd, timeout=60, user=None):
         """在 WSL 发行版中执行命令并返回 stdout"""
         try:
-            proc = self._wsl_run(distro, cmd, timeout=timeout)
+            proc = self._wsl_run(distro, cmd, timeout=timeout, user=user)
             return self._safe_decode(proc.stdout)
         except Exception:
             return ""
 
-    def _wsl_exec_checked(self, distro, cmd, timeout=60):
+    def _wsl_exec_checked(self, distro, cmd, timeout=60, user=None):
         """在 WSL 中执行命令，失败时抛出异常。"""
-        proc = self._wsl_run(distro, cmd, timeout=timeout)
+        proc = self._wsl_run(distro, cmd, timeout=timeout, user=user)
         stdout = self._safe_decode(proc.stdout)
         if proc.returncode != 0:
             stderr = self._clean_stderr(proc.stderr, 0)

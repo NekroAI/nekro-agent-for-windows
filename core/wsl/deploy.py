@@ -8,14 +8,28 @@ from core.wsl.constants import DISTRO_NAME, STABLE_IMAGE
 
 
 class WSLDeployMixin:
+    def _get_active_deploy_paths(self):
+        """从当前活跃实例配置中获取部署路径，兼容无多实例配置的情况。"""
+        if self.config:
+            inst = self.config.get_instance()
+            if inst:
+                return (
+                    inst.get("deploy_dir", "/root/nekro_agent"),
+                    inst.get("data_dir", "/root/nekro_agent_data"),
+                    inst.get("instance_name", ""),
+                )
+        return "/root/nekro_agent", "/root/nekro_agent_data", ""
+
     def start_services(self, deploy_mode):
         """部署 Docker Compose 服务"""
-        if self.is_running:
+        if self.is_running or self._deploying:
             return True
 
+        self._deploying = True
         distro = DISTRO_NAME
         if not self._distro_exists():
             self.log_received.emit("NekroAgent 发行版不存在", "error")
+            self._deploying = False
             return False
 
         self._stop_event.clear()
@@ -27,12 +41,12 @@ class WSLDeployMixin:
 
         if not os.path.exists(compose_src):
             self.log_received.emit(f"Compose 文件不存在: {compose_src}", "error")
+            self._deploying = False
             return False
 
         def _deploy():
             try:
-                deploy_dir = "/root/nekro_agent"
-                data_dir = "/root/nekro_agent_data"
+                deploy_dir, data_dir, _ = self._get_active_deploy_paths()
                 compose_dest = f"{deploy_dir}/docker-compose.yml"
                 env_dest = f"{deploy_dir}/.env"
 
@@ -136,11 +150,30 @@ class WSLDeployMixin:
                 else:
                     self._refresh_deploy_info(deploy_info)
 
+                if self.config and is_first_deploy:
+                    _, _, inst_name = self._get_active_deploy_paths()
+                    inst_id = self.config.get_active_instance_id()
+                    if not inst_id:
+                        inst_id = self.config.next_instance_id()
+                    self.config.set_instance(inst_id, {
+                        "instance_name": inst_name,
+                        "deploy_dir": deploy_dir,
+                        "data_dir": data_dir,
+                        "deploy_mode": deploy_mode,
+                        "nekro_port": self.config.get("nekro_port") or 8021,
+                        "napcat_port": self.config.get("napcat_port") or 6099,
+                        "release_channel": self.config.get("release_channel") or "stable",
+                        "deploy_info": deploy_info,
+                    })
+                    self.config.set("active_instance", inst_id)
+
                 threading.Thread(target=self._log_reader, args=(distro, deploy_dir), daemon=True).start()
                 threading.Thread(target=self._health_check, daemon=True).start()
             except Exception as e:
                 self.log_received.emit(f"部署失败: {e}", "error")
                 self.status_changed.emit("启动失败")
+            finally:
+                self._deploying = False
 
         threading.Thread(target=_deploy, daemon=True).start()
         return True
@@ -167,7 +200,7 @@ class WSLDeployMixin:
         self.status_changed.emit("停止中...")
 
         def _do_stop():
-            deploy_dir = "/root/nekro_agent"
+            deploy_dir, _, _ = self._get_active_deploy_paths()
 
             def _restore_runtime_state():
                 self.is_running = True
@@ -176,10 +209,6 @@ class WSLDeployMixin:
                     threading.Thread(target=self._log_reader, args=(distro, deploy_dir), daemon=True).start()
 
             try:
-                wsl_home = self._wsl_exec(distro, "echo $HOME").strip()
-                if not wsl_home:
-                    wsl_home = "/root"
-                deploy_dir = f"{wsl_home}/nekro_agent"
 
                 stop_proc = subprocess.run(
                     ["wsl", "-d", distro, "--", "bash", "-c", f"cd {deploy_dir} && docker compose -f docker-compose.yml stop"],
@@ -242,10 +271,7 @@ class WSLDeployMixin:
 
         def _do_uninstall():
             try:
-                wsl_home = self._wsl_exec(distro, "echo $HOME").strip()
-                if not wsl_home:
-                    wsl_home = "/root"
-                deploy_dir = f"{wsl_home}/nekro_agent"
+                deploy_dir, _, _ = self._get_active_deploy_paths()
 
                 self.log_received.emit("[卸载] 1/3 停止并删除容器...", "info")
                 self._wsl_exec(
@@ -277,6 +303,8 @@ class WSLDeployMixin:
                     self.config.set("image_update_last_alert_signature", "")
                     self.config.set("last_image_update_check_ts", 0)
                     self.config.set("deploy_info", None)
+                    self.config.set("instances", {})
+                    self.config.set("active_instance", "")
 
                 self.status_changed.emit("已卸载")
             except Exception as e:
@@ -350,6 +378,8 @@ class WSLDeployMixin:
                 content = f.read()
 
         existing_env = self._parse_env_values(existing_env_content or "")
+        _, _, active_instance_name = self._get_active_deploy_paths()
+
         lines = content.splitlines()
         new_lines = []
         for line in lines:
@@ -374,7 +404,7 @@ class WSLDeployMixin:
             elif key == "NEKRO_ADMIN_PASSWORD":
                 new_lines.append(f"NEKRO_ADMIN_PASSWORD={existing_value or self._random_token(16)}")
             elif key == "INSTANCE_NAME":
-                new_lines.append(f"{key}={existing_value}")
+                new_lines.append(f"{key}={existing_value or active_instance_name}")
             elif key in {"POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DATABASE"} and existing_value:
                 new_lines.append(f"{key}={existing_value}")
             else:
@@ -407,7 +437,8 @@ class WSLDeployMixin:
 
         def _configure():
             distro = DISTRO_NAME
-            config_dir = "/root/nekro_agent_data/napcat_data/napcat"
+            _, data_dir, _ = self._get_active_deploy_paths()
+            config_dir = f"{data_dir}/napcat_data/napcat"
             desired_client = {
                 "enable": True,
                 "name": payload.get("name") or "Nekro Agent",
@@ -489,8 +520,7 @@ class WSLDeployMixin:
                     if account:
                         configured_accounts.append(account)
 
-                wsl_home = self._wsl_exec_checked(distro, "echo $HOME").strip() or "/root"
-                deploy_dir = f"{wsl_home}/nekro_agent"
+                deploy_dir, _, _ = self._get_active_deploy_paths()
                 proc = subprocess.run(
                     [
                         "wsl",

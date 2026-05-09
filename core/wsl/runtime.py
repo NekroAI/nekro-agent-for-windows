@@ -8,7 +8,9 @@ from core.wsl.constants import DISTRO_NAME, ROOTFS_URLS
 
 
 class WSLRuntimeMixin:
-    def get_host_access_path(self, guest_path):
+    def get_host_access_path(self, guest_path=None):
+        if guest_path is None and hasattr(self, 'config') and self.config:
+            guest_path = self.config.get_active_data_dir()
         normalized = guest_path or "/"
         return f"\\\\wsl$\\{DISTRO_NAME}{normalized}"
 

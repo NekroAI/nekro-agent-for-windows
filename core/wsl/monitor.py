@@ -66,5 +66,6 @@ class WSLMonitorMixin:
             time.sleep(interval)
 
         if not self._stop_event.is_set():
+            self.is_running = False
             self.log_received.emit("服务启动超时，请检查日志", "error")
             self.status_changed.emit("启动超时")
