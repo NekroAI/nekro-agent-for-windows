@@ -4,6 +4,46 @@ from PyQt6.QtWidgets import QComboBox, QDialog, QFrame, QHBoxLayout, QLabel, QLi
 
 from ui.styles import STYLESHEET
 
+SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+
+class SpinnerLabel(QLabel):
+    """Reusable braille-dot spinner with start/stop/finish states."""
+
+    def __init__(self, parent=None, color="#58a6ff", size=16):
+        super().__init__(parent)
+        self._frames = SPINNER_FRAMES
+        self._index = 0
+        self.setFixedWidth(20)
+        self.setStyleSheet(f"font-size: {size}px; color: {color};")
+        self.setText(self._frames[0])
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+
+    def _tick(self):
+        self._index = (self._index + 1) % len(self._frames)
+        self.setText(self._frames[self._index])
+
+    def start(self, interval_ms=100):
+        self._index = 0
+        self.setText(self._frames[0])
+        self.setVisible(True)
+        self._timer.start(interval_ms)
+
+    def stop(self):
+        self._timer.stop()
+
+    def set_finished(self, success):
+        self._timer.stop()
+        self.setText("✓" if success else "✗")
+        self.setStyleSheet(
+            "font-size: 16px; color: #3fb950;" if success else "font-size: 16px; color: #f26f82;"
+        )
+
+    @property
+    def running(self):
+        return self._timer.isActive()
+
 
 def show_notice_dialog(parent, title, text, button_text="确定", danger=False):
     dialog = QDialog(parent)
@@ -61,8 +101,6 @@ class UpdateProgressDialog(QDialog):
         super().__init__(parent)
         self._running = False
         self._completed = False
-        self._spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-        self._spinner_index = 0
 
         self.setWindowTitle(title)
         self.setMinimumWidth(400)
@@ -89,9 +127,7 @@ class UpdateProgressDialog(QDialog):
         progress_row = QHBoxLayout()
         progress_row.setSpacing(10)
 
-        self.spinner_label = QLabel("⠋")
-        self.spinner_label.setStyleSheet("font-size: 16px; color: #58a6ff;")
-        self.spinner_label.setFixedWidth(20)
+        self.spinner_label = SpinnerLabel(self)
         self.spinner_label.setVisible(False)
         progress_row.addWidget(self.spinner_label, 0, Qt.AlignmentFlag.AlignTop)
 
@@ -131,11 +167,6 @@ class UpdateProgressDialog(QDialog):
         self.action_button.clicked.connect(self._handle_action)
         button_row.addWidget(self.action_button)
 
-        layout.addLayout(button_row)
-
-        self._spinner_timer = QTimer(self)
-        self._spinner_timer.timeout.connect(self._tick_spinner)
-
     def _schedule_resize(self):
         QTimer.singleShot(0, self._refresh_size)
 
@@ -159,14 +190,10 @@ class UpdateProgressDialog(QDialog):
         self.begin()
         self.confirmed.emit()
 
-    def _tick_spinner(self):
-        self._spinner_index = (self._spinner_index + 1) % len(self._spinner_frames)
-        self.spinner_label.setText(self._spinner_frames[self._spinner_index])
-
     def begin(self, status_text="正在准备更新..."):
         self._running = True
         self._completed = False
-        self.spinner_label.setVisible(True)
+        self.spinner_label.start()
         self.status_label.setVisible(True)
         self.status_label.setText(status_text)
         self.detail_label.clear()
@@ -176,7 +203,6 @@ class UpdateProgressDialog(QDialog):
         self.cancel_button.setVisible(False)
         self.action_button.setText("处理中...")
         self.action_button.setEnabled(False)
-        self._spinner_timer.start(100)
         self._schedule_resize()
 
     def set_progress(self, status_text=None, detail_text=None, value=None, busy=None):
@@ -203,12 +229,7 @@ class UpdateProgressDialog(QDialog):
     def set_finished(self, success, status_text, detail_text=""):
         self._running = False
         self._completed = True
-        self._spinner_timer.stop()
-        self.spinner_label.setVisible(True)
-        self.spinner_label.setText("✓" if success else "✗")
-        self.spinner_label.setStyleSheet(
-            "font-size: 16px; color: #3fb950;" if success else "font-size: 16px; color: #f26f82;"
-        )
+        self.spinner_label.set_finished(success)
         self.status_label.setVisible(True)
         self.status_label.setText(status_text)
         self.detail_label.setText(detail_text)
@@ -313,10 +334,16 @@ class StyledComboBox(QComboBox):
 
 
 class MetricCard(QFrame):
-    def __init__(self, label, value, hint="", accent="blue", parent=None):
+    clicked = pyqtSignal()
+
+    def __init__(self, label, value, hint="", accent="blue", clickable=False, parent=None):
         super().__init__(parent)
         self.setProperty("accent", accent)
         self.setObjectName("MetricCard")
+        self._clickable = clickable
+
+        if clickable:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 18, 18, 18)
@@ -338,6 +365,19 @@ class MetricCard(QFrame):
             hint_widget.setWordWrap(True)
             hint_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
             layout.addWidget(hint_widget)
+
+    def set_clickable(self, clickable):
+        self._clickable = clickable
+        self.setCursor(
+            Qt.CursorShape.PointingHandCursor if clickable else Qt.CursorShape.ArrowCursor
+        )
+
+    def mousePressEvent(self, event):
+        if self._clickable and event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
 
 class SectionCard(QFrame):
@@ -367,3 +407,76 @@ class SectionCard(QFrame):
 
     def body_layout(self):
         return self._layout
+
+
+class StepIndicator(QWidget):
+    """Horizontal step dots for wizard dialogs."""
+
+    def __init__(self, steps, current=0, parent=None):
+        super().__init__(parent)
+        self._steps = steps
+        self._current = current
+        self._dots = []
+        self._labels = []
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 8)
+        layout.setSpacing(0)
+        layout.addStretch()
+
+        for i, name in enumerate(steps):
+            if i > 0:
+                line = QFrame()
+                line.setFixedSize(32, 2)
+                line.setObjectName("StepLine")
+                layout.addWidget(line, 0, Qt.AlignmentFlag.AlignVCenter)
+
+            col = QVBoxLayout()
+            col.setSpacing(4)
+            col.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            dot = QLabel()
+            dot.setFixedSize(10, 10)
+            dot.setObjectName("StepDot")
+            dot.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            col.addWidget(dot, 0, Qt.AlignmentFlag.AlignCenter)
+
+            label = QLabel(name)
+            label.setObjectName("StepLabel")
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            col.addWidget(label)
+
+            layout.addLayout(col)
+            self._dots.append(dot)
+            self._labels.append(label)
+
+        layout.addStretch()
+        self._refresh()
+
+    def set_step(self, index):
+        self._current = max(0, min(index, len(self._steps) - 1))
+        self._refresh()
+
+    def _refresh(self):
+        for i, (dot, label) in enumerate(zip(self._dots, self._labels)):
+            if i < self._current:
+                dot.setProperty("state", "done")
+                label.setProperty("state", "done")
+            elif i == self._current:
+                dot.setProperty("state", "active")
+                label.setProperty("state", "active")
+            else:
+                dot.setProperty("state", "pending")
+                label.setProperty("state", "pending")
+            dot.style().unpolish(dot)
+            dot.style().polish(dot)
+            label.style().unpolish(label)
+            label.style().polish(label)
+
+        for child in self.findChildren(QFrame, "StepLine"):
+            idx = self.layout().indexOf(child)
+            step_idx = idx // 2
+            if step_idx <= self._current:
+                child.setStyleSheet("background: #e88478;")
+            else:
+                child.setStyleSheet("background: #dfe7ef;")

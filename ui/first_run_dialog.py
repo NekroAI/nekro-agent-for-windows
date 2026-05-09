@@ -3,12 +3,12 @@ import re
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                              QPushButton, QWidget, QStackedWidget,
                              QMessageBox, QLineEdit, QFileDialog,
-                             QSizePolicy)
+                             QSizePolicy, QScrollArea, QFrame)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
 from core.port_utils import validate_port_bindings
 from ui.styles import STYLESHEET
-from ui.widgets import create_install_progress_bar, show_notice_dialog
+from ui.widgets import StepIndicator, create_install_progress_bar, show_notice_dialog
 
 
 class CheckStepThread(QThread):
@@ -23,6 +23,34 @@ class CheckStepThread(QThread):
     def run(self):
         passed, detail = self._func()
         self.step_done.emit(self._step, passed, detail)
+
+
+class ScanInstancesThread(QThread):
+    """后台扫描已有实例线程"""
+    scan_done = pyqtSignal(list)
+    scan_step = pyqtSignal(str)  # 当前扫描步骤描述
+
+    def __init__(self, backend):
+        super().__init__()
+        self.backend = backend
+
+    def run(self):
+        instances = self.backend.scan_existing_instances(on_step=self.scan_step.emit)
+        self.scan_done.emit(instances)
+
+
+class TakeoverThread(QThread):
+    """后台执行接管线程"""
+    finished = pyqtSignal(bool)
+
+    def __init__(self, backend, instance):
+        super().__init__()
+        self.backend = backend
+        self.instance = instance
+
+    def run(self):
+        ok = self.backend.takeover_instance(self.instance)
+        self.finished.emit(ok)
 
 
 class CreateRuntimeThread(QThread):
@@ -51,6 +79,7 @@ class FirstRunDialog(QDialog):
         self.env_result = None
         self._check_in_progress = False
         self._selected_mode = self.config.get("deploy_mode") or "lite"
+        self._pending_takeover_instance = None  # 场景 B 需要先建发行版时暂存
 
         self.setWindowTitle("Nekro Agent 环境配置向导")
         self.resize(660, 560)
@@ -59,28 +88,130 @@ class FirstRunDialog(QDialog):
         self.setStyleSheet(STYLESHEET)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(30, 30, 30, 30)
+        layout.setContentsMargins(30, 24, 30, 30)
         layout.setSpacing(0)
+
+        self._step_indicator = StepIndicator(
+            ["检测环境", "创建运行环境", "选择版本", "配置端口"],
+            current=0,
+        )
+        layout.addWidget(self._step_indicator)
 
         self.stack = QStackedWidget()
         layout.addWidget(self.stack)
 
-        self._init_check_page()       # 页面 0: 环境检测
-        self._init_create_page()      # 页面 1: 创建运行环境
-        self._init_select_page()      # 页面 2: 版本选择
-        self._init_datadir_page()     # 页面 3: 数据目录配置
+        # 页面名称 → stack index 映射
+        self._page_index = {}
+
+        self._init_scan_page()           # scan（第一页：扫描已有实例）
+        self._init_found_page()          # found_instances（扫描到实例时显示）
+        self._init_check_page()          # env_check（未发现实例时的全新部署流程入口）
+        self._init_create_page()         # create_runtime
+        self._init_select_page()         # select_mode
+        self._init_datadir_page()        # data_dir
+        self._init_takeover_page()       # takeover_progress
 
         self.backend.progress_updated.connect(self._on_progress)
         self.backend.install_error.connect(self._on_install_error)
 
-        self.stack.setCurrentIndex(0)
-        self._start_check()
+        self._goto_page("scan")
+        self._start_scan()
+
+    def _add_page(self, page: QWidget, name: str):
+        idx = self.stack.addWidget(page)
+        self._page_index[name] = idx
+
+    def _goto_page(self, name: str):
+        self.stack.setCurrentIndex(self._page_index[name])
+        step_map = {
+            "scan": 0, "env_check": 0, "found_instances": 0,
+            "create_runtime": 1,
+            "select_mode": 2,
+            "data_dir": 3,
+            "takeover_progress": -1,
+        }
+        step = step_map.get(name, -1)
+        if step >= 0:
+            self._step_indicator.set_step(step)
+            self._step_indicator.setVisible(True)
+        else:
+            self._step_indicator.setVisible(False)
 
     def _show_notice_dialog(self, title, text, button_text="确定", danger=False):
         show_notice_dialog(self, title, text, button_text, danger)
 
     # ------------------------------------------------------------------ #
-    #  页面 0: 环境检测
+    #  页面 scan: 检测已有实例（第一页）
+    # ------------------------------------------------------------------ #
+
+    def _init_scan_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(20)
+
+        title = QLabel("检测本机部署")
+        title.setObjectName("WizardTitle")
+        layout.addWidget(title)
+
+        self.scan_desc = QLabel("正在扫描本机已有的 Nekro Agent 实例，请稍候...")
+        self.scan_desc.setObjectName("WizardDesc")
+        self.scan_desc.setWordWrap(True)
+        layout.addWidget(self.scan_desc)
+
+        self.scan_step_label = QLabel("")
+        self.scan_step_label.setObjectName("WizardStepHint")
+        self.scan_step_label.setWordWrap(True)
+        layout.addWidget(self.scan_step_label)
+
+        self.scan_progress = create_install_progress_bar(0, 0, height=8, radius=4)
+        layout.addWidget(self.scan_progress)
+
+        layout.addStretch()
+
+        btn_box = QHBoxLayout()
+        btn_box.addStretch()
+        self.scan_skip_btn = QPushButton("跳过，全新部署")
+        self.scan_skip_btn.setFixedHeight(38)
+        self.scan_skip_btn.setFixedWidth(150)  # 固定宽度，扫描前后不变
+        self.scan_skip_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.scan_skip_btn.setObjectName("WizardSecondary")
+        self.scan_skip_btn.setEnabled(False)
+        self.scan_skip_btn.clicked.connect(self._skip_to_fresh_deploy)
+        btn_box.addWidget(self.scan_skip_btn)
+        layout.addLayout(btn_box)
+
+        self._add_page(page, "scan")
+
+    def _start_scan(self):
+        self.scan_desc.setText("正在扫描本机已有的 Nekro Agent 实例，请稍候...")
+        self.scan_step_label.setText("")
+        self.scan_progress.setRange(0, 0)
+        self.scan_skip_btn.setText("跳过，全新部署")
+        self.scan_skip_btn.setEnabled(False)
+        self._scan_thread = ScanInstancesThread(self.backend)
+        self._scan_thread.scan_step.connect(self.scan_step_label.setText)
+        self._scan_thread.scan_done.connect(self._on_scan_done)
+        self._scan_thread.start()
+
+    def _on_scan_done(self, instances: list):
+        self.scan_progress.setRange(0, 1)
+        self.scan_progress.setValue(1)
+        self.scan_step_label.setText("")
+        if instances:
+            self._populate_found_page(instances)
+            self._goto_page("found_instances")
+        else:
+            self.scan_desc.setText("未检测到已有实例，点击下方按钮开始全新安装配置。")
+            self.scan_skip_btn.setText("全新部署")
+            self.scan_skip_btn.setEnabled(True)
+
+    def _skip_to_fresh_deploy(self):
+        """跳过扫描结果，进入全新部署流程（环境检测）"""
+        self._goto_page("env_check")
+        self._start_check()
+
+    # ------------------------------------------------------------------ #
+    #  页面 env_check: 环境检测
     # ------------------------------------------------------------------ #
 
     def _init_check_page(self):
@@ -89,12 +220,12 @@ class FirstRunDialog(QDialog):
         layout.setSpacing(20)
 
         title = QLabel("环境检测")
-        title.setStyleSheet("font-size: 22px; font-weight: bold; color: #24292f;")
+        title.setObjectName("WizardTitle")
         title.setWordWrap(True)
         layout.addWidget(title)
 
         desc = QLabel("正在检测系统环境，请稍候...")
-        desc.setStyleSheet("font-size: 14px; color: #57606a;")
+        desc.setObjectName("WizardDesc")
         desc.setWordWrap(True)
         layout.addWidget(desc)
         self.check_desc = desc
@@ -126,22 +257,18 @@ class FirstRunDialog(QDialog):
         self.btn_action.setFixedHeight(38)
         self.btn_action.setMinimumWidth(120)
         self.btn_action.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_action.setStyleSheet(
-            "QPushButton { background-color: #2da44e; color: white; border: none; "
-            "border-radius: 6px; font-size: 14px; font-weight: 600; padding: 0 20px; }"
-            "QPushButton:hover { background-color: #28943f; }"
-            "QPushButton:disabled { background-color: #94d3a2; }"
-        )
+        self.btn_action.setObjectName("WizardPrimary")
         self.btn_action.setEnabled(False)
         self.btn_action.clicked.connect(self._handle_action)
         btn_box.addWidget(self.btn_action)
 
         layout.addLayout(btn_box)
-        self.stack.addWidget(page)
+        self._add_page(page, "env_check")
 
     def _create_check_item(self, name):
         lbl = QLabel(f"⏳  {name}")
-        lbl.setStyleSheet("font-size: 15px; color: #57606a; padding: 5px 0;")
+        lbl.setObjectName("WizardCheckItem")
+        lbl.setProperty("state", "pending")
         lbl.setProperty("check_name", name)
         lbl.setWordWrap(True)
         lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -151,10 +278,12 @@ class FirstRunDialog(QDialog):
         name = label.property("check_name")
         if ok:
             label.setText(f"✅  {name}" + (f"  —  {detail}" if detail else ""))
-            label.setStyleSheet("font-size: 15px; color: #2da44e; padding: 5px 0;")
+            label.setProperty("state", "pass")
         else:
             label.setText(f"❌  {name}" + (f"  —  {detail}" if detail else ""))
-            label.setStyleSheet("font-size: 15px; color: #cf222e; padding: 5px 0;")
+            label.setProperty("state", "fail")
+        label.style().unpolish(label)
+        label.style().polish(label)
 
     def _start_check(self):
         self._check_in_progress = True
@@ -183,7 +312,9 @@ class FirstRunDialog(QDialog):
                 self._check_results[i] = (False, "")
                 name = labels[i].property("check_name")
                 labels[i].setText(f"—  {name}")
-                labels[i].setStyleSheet("font-size: 15px; color: #8b949e; padding: 5px 0;")
+                labels[i].setProperty("state", "skip")
+                labels[i].style().unpolish(labels[i])
+                labels[i].style().polish(labels[i])
             self._on_all_checks_done()
             return
         self._run_check_step(step + 1)
@@ -198,8 +329,11 @@ class FirstRunDialog(QDialog):
             "docker_available": r.get(2, (False, ""))[0],
             "compose_available": r.get(3, (False, ""))[0],
         }
-        result = self.env_result
+        self._apply_check_result()
 
+    def _apply_check_result(self):
+        """根据环境检测结果更新描述和按钮（原有逻辑）"""
+        result = self.env_result
         all_ok = (result["wsl_installed"] and result["distro"]
                   and result["docker_available"] and result["compose_available"])
 
@@ -227,7 +361,7 @@ class FirstRunDialog(QDialog):
         mode = getattr(self, '_action_mode', None)
 
         if mode == "next":
-            self.stack.setCurrentIndex(2)
+            self._goto_page("select_mode")
             return
 
         if mode == "install_wsl":
@@ -249,7 +383,7 @@ class FirstRunDialog(QDialog):
             return
 
         if mode == "create_runtime":
-            self.stack.setCurrentIndex(1)
+            self._goto_page("create_runtime")
             return
 
         if mode == "install_docker":
@@ -274,12 +408,241 @@ class FirstRunDialog(QDialog):
         for lbl in [self.lbl_wsl, self.lbl_distro, self.lbl_docker, self.lbl_compose]:
             name = lbl.property("check_name")
             lbl.setText(f"⏳  {name}")
-            lbl.setStyleSheet("font-size: 15px; color: #57606a; padding: 5px 0;")
+            lbl.setProperty("state", "pending")
+            lbl.style().unpolish(lbl)
+            lbl.style().polish(lbl)
 
         self._start_check()
 
     # ------------------------------------------------------------------ #
-    #  页面 1: 创建运行环境
+    #  页面 found_instances: 发现已有实例
+    # ------------------------------------------------------------------ #
+
+    def _init_found_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(16)
+
+        title = QLabel("发现已有 Nekro Agent 实例")
+        title.setObjectName("WizardTitle")
+        title.setWordWrap(True)
+        layout.addWidget(title)
+
+        desc = QLabel("检测到本机已安装以下 Nekro Agent 实例，可将其接管到此启动器进行统一管理。")
+        desc.setObjectName("WizardDesc")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        # 实例卡片列表区域（可滚动）
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("background: transparent;")
+        self._found_cards_widget = QWidget()
+        self._found_cards_layout = QVBoxLayout(self._found_cards_widget)
+        self._found_cards_layout.setSpacing(10)
+        self._found_cards_layout.setContentsMargins(0, 0, 0, 0)
+        self._found_cards_layout.addStretch()
+        scroll.setWidget(self._found_cards_widget)
+        layout.addWidget(scroll, 1)
+
+        # 底部按钮
+        btn_box = QHBoxLayout()
+        btn_box.addStretch()
+        btn_skip = QPushButton("忽略，全新部署")
+        btn_skip.setFixedHeight(38)
+        btn_skip.setFixedWidth(150)
+        btn_skip.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_skip.setObjectName("WizardSecondary")
+        btn_skip.clicked.connect(self._skip_takeover)
+        btn_box.addWidget(btn_skip)
+        layout.addLayout(btn_box)
+
+        self._add_page(page, "found_instances")
+
+    def _populate_found_page(self, instances: list):
+        """用扫描结果填充实例卡片"""
+        # 清空旧卡片（保留末尾的 stretch）
+        while self._found_cards_layout.count() > 1:
+            item = self._found_cards_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        for instance in instances:
+            card = self._create_instance_card(instance)
+            self._found_cards_layout.insertWidget(
+                self._found_cards_layout.count() - 1, card
+            )
+
+    def _create_instance_card(self, instance: dict) -> QWidget:
+        card = QFrame()
+        card.setObjectName("WizardInstanceCard")
+        card.setFrameShape(QFrame.Shape.StyledPanel)
+
+        inner = QHBoxLayout(card)
+        inner.setContentsMargins(16, 14, 14, 14)
+        inner.setSpacing(12)
+
+        info_col = QVBoxLayout()
+        info_col.setSpacing(4)
+
+        distro = instance["distro"]
+        status = instance["status"]
+        deploy_mode = instance["deploy_mode"]
+        port = instance["env"].get("NEKRO_EXPOSE_PORT") or "8021"
+        data_dir = instance["data_dir"]
+        deploy_dir = instance["deploy_dir"]
+        instance_name = instance.get("instance_name", "")
+        is_managed = instance["is_managed"]
+
+        status_icon = "🟢" if status == "running" else "⚪"
+        status_text = "运行中" if status == "running" else "已停止"
+
+        title_text = f"{distro}  {status_icon} {status_text}"
+        if is_managed:
+            title_text += "  （本启动器发行版）"
+        if instance_name:
+            title_text += f"  [{instance_name}]"
+
+        lbl_title = QLabel(title_text)
+        lbl_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #24384a; border: none;")
+        info_col.addWidget(lbl_title)
+
+        mode_label = "完整版 (NapCat)" if deploy_mode == "napcat" else "精简版 (Lite)"
+        lbl_detail = QLabel(f"端口: {port}  |  模式: {mode_label}")
+        lbl_detail.setStyleSheet("font-size: 13px; color: #6e8396; border: none;")
+        info_col.addWidget(lbl_detail)
+
+        lbl_dir = QLabel(f"部署: {deploy_dir}  |  数据: {data_dir}")
+        lbl_dir.setStyleSheet("font-size: 12px; color: #8a98a6; border: none;")
+        lbl_dir.setWordWrap(True)
+        info_col.addWidget(lbl_dir)
+
+        inner.addLayout(info_col, 1)
+
+        btn_takeover = QPushButton("接管此实例")
+        btn_takeover.setFixedHeight(36)
+        btn_takeover.setMinimumWidth(100)
+        btn_takeover.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_takeover.setStyleSheet(
+            "QPushButton { background: #1b6db4; color: white; border: none; "
+            "border-radius: 8px; font-size: 13px; font-weight: 600; padding: 0 14px; }"
+            "QPushButton:hover { background: #185f9d; }"
+        )
+        btn_takeover.clicked.connect(lambda _checked, inst=instance: self._start_takeover(inst))
+        inner.addWidget(btn_takeover, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        return card
+
+    def _skip_takeover(self):
+        """用户选择忽略已有实例，进入全新部署流程（环境检测）"""
+        self._goto_page("env_check")
+        self._start_check()
+
+    def _start_takeover(self, instance: dict):
+        """用户点击接管某个实例"""
+        need_create = not instance["is_managed"] and not self.backend.runtime_exists()
+
+        if need_create:
+            # 需要先创建 NekroAgent 发行版，暂存实例信息
+            self._pending_takeover_instance = instance
+            self._show_notice_dialog(
+                "需要先创建运行环境",
+                "该实例位于其他 WSL 发行版中。\n\n"
+                "接管前需先创建 NekroAgent 专用运行环境，创建完成后将自动继续迁移。",
+                button_text="继续",
+            )
+            self._goto_page("create_runtime")
+            return
+
+        self._goto_page("takeover_progress")
+        self._run_takeover(instance)
+
+    def _run_takeover(self, instance: dict):
+        """启动接管线程"""
+        self._current_takeover_instance = instance
+        self.takeover_lbl_status.setText("正在接管实例，请稍候...")
+        self.takeover_progress.setRange(0, 0)
+        self.takeover_progress.setVisible(True)
+        self.takeover_lbl_error.setVisible(False)
+        self.btn_takeover_retry.setVisible(False)
+
+        self._takeover_thread = TakeoverThread(self.backend, instance)
+        self._takeover_thread.finished.connect(self._on_takeover_done)
+        self._takeover_thread.start()
+
+    def _on_takeover_done(self, success: bool):
+        self.takeover_progress.setVisible(False)
+        if success:
+            self.takeover_lbl_status.setText("✅ 接管成功！正在启动服务...")
+            mode = self.config.get("deploy_mode") or "lite"
+            self.deploy_requested.emit(mode)
+            self.accept()
+        else:
+            # 检查是否需要先创建发行版（场景 B）
+            if self._pending_takeover_instance is not None:
+                return
+            self.takeover_lbl_status.setText("❌ 接管失败，请查看下方错误详情后重试。")
+            self.btn_takeover_retry.setVisible(True)
+
+    # ------------------------------------------------------------------ #
+    #  页面 takeover_progress: 接管进度
+    # ------------------------------------------------------------------ #
+
+    def _init_takeover_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(18)
+
+        title = QLabel("正在接管 Nekro Agent 实例")
+        title.setObjectName("WizardTitle")
+        title.setWordWrap(True)
+        layout.addWidget(title)
+
+        desc = QLabel("正在将数据迁移到启动器管理环境，此过程可能需要几分钟，请耐心等待。")
+        desc.setObjectName("WizardDesc")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        self.takeover_progress = create_install_progress_bar(0, 0, height=8, radius=4)
+        self.takeover_progress.setVisible(False)
+        layout.addWidget(self.takeover_progress)
+
+        self.takeover_lbl_status = QLabel("")
+        self.takeover_lbl_status.setObjectName("WizardDesc")
+        self.takeover_lbl_status.setWordWrap(True)
+        layout.addWidget(self.takeover_lbl_status)
+
+        self.takeover_lbl_error = QLabel("")
+        self.takeover_lbl_error.setObjectName("WizardError")
+        self.takeover_lbl_error.setWordWrap(True)
+        self.takeover_lbl_error.setVisible(False)
+        layout.addWidget(self.takeover_lbl_error)
+
+        layout.addStretch()
+
+        btn_box = QHBoxLayout()
+        btn_box.addStretch()
+        self.btn_takeover_retry = QPushButton("重试")
+        self.btn_takeover_retry.setFixedHeight(38)
+        self.btn_takeover_retry.setFixedWidth(100)
+        self.btn_takeover_retry.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_takeover_retry.setObjectName("WizardPrimary")
+        self.btn_takeover_retry.setVisible(False)
+        self.btn_takeover_retry.clicked.connect(self._retry_takeover)
+        btn_box.addWidget(self.btn_takeover_retry)
+        layout.addLayout(btn_box)
+
+        self._add_page(page, "takeover_progress")
+
+    def _retry_takeover(self):
+        inst = getattr(self, "_current_takeover_instance", None)
+        if inst:
+            self.btn_takeover_retry.setVisible(False)
+            self._run_takeover(inst)
+
+    # ------------------------------------------------------------------ #
+    #  页面 create_runtime: 创建运行环境
     # ------------------------------------------------------------------ #
 
     def _init_create_page(self):
@@ -288,26 +651,21 @@ class FirstRunDialog(QDialog):
         layout.setSpacing(18)
 
         title = QLabel("创建 Nekro Agent 运行环境")
-        title.setStyleSheet("font-size: 22px; font-weight: bold; color: #24292f;")
+        title.setObjectName("WizardTitle")
         title.setWordWrap(True)
         layout.addWidget(title)
 
         desc = QLabel("将下载 Ubuntu 并创建专用 WSL2 运行环境，与系统已有环境互不影响。")
-        desc.setStyleSheet("font-size: 13px; color: #57606a;")
+        desc.setObjectName("WizardDesc")
         desc.setWordWrap(True)
         layout.addWidget(desc)
 
-        # 安装目录
         lbl_dir = QLabel("安装目录:")
-        lbl_dir.setStyleSheet("font-size: 14px; font-weight: 600; color: #24292f; margin-top: 10px;")
+        lbl_dir.setStyleSheet("font-size: 14px; font-weight: 600; color: #24384a; margin-top: 10px;")
         layout.addWidget(lbl_dir)
 
         dir_box = QHBoxLayout()
         self.dir_edit = QLineEdit(self.backend.get_default_install_dir())
-        self.dir_edit.setStyleSheet(
-            "padding: 8px; border: 1px solid #d0d7de; border-radius: 6px; "
-            "background: white; font-size: 13px;"
-        )
         self.dir_edit.setMinimumWidth(260)
         btn_browse = QPushButton("浏览...")
         btn_browse.setFixedHeight(35)
@@ -319,7 +677,7 @@ class FirstRunDialog(QDialog):
         layout.addLayout(dir_box)
 
         hint = QLabel("此目录将存放 WSL2 运行时文件，建议预留 10GB 以上空间。")
-        hint.setStyleSheet("font-size: 12px; color: #8b949e;")
+        hint.setObjectName("WizardHint")
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
@@ -330,16 +688,12 @@ class FirstRunDialog(QDialog):
 
         # 进度状态文本
         self.lbl_progress = QLabel("")
-        self.lbl_progress.setStyleSheet("font-size: 13px; color: #0969da; margin-top: 8px;")
+        self.lbl_progress.setObjectName("WizardDesc")
         self.lbl_progress.setWordWrap(True)
         layout.addWidget(self.lbl_progress)
 
-        # 错误详情文本
         self.lbl_error = QLabel("")
-        self.lbl_error.setStyleSheet(
-            "font-size: 12px; color: #cf222e; background: #fff0f0; border: 1px solid #ffcdd2; "
-            "border-radius: 6px; padding: 8px; margin-top: 4px;"
-        )
+        self.lbl_error.setObjectName("WizardError")
         self.lbl_error.setWordWrap(True)
         self.lbl_error.setVisible(False)
         layout.addWidget(self.lbl_error)
@@ -350,34 +704,32 @@ class FirstRunDialog(QDialog):
         btn_box = QHBoxLayout()
 
         self.btn_back = QPushButton("返回")
+        self.btn_back.setObjectName("WizardSecondary")
         self.btn_back.setFixedHeight(38)
         self.btn_back.setFixedWidth(80)
         self.btn_back.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_back.setStyleSheet(
-            "QPushButton { background-color: #f3f4f6; color: #24292f; border: 1px solid #d0d7de; "
-            "border-radius: 6px; font-size: 14px; font-weight: 600; }"
-            "QPushButton:hover { background-color: #e8e9eb; }"
-        )
-        self.btn_back.clicked.connect(lambda: self.stack.setCurrentIndex(0))
+        self.btn_back.clicked.connect(self._create_page_back)
         btn_box.addWidget(self.btn_back)
 
         btn_box.addStretch()
 
         self.btn_create = QPushButton("开始创建")
+        self.btn_create.setObjectName("WizardPrimary")
         self.btn_create.setFixedHeight(38)
         self.btn_create.setFixedWidth(120)
         self.btn_create.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_create.setStyleSheet(
-            "QPushButton { background-color: #2da44e; color: white; border: none; "
-            "border-radius: 6px; font-size: 14px; font-weight: 600; }"
-            "QPushButton:hover { background-color: #28943f; }"
-            "QPushButton:disabled { background-color: #94d3a2; }"
-        )
         self.btn_create.clicked.connect(self._start_create)
         btn_box.addWidget(self.btn_create)
 
         layout.addLayout(btn_box)
-        self.stack.addWidget(page)
+        self._add_page(page, "create_runtime")
+
+    def _create_page_back(self):
+        """创建页的返回：若是从接管流程进来则回到实例列表，否则回到环境检测"""
+        if self._pending_takeover_instance is not None:
+            self._goto_page("found_instances")
+        else:
+            self._goto_page("env_check")
 
     def _browse_install_dir(self):
         d = QFileDialog.getExistingDirectory(
@@ -407,13 +759,24 @@ class FirstRunDialog(QDialog):
 
     def _on_progress(self, text):
         """接收 wsl_manager.progress_updated 信号"""
-        # 检查当前是否在创建页面（页面 1）
-        if self.stack.currentIndex() == 1:
+        current_page = self._current_page_name()
+
+        if current_page == "create_runtime":
             self.lbl_progress.setText(text)
             self._update_create_progress(text)
             return
 
-        # 检测页面的处理
+        if current_page == "takeover_progress":
+            if text == "__need_create_runtime__":
+                inst = getattr(self, "_current_takeover_instance", None)
+                if inst:
+                    self._pending_takeover_instance = inst
+                self._goto_page("create_runtime")
+                return
+            self.takeover_lbl_status.setText(text)
+            return
+
+        # 检测页的处理
         if text == "__docker_done__":
             self.check_progress.setVisible(False)
             self._recheck()
@@ -428,6 +791,13 @@ class FirstRunDialog(QDialog):
 
         if self.check_progress.isVisible():
             self.check_desc.setText(text)
+
+    def _current_page_name(self) -> str:
+        idx = self.stack.currentIndex()
+        for name, i in self._page_index.items():
+            if i == idx:
+                return name
+        return ""
 
     def _update_create_progress(self, text):
         progress_match = re.search(r"\((\d+)%\)", text)
@@ -445,8 +815,13 @@ class FirstRunDialog(QDialog):
         self.create_progress.setRange(0, 0)
 
     def _on_install_error(self, message):
-        self.lbl_error.setText(message)
-        self.lbl_error.setVisible(bool(message))
+        current_page = self._current_page_name()
+        if current_page == "create_runtime":
+            self.lbl_error.setText(message)
+            self.lbl_error.setVisible(bool(message))
+        elif current_page == "takeover_progress":
+            self.takeover_lbl_error.setText(message)
+            self.takeover_lbl_error.setVisible(bool(message))
 
     def _on_create_done(self, success):
         self.btn_create.setEnabled(True)
@@ -456,16 +831,20 @@ class FirstRunDialog(QDialog):
 
         if success:
             self.lbl_error.setVisible(False)
-            self.lbl_progress.setText("环境创建完成！")
-            self.lbl_progress.setStyleSheet("font-size: 13px; color: #2da44e; margin-top: 8px;")
-            # 直接跳到版本选择页
-            self.stack.setCurrentIndex(2)
+            self.lbl_progress.setText("✅ 环境创建完成！")
+            # 若是为接管外部实例而创建的发行版，继续接管流程
+            if self._pending_takeover_instance is not None:
+                instance = self._pending_takeover_instance
+                self._pending_takeover_instance = None
+                self._goto_page("takeover_progress")
+                self._run_takeover(instance)
+            else:
+                self._goto_page("select_mode")
         else:
-            self.lbl_progress.setStyleSheet("font-size: 13px; color: #cf222e; margin-top: 8px;")
-            self.lbl_progress.setText("环境创建失败，请查看下方错误详情后重试。")
+            self.lbl_progress.setText("❌ 环境创建失败，请查看下方错误详情后重试。")
 
     # ------------------------------------------------------------------ #
-    #  页面 2: 版本选择
+    #  页面 select_mode: 版本选择
     # ------------------------------------------------------------------ #
 
     def _init_select_page(self):
@@ -474,12 +853,12 @@ class FirstRunDialog(QDialog):
         layout.setSpacing(20)
 
         title = QLabel("选择部署版本")
-        title.setStyleSheet("font-size: 22px; font-weight: bold; color: #24292f;")
+        title.setObjectName("WizardTitle")
         title.setWordWrap(True)
         layout.addWidget(title)
 
         desc = QLabel("请选择要部署的 Nekro Agent 版本:")
-        desc.setStyleSheet("font-size: 14px; color: #57606a;")
+        desc.setObjectName("WizardDesc")
         layout.addWidget(desc)
 
         self.card_lite = self._create_mode_card(
@@ -497,7 +876,7 @@ class FirstRunDialog(QDialog):
         layout.addWidget(self.card_napcat)
 
         layout.addStretch()
-        self.stack.addWidget(page)
+        self._add_page(page, "select_mode")
 
     def _create_mode_card(self, title, desc, mode):
         card = QPushButton()
@@ -505,9 +884,9 @@ class FirstRunDialog(QDialog):
         card.setMinimumHeight(104)
         card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         card.setStyleSheet(
-            "QPushButton { background-color: #ffffff; border: 2px solid #d0d7de; "
+            "QPushButton { background-color: #ffffff; border: 2px solid #dfe7ef; "
             "border-radius: 10px; padding: 15px 20px; }"
-            "QPushButton:hover { border-color: #0969da; background-color: #f6f8fa; }"
+            "QPushButton:hover { border-color: #e88478; background-color: #fff9f8; }"
         )
 
         inner = QVBoxLayout(card)
@@ -518,13 +897,13 @@ class FirstRunDialog(QDialog):
         lbl_title = QLabel(title)
         lbl_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl_title.setWordWrap(True)
-        lbl_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #24292f; "
+        lbl_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #24384a; "
                                 "background: transparent; border: none;")
         lbl_title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         lbl_desc = QLabel(desc)
         lbl_desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl_desc.setWordWrap(True)
-        lbl_desc.setStyleSheet("font-size: 12px; color: #57606a; "
+        lbl_desc.setStyleSheet("font-size: 12px; color: #6e8396; "
                                "background: transparent; border: none;")
         lbl_desc.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
@@ -539,7 +918,7 @@ class FirstRunDialog(QDialog):
         if self.config:
             self.config.set("deploy_mode", mode)
         self._update_port_inputs_for_mode(mode)
-        self.stack.setCurrentIndex(3)  # 跳转到数据目录配置页
+        self._goto_page("data_dir")
 
     def _update_port_inputs_for_mode(self, mode):
         show_napcat = mode == "napcat"
@@ -552,7 +931,7 @@ class FirstRunDialog(QDialog):
             self.port_hint_label.setText(hint)
 
     # ------------------------------------------------------------------ #
-    #  页面 3: 数据目录配置
+    #  页面 data_dir: 数据目录配置
     # ------------------------------------------------------------------ #
 
     def _init_datadir_page(self):
@@ -560,48 +939,53 @@ class FirstRunDialog(QDialog):
         layout = QVBoxLayout(page)
         layout.setSpacing(18)
 
-        title = QLabel("配置数据目录")
-        title.setStyleSheet("font-size: 22px; font-weight: bold; color: #24292f;")
+        title = QLabel("配置实例")
+        title.setObjectName("WizardTitle")
         title.setWordWrap(True)
         layout.addWidget(title)
 
-        desc = QLabel("数据目录用于存储 Nekro Agent 运行数据（数据库、配置、日志等）。")
-        desc.setStyleSheet("font-size: 14px; color: #57606a;")
+        desc = QLabel("配置实例名称、端口和数据目录。多实例部署时请为每个实例设置不同的名称和端口。")
+        desc.setObjectName("WizardDesc")
         desc.setWordWrap(True)
         layout.addWidget(desc)
 
-        windows_path = self.backend.get_host_access_path("/root/nekro_agent_data")
-        lbl_winpath = QLabel("Windows 侧访问路径:")
-        lbl_winpath.setStyleSheet("font-size: 14px; font-weight: 600; color: #24292f; margin-top: 10px;")
+        # 实例名称
+        lbl_instance = QLabel("实例名称（可选）:")
+        lbl_instance.setStyleSheet("font-size: 14px; font-weight: 600; color: #24384a; margin-top: 10px;")
+        layout.addWidget(lbl_instance)
+
+        self.instance_name_edit = QLineEdit("")
+        self.instance_name_edit.setPlaceholderText("留空为默认实例，多实例时建议填写如 bot1_")
+        self.instance_name_edit.setFixedWidth(300)
+        self.instance_name_edit.textChanged.connect(self._on_instance_name_changed)
+        layout.addWidget(self.instance_name_edit)
+
+        instance_hint = QLabel("实例名称将作为容器和数据卷的前缀，用于隔离多个实例。建议以下划线结尾，如 bot1_。")
+        instance_hint.setObjectName("WizardHint")
+        instance_hint.setWordWrap(True)
+        layout.addWidget(instance_hint)
+
+        # Windows 侧访问路径
+        lbl_winpath = QLabel("Windows 侧数据访问路径:")
+        lbl_winpath.setStyleSheet("font-size: 14px; font-weight: 600; color: #24384a; margin-top: 10px;")
         layout.addWidget(lbl_winpath)
 
+        windows_path = self.backend.get_host_access_path("/root/nekro_agent_data")
         self.datadir_path_card = QLabel(windows_path or r"\\wsl$\NekroAgent\root\nekro_agent_data")
-        self.datadir_path_card.setStyleSheet(
-            "font-size: 13px; color: #24292f; background: #f6f8fa; "
-            "border: 1px solid #d0d7de; border-radius: 6px; padding: 10px; margin-top: 2px;"
-        )
+        self.datadir_path_card.setProperty("role", "info_block")
         self.datadir_path_card.setWordWrap(True)
         self.datadir_path_card.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.datadir_path_card)
 
-        hint = QLabel("数据目录固定存储于 WSL 运行环境内部，可通过上方路径在 Windows 文件管理器中直接访问。")
-        hint.setStyleSheet("font-size: 12px; color: #8b949e;")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-
         # 端口配置
         lbl_ports = QLabel("端口配置:")
-        lbl_ports.setStyleSheet("font-size: 14px; font-weight: 600; color: #24292f; margin-top: 10px;")
+        lbl_ports.setStyleSheet("font-size: 14px; font-weight: 600; color: #24384a; margin-top: 10px;")
         layout.addWidget(lbl_ports)
 
         port_row1 = QHBoxLayout()
         port_row1.addWidget(QLabel("Nekro Agent 端口:"))
         self.nekro_port_edit = QLineEdit(str(self.config.get("nekro_port") or 8021))
         self.nekro_port_edit.setFixedWidth(100)
-        self.nekro_port_edit.setStyleSheet(
-            "padding: 6px; border: 1px solid #d0d7de; border-radius: 6px; "
-            "background: white; font-size: 13px;"
-        )
         port_row1.addWidget(self.nekro_port_edit)
         port_row1.addStretch()
         layout.addLayout(port_row1)
@@ -612,16 +996,12 @@ class FirstRunDialog(QDialog):
         port_row2.addWidget(QLabel("NapCat 端口:"))
         self.napcat_port_edit = QLineEdit(str(self.config.get("napcat_port") or 6099))
         self.napcat_port_edit.setFixedWidth(100)
-        self.napcat_port_edit.setStyleSheet(
-            "padding: 6px; border: 1px solid #d0d7de; border-radius: 6px; "
-            "background: white; font-size: 13px;"
-        )
         port_row2.addWidget(self.napcat_port_edit)
         port_row2.addStretch()
         layout.addWidget(self.napcat_port_row)
 
         self.port_hint_label = QLabel()
-        self.port_hint_label.setStyleSheet("font-size: 12px; color: #8b949e;")
+        self.port_hint_label.setObjectName("WizardHint")
         layout.addWidget(self.port_hint_label)
         self._update_port_inputs_for_mode(self._selected_mode)
 
@@ -631,33 +1011,37 @@ class FirstRunDialog(QDialog):
         btn_box = QHBoxLayout()
 
         btn_back = QPushButton("返回")
+        btn_back.setObjectName("WizardSecondary")
         btn_back.setFixedHeight(38)
         btn_back.setFixedWidth(80)
         btn_back.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_back.setStyleSheet(
-            "QPushButton { background-color: #f3f4f6; color: #24292f; border: 1px solid #d0d7de; "
-            "border-radius: 6px; font-size: 14px; font-weight: 600; }"
-            "QPushButton:hover { background-color: #e8e9eb; }"
-        )
-        btn_back.clicked.connect(lambda: self.stack.setCurrentIndex(2))
+        btn_back.clicked.connect(lambda: self._goto_page("select_mode"))
         btn_box.addWidget(btn_back)
 
         btn_box.addStretch()
 
         btn_deploy = QPushButton("开始部署")
+        btn_deploy.setObjectName("WizardPrimary")
         btn_deploy.setFixedHeight(38)
         btn_deploy.setFixedWidth(120)
         btn_deploy.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_deploy.setStyleSheet(
-            "QPushButton { background-color: #2da44e; color: white; border: none; "
-            "border-radius: 6px; font-size: 14px; font-weight: 600; }"
-            "QPushButton:hover { background-color: #28943f; }"
-        )
         btn_deploy.clicked.connect(self._confirm_datadir)
         btn_box.addWidget(btn_deploy)
 
         layout.addLayout(btn_box)
-        self.stack.addWidget(page)
+        self._add_page(page, "data_dir")
+
+    def _on_instance_name_changed(self, text):
+        """实例名称变化时，更新数据目录预览路径。"""
+        name = text.strip()
+        if name and not name.endswith("_"):
+            name += "_"
+        if name:
+            data_dir = f"/root/{name}nekro_agent_data"
+        else:
+            data_dir = "/root/nekro_agent_data"
+        windows_path = self.backend.get_host_access_path(data_dir)
+        self.datadir_path_card.setText(windows_path)
 
     def _confirm_datadir(self):
         mode = getattr(self, "_selected_mode", "lite")
@@ -692,10 +1076,35 @@ class FirstRunDialog(QDialog):
                 button_text="我知道了",
             )
 
+        instance_name = self.instance_name_edit.text().strip()
+        if instance_name and not instance_name.endswith("_"):
+            instance_name += "_"
+
+        if instance_name:
+            deploy_dir = f"/root/{instance_name}nekro_agent"
+            data_dir = f"/root/{instance_name}nekro_agent_data"
+        else:
+            deploy_dir = "/root/nekro_agent"
+            data_dir = "/root/nekro_agent_data"
+
+        inst_id = instance_name.rstrip("_") if instance_name else self.config.next_instance_id()
+        inst_data = {
+            "instance_name": instance_name,
+            "deploy_dir": deploy_dir,
+            "data_dir": data_dir,
+            "deploy_mode": mode,
+            "nekro_port": nekro_port,
+            "napcat_port": napcat_port,
+            "release_channel": self.config.get("release_channel") or "stable",
+        }
+        self.config.set_instance(inst_id, inst_data)
+        self.config.set("active_instance", inst_id)
+
         if self.config:
             self.config.set("nekro_port", nekro_port)
             if mode == "napcat":
                 self.config.set("napcat_port", napcat_port)
+            self.config.set("deploy_mode", mode)
             self.config.set("first_run", False)
         self.deploy_requested.emit(mode)
         self.accept()

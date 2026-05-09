@@ -60,7 +60,7 @@ QPushButton#SidebarToggle {
     border-radius: 8px;
     color: #bf655d;
     font-size: 14px;
-    font-weight: 700;
+    font-weight: 600;
 }
 
 QPushButton#SidebarToggle:hover {
@@ -71,7 +71,7 @@ QPushButton#SidebarToggle:hover {
 QLabel#SidebarEyebrow {
     color: #d9807a;
     font-size: 11px;
-    font-weight: 700;
+    font-weight: 600;
     letter-spacing: 1px;
 }
 
@@ -122,7 +122,7 @@ QPushButton#SidebarFootBtn {
     padding: 6px 12px;
     color: #586d7e;
     font-size: 14px;
-    font-weight: 700;
+    font-weight: 600;
     text-align: center;
 }
 
@@ -146,7 +146,7 @@ QFrame#HeroCard {
 QLabel#HeroEyebrow {
     color: #d9817c;
     font-size: 11px;
-    font-weight: 700;
+    font-weight: 600;
     letter-spacing: 1px;
 }
 
@@ -168,7 +168,7 @@ QLabel#StatusBadge {
     border-radius: 8px;
     color: #ba665f;
     font-size: 12px;
-    font-weight: 700;
+    font-weight: 600;
     padding: 6px 12px;
 }
 
@@ -178,7 +178,7 @@ QLabel#FeatureBadge {
     border-radius: 8px;
     color: #1b6db4;
     font-size: 12px;
-    font-weight: 700;
+    font-weight: 600;
     padding: 6px 12px;
 }
 
@@ -191,7 +191,7 @@ QLabel#QuickLabel {
 QLabel#QuickValue {
     color: #274055;
     font-size: 14px;
-    font-weight: 700;
+    font-weight: 600;
 }
 
 QPushButton#HeroPrimary,
@@ -200,7 +200,7 @@ QPushButton#HeroSecondary {
     border-radius: 8px;
     padding: 0 18px;
     font-size: 13px;
-    font-weight: 700;
+    font-weight: 600;
 }
 
 QPushButton#HeroPrimary {
@@ -303,13 +303,13 @@ QFrame#MetricCard[accent="red"] {
 QLabel#MetricLabel {
     color: #8395a4;
     font-size: 11px;
-    font-weight: 700;
+    font-weight: 600;
 }
 
 QLabel#MetricValue {
     color: #264057;
     font-size: 18px;
-    font-weight: 700;
+    font-weight: 600;
 }
 
 QLabel#MetricHint,
@@ -354,7 +354,7 @@ QLabel#ActionBadge {
     border-radius: 8px;
     color: #3db6d1;
     font-size: 13px;
-    font-weight: 700;
+    font-weight: 600;
 }
 
 QPushButton[variant="primary"] QLabel#ActionBadge {
@@ -371,7 +371,7 @@ QPushButton[variant="danger"] QLabel#ActionBadge {
 
 QLabel#ActionTitle {
     font-size: 15px;
-    font-weight: 700;
+    font-weight: 600;
     color: #264057;
 }
 
@@ -555,5 +555,346 @@ QPushButton[role="primary"] {
 QPushButton[role="primary"]:hover {
     background: #185f9d;
     border-color: #185f9d;
+}
+
+/* ── Disabled & Pressed states ── */
+
+QPushButton#HeroPrimary:disabled {
+    background: #f0b5ad;
+    border-color: #f0b5ad;
+    color: rgba(255,255,255,0.7);
+}
+
+QPushButton#HeroPrimary:pressed {
+    background: #d97065;
+    border-color: #d97065;
+}
+
+QPushButton#HeroSecondary:disabled {
+    background: #f5f7f9;
+    border-color: #e7eef5;
+    color: #b0bdc9;
+}
+
+QPushButton#HeroSecondary:pressed {
+    background: #eaf5fc;
+    border-color: #7ab9d4;
+}
+
+QPushButton[role="danger"]:disabled {
+    background: #dda0ab;
+    border-color: #dda0ab;
+    color: rgba(255,255,255,0.7);
+}
+
+QPushButton[role="primary"]:disabled {
+    background: #8ab6d8;
+    border-color: #8ab6d8;
+    color: rgba(255,255,255,0.7);
+}
+
+QPushButton[nav="true"]:disabled {
+    color: #b8c6d1;
+}
+
+QPushButton#SegmentBtn:disabled {
+    color: #bcc8d2;
+    border-color: #edf1f5;
+}
+
+QDialog QPushButton:disabled,
+QMessageBox QPushButton:disabled {
+    background: #f5f7f9;
+    border-color: #e7eef5;
+    color: #b0bdc9;
+}
+
+/* ── ScrollBar ── */
+
+QScrollBar:vertical {
+    background: transparent;
+    width: 8px;
+    margin: 2px 0;
+}
+
+QScrollBar::handle:vertical {
+    background: rgba(0, 0, 0, 0.12);
+    min-height: 32px;
+    border-radius: 4px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background: rgba(0, 0, 0, 0.22);
+}
+
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical,
+QScrollBar::add-page:vertical,
+QScrollBar::sub-page:vertical {
+    height: 0;
+    background: transparent;
+}
+
+QScrollBar:horizontal {
+    background: transparent;
+    height: 8px;
+    margin: 0 2px;
+}
+
+QScrollBar::handle:horizontal {
+    background: rgba(0, 0, 0, 0.12);
+    min-width: 32px;
+    border-radius: 4px;
+}
+
+QScrollBar::handle:horizontal:hover {
+    background: rgba(0, 0, 0, 0.22);
+}
+
+QScrollBar::add-line:horizontal,
+QScrollBar::sub-line:horizontal,
+QScrollBar::add-page:horizontal,
+QScrollBar::sub-page:horizontal {
+    width: 0;
+    background: transparent;
+}
+
+/* ── MetricCard hover ── */
+
+QFrame#MetricCard:hover {
+    border-color: #c8d6e2;
+}
+
+/* ── Step indicator ── */
+
+QLabel#StepDot {
+    border-radius: 5px;
+}
+
+QLabel#StepDot[state="done"] {
+    background: #e88478;
+}
+
+QLabel#StepDot[state="active"] {
+    background: #e88478;
+    border: 2px solid #f0c4be;
+}
+
+QLabel#StepDot[state="pending"] {
+    background: #dfe7ef;
+}
+
+QLabel#StepLabel {
+    font-size: 11px;
+    font-weight: 600;
+}
+
+QLabel#StepLabel[state="done"] {
+    color: #e88478;
+}
+
+QLabel#StepLabel[state="active"] {
+    color: #264057;
+}
+
+QLabel#StepLabel[state="pending"] {
+    color: #a0b0be;
+}
+
+/* ── Wizard (first-run dialog) ── */
+
+QLabel#WizardTitle {
+    font-size: 22px;
+    font-weight: 700;
+    color: #24384a;
+}
+
+QLabel#WizardDesc {
+    font-size: 14px;
+    color: #6e8396;
+}
+
+QLabel#WizardHint {
+    font-size: 12px;
+    color: #8a98a6;
+}
+
+QLabel#WizardStepHint {
+    font-size: 12px;
+    color: #8a98a6;
+}
+
+QLabel#WizardCheckItem {
+    font-size: 15px;
+    padding: 5px 0;
+}
+
+QLabel#WizardCheckItem[state="pending"] {
+    color: #6e8396;
+}
+
+QLabel#WizardCheckItem[state="pass"] {
+    color: #54c08a;
+}
+
+QLabel#WizardCheckItem[state="fail"] {
+    color: #e06b6b;
+}
+
+QLabel#WizardCheckItem[state="skip"] {
+    color: #a0b0be;
+}
+
+QLabel#WizardError {
+    font-size: 12px;
+    color: #e06b6b;
+    background: #fff5f5;
+    border: 1px solid #f0c9c9;
+    border-radius: 6px;
+    padding: 8px;
+}
+
+QPushButton#WizardPrimary,
+QDialog QPushButton#WizardPrimary {
+    min-height: 38px;
+    background: #e88478;
+    color: white;
+    border: none;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 600;
+    padding: 0 20px;
+}
+
+QPushButton#WizardPrimary:hover,
+QDialog QPushButton#WizardPrimary:hover {
+    background: #ef9488;
+}
+
+QPushButton#WizardPrimary:disabled,
+QDialog QPushButton#WizardPrimary:disabled {
+    background: #f0b5ad;
+    color: rgba(255,255,255,0.7);
+}
+
+QPushButton#WizardSecondary,
+QDialog QPushButton#WizardSecondary {
+    min-height: 38px;
+    background: #ffffff;
+    color: #264057;
+    border: 1px solid #d7e2ec;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 600;
+    padding: 0 20px;
+}
+
+QPushButton#WizardSecondary:hover,
+QDialog QPushButton#WizardSecondary:hover {
+    border-color: #8fc5dd;
+    background: #f5fbfe;
+}
+
+QPushButton#WizardSecondary:disabled,
+QDialog QPushButton#WizardSecondary:disabled {
+    background: #f5f7f9;
+    border-color: #e7eef5;
+    color: #b0bdc9;
+}
+
+QPushButton#WizardAccent,
+QDialog QPushButton#WizardAccent {
+    min-height: 38px;
+    background: #1b6db4;
+    color: white;
+    border: none;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    padding: 0 14px;
+}
+
+QPushButton#WizardAccent:hover,
+QDialog QPushButton#WizardAccent:hover {
+    background: #185f9d;
+}
+
+QFrame#WizardModeCard {
+    background: #ffffff;
+    border: 2px solid #dfe7ef;
+    border-radius: 10px;
+    padding: 15px 20px;
+}
+
+QFrame#WizardModeCard:hover {
+    border-color: #e88478;
+    background: #fff9f8;
+}
+
+QFrame#WizardInstanceCard {
+    background: #ffffff;
+    border: 1.5px solid #dfe7ef;
+    border-radius: 10px;
+}
+
+QFrame#WizardInstanceCard:hover {
+    border-color: #c8d6e2;
+}
+
+/* ── Image table row ── */
+
+QFrame#ImageRow {
+    background: #ffffff;
+    border: 1px solid #edf1f5;
+    border-radius: 6px;
+    padding: 8px 0;
+}
+
+QFrame#ImageRow:hover {
+    background: #fafcfe;
+    border-color: #d7e2ec;
+}
+
+QFrame#ImageTableHeader {
+    border-bottom: 1px solid #e7eef5;
+    padding-bottom: 8px;
+}
+
+/* ── App Update Dialog ── */
+
+QLabel#UpdateBadgeCurrent {
+    background: #f0f4f8;
+    border: 1px solid #dfe7ef;
+    border-radius: 10px;
+    padding: 4px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #7a8d9f;
+}
+
+QLabel#UpdateBadgeNew {
+    background: #fef1ef;
+    border: 1px solid #f5c4bc;
+    border-radius: 10px;
+    padding: 4px 12px;
+    font-size: 12px;
+    font-weight: 700;
+    color: #d05a4e;
+}
+
+QLabel#UpdateChangelog {
+    background: #fbfdff;
+    border: 1px solid #e7eef5;
+    border-radius: 8px;
+    padding: 14px;
+    font-size: 12.5px;
+    color: #3d5366;
+    line-height: 1.5em;
+}
+
+QLabel#VersionDisplay {
+    font-size: 12px;
+    color: #8fa3b4;
+    font-weight: 600;
 }
 """
