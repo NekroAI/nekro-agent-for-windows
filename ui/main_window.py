@@ -1088,6 +1088,7 @@ class MainWindow(QMainWindow):
             return
 
         self._app_update_silent = silent
+        self._app_update_found = False
         checker = UpdateChecker()
         thread = QThread(self)
         checker.moveToThread(thread)
@@ -1104,6 +1105,7 @@ class MainWindow(QMainWindow):
     def _on_app_update_available(self, info: dict):
         import time
         self.config.set("last_app_update_check_ts", int(time.time()))
+        self._app_update_found = True
 
         skipped = self.config.get("skipped_app_version") or ""
         if self._app_update_silent and skipped == info.get("tag", ""):
@@ -1121,15 +1123,12 @@ class MainWindow(QMainWindow):
         if not getattr(self, "_app_update_silent", True):
             import time
             self.config.set("last_app_update_check_ts", int(time.time()))
-            if not hasattr(self, "_app_update_dialog_shown"):
+            if not getattr(self, "_app_update_found", False):
                 self._show_notice_dialog("检查完成", f"当前已是最新版本 v{APP_VERSION}。")
-            if hasattr(self, "_app_update_dialog_shown"):
-                del self._app_update_dialog_shown
 
     def _show_app_update_dialog(self, info: dict):
         from ui.update_dialog import AppUpdateDialog
 
-        self._app_update_dialog_shown = True
         dialog = AppUpdateDialog(self, info)
         result = dialog.exec()
 
@@ -1349,7 +1348,10 @@ class MainWindow(QMainWindow):
 
     def _on_backend_progress(self, text):
         if text.startswith("__pull_progress__|"):
-            _, phase, message = text.split("|", 2)
+            parts = text.split("|", 2)
+            if len(parts) < 3:
+                return
+            _, phase, message = parts
             if phase == "start":
                 self._clear_pull_progress()
                 self._update_pull_view(header=message)
@@ -2340,9 +2342,16 @@ class MainWindow(QMainWindow):
             self.config.set("nekro_port", nekro_port)
             if deploy_mode == "napcat":
                 self.config.set("napcat_port", napcat_port)
+
+            active_id = self.config.get_active_instance_id()
+            if active_id:
+                update_kwargs = {"nekro_port": nekro_port}
+                if deploy_mode == "napcat":
+                    update_kwargs["napcat_port"] = napcat_port
+                self.config.update_instance(active_id, **update_kwargs)
+
             self.browser_urls["nekro"] = f"http://localhost:{nekro_port}"
             self.browser_urls["napcat"] = f"http://localhost:{napcat_port}"
-            # 同步更新已保存的 deploy_info 里的端口，避免凭据弹窗显示旧端口
             deploy_info = self.config.get("deploy_info")
             if deploy_info:
                 deploy_info["port"] = str(nekro_port)

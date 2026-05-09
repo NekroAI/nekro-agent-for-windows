@@ -132,11 +132,13 @@ def _inline_format(text: str) -> str:
     text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
     text = re.sub(r"\*(.+?)\*", r"<i>\1</i>", text)
     text = re.sub(r"_(.+?)_", r"<i>\1</i>", text)
-    text = re.sub(
-        r"\[([^\]]+)\]\(([^)]+)\)",
-        r'<a href="\2" style="color:#0969da; text-decoration:none;">\1</a>',
-        text,
-    )
+    def _safe_link(m):
+        label, url = m.group(1), m.group(2)
+        if not url.startswith(("http://", "https://")):
+            return label
+        return f'<a href="{url}" style="color:#0969da; text-decoration:none;">{label}</a>'
+
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", _safe_link, text)
     return text
 
 
@@ -148,6 +150,7 @@ class AppUpdateDialog(QDialog):
         self._info = update_info
         self._download_worker = None
         self._download_thread = None
+        self._launch_timer_id = None
 
         self.setWindowTitle("发现新版本")
         self.setMinimumWidth(480)
@@ -301,6 +304,8 @@ class AppUpdateDialog(QDialog):
         if not url:
             return
 
+        self._cleanup_download_thread()
+
         self._btn_download.setEnabled(False)
         self._btn_download.setText("下载中...")
         self._btn_skip.setEnabled(False)
@@ -335,6 +340,15 @@ class AppUpdateDialog(QDialog):
             self._size_label.setText(_fmt_size(downloaded))
             self._status_label.setText("正在下载...")
 
+    def _cleanup_download_thread(self):
+        if self._download_worker and self._download_thread:
+            if self._download_thread.isRunning():
+                self._download_worker.cancel()
+                self._download_thread.quit()
+                self._download_thread.wait(3000)
+            self._download_worker = None
+            self._download_thread = None
+
     def _on_download_finished(self, success: bool, result: str):
         self._download_thread.quit()
         self._download_thread.wait(3000)
@@ -345,7 +359,8 @@ class AppUpdateDialog(QDialog):
             self._status_label.setText("下载完成！正在启动安装程序...")
             self._btn_download.setText("下载完成")
 
-            QTimer.singleShot(800, lambda: self._launch_installer(result))
+            self._launch_timer_id = self.startTimer(800)
+            self._pending_installer_path = result
         else:
             self._progress_bar.setRange(0, 100)
             self._progress_bar.setValue(0)
@@ -355,6 +370,16 @@ class AppUpdateDialog(QDialog):
             self._btn_download.setText("重新下载")
             self._btn_skip.setEnabled(True)
             self._btn_later.setEnabled(True)
+
+    def timerEvent(self, event):
+        if event.timerId() == self._launch_timer_id:
+            self.killTimer(self._launch_timer_id)
+            self._launch_timer_id = None
+            path = getattr(self, "_pending_installer_path", None)
+            if path:
+                self._launch_installer(path)
+        else:
+            super().timerEvent(event)
 
     def _launch_installer(self, installer_path: str):
         try:
@@ -370,10 +395,10 @@ class AppUpdateDialog(QDialog):
             self._btn_later.setEnabled(True)
 
     def reject(self):
-        if self._download_worker and self._download_thread and self._download_thread.isRunning():
-            self._download_worker.cancel()
-            self._download_thread.quit()
-            self._download_thread.wait(3000)
+        if self._launch_timer_id is not None:
+            self.killTimer(self._launch_timer_id)
+            self._launch_timer_id = None
+        self._cleanup_download_thread()
         super().reject()
 
 

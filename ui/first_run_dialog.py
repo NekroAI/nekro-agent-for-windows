@@ -111,11 +111,33 @@ class FirstRunDialog(QDialog):
         self._init_datadir_page()        # data_dir
         self._init_takeover_page()       # takeover_progress
 
+        self._active_threads: list[QThread] = []
+
         self.backend.progress_updated.connect(self._on_progress)
         self.backend.install_error.connect(self._on_install_error)
 
         self._goto_page("scan")
         self._start_scan()
+
+    def _track_thread(self, thread: QThread):
+        self._active_threads.append(thread)
+        thread.finished.connect(lambda t=thread: self._active_threads.remove(t) if t in self._active_threads else None)
+
+    def reject(self):
+        for thread in list(self._active_threads):
+            if thread.isRunning():
+                thread.quit()
+                thread.wait(3000)
+        self._active_threads.clear()
+        try:
+            self.backend.progress_updated.disconnect(self._on_progress)
+        except (TypeError, RuntimeError):
+            pass
+        try:
+            self.backend.install_error.disconnect(self._on_install_error)
+        except (TypeError, RuntimeError):
+            pass
+        super().reject()
 
     def _add_page(self, page: QWidget, name: str):
         idx = self.stack.addWidget(page)
@@ -191,6 +213,7 @@ class FirstRunDialog(QDialog):
         self._scan_thread = ScanInstancesThread(self.backend)
         self._scan_thread.scan_step.connect(self.scan_step_label.setText)
         self._scan_thread.scan_done.connect(self._on_scan_done)
+        self._track_thread(self._scan_thread)
         self._scan_thread.start()
 
     def _on_scan_done(self, instances: list):
@@ -298,7 +321,8 @@ class FirstRunDialog(QDialog):
             return
         thread = CheckStepThread(self._check_funcs[step], step)
         thread.step_done.connect(self._on_step_done)
-        self._current_step_thread = thread  # prevent GC
+        self._current_step_thread = thread
+        self._track_thread(thread)
         thread.start()
 
     def _on_step_done(self, step, passed, detail):
@@ -569,6 +593,7 @@ class FirstRunDialog(QDialog):
 
         self._takeover_thread = TakeoverThread(self.backend, instance)
         self._takeover_thread.finished.connect(self._on_takeover_done)
+        self._track_thread(self._takeover_thread)
         self._takeover_thread.start()
 
     def _on_takeover_done(self, success: bool):
@@ -755,6 +780,7 @@ class FirstRunDialog(QDialog):
 
         self._create_thread = CreateRuntimeThread(self.backend, install_dir)
         self._create_thread.finished.connect(self._on_create_done)
+        self._track_thread(self._create_thread)
         self._create_thread.start()
 
     def _on_progress(self, text):

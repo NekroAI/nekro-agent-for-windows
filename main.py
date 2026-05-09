@@ -16,23 +16,21 @@ class LogRedirector:
     def __init__(self, log_file):
         self.log_file = log_file
         self.file = open(log_file, 'w', encoding='utf-8', buffering=1)
-        # 保存原始的 stdout/stderr（已经是打开状态的文件对象）
         self.console = sys.__stdout__
 
     def write(self, message):
         try:
-            # 写入文件（使用 UTF-8）
             self.file.write(message)
             self.file.flush()
-        except Exception as e:
+        except Exception:
             pass
 
+        if self.console is None:
+            return
         try:
-            # 写入控制台（尝试用原始 stdout）
             self.console.write(message)
             self.console.flush()
         except UnicodeEncodeError:
-            # 如果编码出错，用 errors='replace' 重新尝试
             try:
                 self.console.write(message.encode('utf-8', errors='replace').decode('utf-8', errors='replace'))
                 self.console.flush()
@@ -46,10 +44,11 @@ class LogRedirector:
             self.file.flush()
         except Exception:
             pass
-        try:
-            self.console.flush()
-        except Exception:
-            pass
+        if self.console is not None:
+            try:
+                self.console.flush()
+            except Exception:
+                pass
 
     def close(self):
         try:
@@ -70,8 +69,8 @@ def main():
     if sys.platform == 'win32':
         os.environ['PYTHONIOENCODING'] = 'utf-8'
 
-    log_dir = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "NekroAgent")
-    os.makedirs(log_dir, exist_ok=True)
+    from core.config_manager import get_app_data_dir
+    log_dir = get_app_data_dir()
     log_file = os.path.join(log_dir, "debug.log")
 
     redirector = LogRedirector(log_file)

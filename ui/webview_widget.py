@@ -13,10 +13,8 @@ from qtwebview2 import QtWebView2Widget  # noqa: E402
 
 
 def _data_folder(subfolder="default"):
-    root = os.path.join(
-        os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-        "NekroAgent", "webview2_data",
-    )
+    from core.config_manager import get_app_data_dir
+    root = os.path.join(get_app_data_dir(), "webview2_data")
     path = os.path.join(root, subfolder)
     os.makedirs(path, exist_ok=True)
     return path
