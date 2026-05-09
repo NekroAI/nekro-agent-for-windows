@@ -9,6 +9,7 @@ a = Analysis(
     datas=[
         ('assets', 'assets'),
         ('data', 'data'),
+        ('version.txt', '.'),
     ],
     hiddenimports=[
         'qtwebview2',
