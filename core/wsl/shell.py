@@ -1,10 +1,13 @@
 import base64
+import logging
 import os
 import re
 import secrets
 import string
 import subprocess
 import sys
+
+logger = logging.getLogger(__name__)
 
 from core.wsl.constants import DISTRO_NAME
 
@@ -135,7 +138,8 @@ class WSLShellMixin:
         try:
             proc = self._wsl_run(distro, cmd, timeout=timeout, user=user)
             return self._safe_decode(proc.stdout)
-        except Exception:
+        except Exception as e:
+            logger.debug("_wsl_exec failed: cmd=%s err=%s", cmd[:120], e)
             return ""
 
     def _wsl_exec_checked(self, distro, cmd, timeout=60, user=None):

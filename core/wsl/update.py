@@ -388,12 +388,15 @@ class WSLUpdateMixin:
 
         target_args = " ".join(shlex.quote(target.lstrip("/")) for target in existing_targets)
         cmd = f"rm -f {shlex.quote(archive_path)} && tar -czf {shlex.quote(archive_path)} -C / {target_args}"
-        rc = subprocess.run(
-            ["wsl", "-d", distro, "--", "bash", "-c", cmd],
-            capture_output=True,
-            timeout=600,
-            creationflags=self._creation_flags(),
-        )
+        try:
+            rc = subprocess.run(
+                ["wsl", "-d", distro, "--", "bash", "-c", cmd],
+                capture_output=True,
+                timeout=600,
+                creationflags=self._creation_flags(),
+            )
+        except subprocess.TimeoutExpired:
+            return False, "备份超时（超过 10 分钟），请检查磁盘空间或数据量。"
         out = self._safe_decode(rc.stdout) + self._safe_decode(rc.stderr)
         if rc.returncode != 0:
             message = "备份失败"

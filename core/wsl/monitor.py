@@ -1,10 +1,13 @@
 import re
 import subprocess
+import threading
 import time
 from urllib.request import urlopen
 
 
 class WSLMonitorMixin:
+    _health_generation: int = 0
+    _health_lock = threading.Lock()
     def _log_reader(self, distro, deploy_dir):
         """通过 docker compose logs -f 流式读取日志"""
         napcat_token_pattern = re.compile(r"WebUi.*token=([a-zA-Z0-9]+)")
@@ -45,16 +48,24 @@ class WSLMonitorMixin:
                     pass
 
     def _health_check(self):
-        """轮询 Nekro Agent 服务直到返回 200"""
+        """轮询 Nekro Agent 服务直到返回 200，自动取消前一轮检查"""
+        with self._health_lock:
+            self._health_generation += 1
+            my_gen = self._health_generation
+
         nekro_port = self.config.get("nekro_port") or 8021
         timeout = 300
         start = time.time()
         interval = 2.0
 
         while time.time() - start < timeout and not self._stop_event.is_set():
+            if self._health_generation != my_gen:
+                return
             try:
                 resp = urlopen(f"http://localhost:{nekro_port}", timeout=5)
                 if resp.status == 200:
+                    if self._health_generation != my_gen:
+                        return
                     elapsed = time.time() - start
                     self.log_received.emit(f"服务已就绪！(耗时 {elapsed:.1f}s)", "info")
                     self.boot_finished.emit()
@@ -65,7 +76,7 @@ class WSLMonitorMixin:
 
             time.sleep(interval)
 
-        if not self._stop_event.is_set():
+        if not self._stop_event.is_set() and self._health_generation == my_gen:
             self.is_running = False
             self.log_received.emit("服务启动超时，请检查日志", "error")
             self.status_changed.emit("启动超时")

@@ -6,13 +6,37 @@
 
 import os
 import re
-import tempfile
+import sys
 from urllib.parse import urlparse
 
 import requests
 from PyQt6.QtCore import QObject, pyqtSignal
 
-APP_VERSION = "1.0.0"
+_FALLBACK_VERSION = "1.0.0"
+
+
+def _read_version() -> str:
+    """从打包资源或项目根目录的 version.txt 读取版本号。"""
+    candidates = []
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    else:
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    candidates.append(os.path.join(base, "version.txt"))
+    candidates.append(os.path.join(base, "data", "version.txt"))
+
+    for path in candidates:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                ver = f.read().strip()
+                if ver:
+                    return ver
+        except OSError:
+            continue
+    return _FALLBACK_VERSION
+
+
+APP_VERSION = _read_version()
 
 GITHUB_REPO = "NekroAI/nekro-agent-for-windows"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -60,8 +84,11 @@ def _try_github_api(url: str) -> dict | None:
                 timeout=REQUEST_TIMEOUT,
                 headers={"Accept": "application/vnd.github+json"},
             )
+            resp.close()
             if resp.status_code == 200:
-                return resp.json()
+                data = resp.json()
+                if isinstance(data, dict):
+                    return data
         except Exception:
             continue
     return None
@@ -73,34 +100,41 @@ def check_update() -> dict | None:
     返回 dict: {tag, name, body, published_at, download_url, file_name, file_size}
     无新版本或请求失败返回 None。
     """
-    data = _try_github_api(GITHUB_API_URL)
-    if not data:
+    try:
+        data = _try_github_api(GITHUB_API_URL)
+        if not data:
+            return None
+
+        tag = str(data.get("tag_name", ""))
+        if not tag or not is_newer(tag):
+            return None
+
+        asset_url = ""
+        asset_name = ""
+        asset_size = 0
+        assets = data.get("assets")
+        if isinstance(assets, list):
+            for asset in assets:
+                if not isinstance(asset, dict):
+                    continue
+                name = str(asset.get("name", ""))
+                if ASSET_PATTERN.match(name):
+                    asset_url = str(asset.get("browser_download_url", ""))
+                    asset_name = name
+                    asset_size = asset.get("size", 0)
+                    break
+
+        return {
+            "tag": tag,
+            "name": str(data.get("name", tag)),
+            "body": str(data.get("body", "")),
+            "published_at": str(data.get("published_at", "")),
+            "download_url": asset_url,
+            "file_name": asset_name,
+            "file_size": asset_size,
+        }
+    except Exception:
         return None
-
-    tag = data.get("tag_name", "")
-    if not tag or not is_newer(tag):
-        return None
-
-    asset_url = ""
-    asset_name = ""
-    asset_size = 0
-    for asset in data.get("assets", []):
-        name = asset.get("name", "")
-        if ASSET_PATTERN.match(name):
-            asset_url = asset.get("browser_download_url", "")
-            asset_name = name
-            asset_size = asset.get("size", 0)
-            break
-
-    return {
-        "tag": tag,
-        "name": data.get("name", tag),
-        "body": data.get("body", ""),
-        "published_at": data.get("published_at", ""),
-        "download_url": asset_url,
-        "file_name": asset_name,
-        "file_size": asset_size,
-    }
 
 
 def _accelerated_download_url(original_url: str) -> list[str]:
@@ -129,11 +163,9 @@ class DownloadWorker(QObject):
         self._cancelled = True
 
     def run(self):
+        from core.config_manager import get_app_data_dir
         urls = _accelerated_download_url(self._download_url)
-        dest_dir = os.path.join(
-            os.environ.get("LOCALAPPDATA", tempfile.gettempdir()),
-            "NekroAgent", "updates",
-        )
+        dest_dir = os.path.join(get_app_data_dir(), "updates")
         os.makedirs(dest_dir, exist_ok=True)
         dest_path = os.path.join(dest_dir, self._file_name)
 

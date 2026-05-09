@@ -4,6 +4,51 @@ import shutil
 import sys
 import threading
 
+_app_data_dir_cache: str | None = None
+_app_data_dir_lock = threading.Lock()
+
+
+def get_app_data_dir() -> str:
+    """返回应用数据根目录。
+
+    优先使用 <exe所在目录>/data（安装目录下），写入失败（如 Program Files）
+    则自动 fallback 到 %LOCALAPPDATA%/NekroAgent。
+    结果会被缓存，整个进程生命周期只探测一次。
+    """
+    global _app_data_dir_cache
+    if _app_data_dir_cache is not None:
+        return _app_data_dir_cache
+
+    with _app_data_dir_lock:
+        if _app_data_dir_cache is not None:
+            return _app_data_dir_cache
+
+        if getattr(sys, "frozen", False):
+            base = os.path.dirname(sys.executable)
+        else:
+            base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+        candidate = os.path.join(base, "data")
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            probe = os.path.join(candidate, f".probe_{os.getpid()}")
+            with open(probe, "w") as f:
+                f.write("ok")
+            try:
+                os.remove(probe)
+            except OSError:
+                pass
+            _app_data_dir_cache = candidate
+            return candidate
+        except (OSError, PermissionError):
+            pass
+
+        local = os.environ.get("LOCALAPPDATA", "") or os.path.expanduser("~")
+        fallback = os.path.join(local, "NekroAgent")
+        os.makedirs(fallback, exist_ok=True)
+        _app_data_dir_cache = fallback
+        return fallback
+
 
 class ConfigManager:
     def __init__(self, config_path=None):
@@ -16,13 +61,14 @@ class ConfigManager:
             if self.base_path.endswith('core'):
                 self.base_path = os.path.dirname(self.base_path)
 
-        self.app_data_dir = os.path.join(
-            os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-            "NekroAgent",
-        )
+        self.app_data_dir = get_app_data_dir()
         self.browser_profile_dir = os.path.join(self.app_data_dir, "browser_profile")
         self._legacy_config_path = os.path.join(self.base_path, "config.json")
         self._legacy_browser_profile_dir = os.path.join(self.base_path, "browser_profile")
+        self._legacy_localappdata_dir = os.path.join(
+            os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+            "NekroAgent",
+        )
 
         if config_path:
             self.config_path = config_path
@@ -64,20 +110,35 @@ class ConfigManager:
     def _migrate_legacy_state(self):
         os.makedirs(self.app_data_dir, exist_ok=True)
 
-        config_path = os.path.abspath(self.config_path)
-        legacy_config_path = os.path.abspath(self._legacy_config_path)
-        if config_path != legacy_config_path:
-            if not os.path.exists(self.config_path) and os.path.exists(self._legacy_config_path):
+        legacy_sources = [
+            self._legacy_config_path,
+            os.path.join(self._legacy_localappdata_dir, "config.json"),
+        ]
+        for src in legacy_sources:
+            src = os.path.abspath(src)
+            if src == os.path.abspath(self.config_path):
+                continue
+            if not os.path.exists(self.config_path) and os.path.exists(src):
                 try:
-                    shutil.copy2(self._legacy_config_path, self.config_path)
+                    shutil.copy2(src, self.config_path)
+                    break
                 except Exception:
-                    pass
+                    continue
 
-            if not os.path.exists(self.browser_profile_dir) and os.path.isdir(self._legacy_browser_profile_dir):
+        legacy_browser_dirs = [
+            self._legacy_browser_profile_dir,
+            os.path.join(self._legacy_localappdata_dir, "browser_profile"),
+        ]
+        for src in legacy_browser_dirs:
+            src = os.path.abspath(src)
+            if src == os.path.abspath(self.browser_profile_dir):
+                continue
+            if not os.path.exists(self.browser_profile_dir) and os.path.isdir(src):
                 try:
-                    shutil.copytree(self._legacy_browser_profile_dir, self.browser_profile_dir)
+                    shutil.copytree(src, self.browser_profile_dir)
+                    break
                 except Exception:
-                    pass
+                    continue
 
     def load_config(self):
         if os.path.exists(self.config_path):

@@ -518,8 +518,14 @@ class WSLDiscoveryMixin:
         if not self.config:
             return
 
-        nekro_port = int(env.get("NEKRO_EXPOSE_PORT") or 8021)
-        napcat_port = int(env.get("NAPCAT_EXPOSE_PORT") or 6099)
+        try:
+            nekro_port = int(env.get("NEKRO_EXPOSE_PORT") or 8021)
+        except (ValueError, TypeError):
+            nekro_port = 8021
+        try:
+            napcat_port = int(env.get("NAPCAT_EXPOSE_PORT") or 6099)
+        except (ValueError, TypeError):
+            napcat_port = 6099
         instance_name = env.get("INSTANCE_NAME", "")
 
         is_preview = agent_image == PREVIEW_IMAGE
