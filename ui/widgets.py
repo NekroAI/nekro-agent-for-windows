@@ -1,3 +1,6 @@
+import re
+from collections import OrderedDict
+
 from PyQt6.QtCore import QPoint, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
@@ -97,6 +100,165 @@ def create_install_progress_bar(minimum=0, maximum=0, height=8, radius=4):
     return bar
 
 
+class PullProgressView(QFrame):
+    def __init__(self, parent=None, dark=False):
+        super().__init__(parent)
+        self._stage_header = ""
+        self._summary_text = ""
+        self._layers = OrderedDict()
+        self._layer_order = []
+
+        self.setObjectName("SectionCard")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(8)
+
+        self.status_label = QLabel("")
+        self.status_label.setObjectName("SectionDesc")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        bar_row = QHBoxLayout()
+        bar_row.setSpacing(10)
+        self.spinner_label = SpinnerLabel(self)
+        bar_row.addWidget(self.spinner_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFixedHeight(8)
+        self.progress_bar.setTextVisible(False)
+        if dark:
+            self.progress_bar.setStyleSheet(
+                "QProgressBar { border: none; background: #1e3a52; border-radius: 4px; }"
+                "QProgressBar::chunk { background: #58a6ff; border-radius: 4px; }"
+            )
+        else:
+            self.progress_bar.setStyleSheet(
+                "QProgressBar { border: none; background: #e8e9eb; border-radius: 4px; }"
+                "QProgressBar::chunk { background: #0969da; border-radius: 4px; }"
+            )
+        bar_row.addWidget(self.progress_bar)
+        layout.addLayout(bar_row)
+        self.setVisible(False)
+
+    @property
+    def stage_header(self):
+        return self._stage_header
+
+    @property
+    def summary_text(self):
+        return self._summary_text
+
+    @property
+    def has_layers(self):
+        return bool(self._layer_order)
+
+    @property
+    def value(self):
+        return self.progress_bar.value()
+
+    def set_active(self, active):
+        self.setVisible(active)
+        if active:
+            self.spinner_label.start(80)
+        else:
+            self.spinner_label.stop()
+
+    def reset(self):
+        self._stage_header = ""
+        self._summary_text = ""
+        self._layers.clear()
+        self._layer_order.clear()
+        self.status_label.setText("")
+        self.progress_bar.setValue(0)
+        self.set_active(False)
+
+    def start(self, header):
+        self.reset()
+        self.update(header=header)
+
+    def begin_stage(self, header):
+        self._stage_header = header
+        self._summary_text = ""
+        self._layers.clear()
+        self._layer_order.clear()
+        self.progress_bar.setValue(0)
+        self.update(header=header)
+
+    def finish(self, header):
+        self.progress_bar.setValue(100)
+        self.update(header=header)
+
+    def fail(self, header):
+        self.update(header=header)
+
+    def update(self, header="", detail=""):
+        if header:
+            self._stage_header = header
+        if detail:
+            self._update_layer(detail)
+        self._refresh_status_label()
+        self.set_active(True)
+
+    def _update_layer(self, detail):
+        layer_match = re.match(r"^([a-f0-9]{6,64}):\s*(.+)$", detail, re.IGNORECASE)
+        if not layer_match:
+            return
+        layer_id, status = layer_match.groups()
+        short_id = layer_id[:12]
+        if short_id not in self._layers:
+            self._layer_order.append(short_id)
+        self._layers[short_id] = status
+        total = len(self._layer_order)
+        done = sum(
+            1
+            for lid in self._layer_order
+            if self._layers.get(lid, "").startswith(("Pull complete", "Already exists", "Download complete"))
+        )
+        if total > 0:
+            self.progress_bar.setValue(int(done * 100 / total))
+        self._summary_text = self._summarize_layers()
+
+    def _summarize_layers(self):
+        total = len(self._layer_order)
+        if total <= 0:
+            return ""
+
+        done = 0
+        downloading = 0
+        extracting = 0
+        verifying = 0
+        waiting = 0
+        for layer_id in self._layer_order:
+            status = self._layers.get(layer_id, "")
+            if status.startswith(("Pull complete", "Already exists", "Download complete")):
+                done += 1
+            elif status.startswith("Downloading"):
+                downloading += 1
+            elif status.startswith("Extracting"):
+                extracting += 1
+            elif status.startswith("Verifying"):
+                verifying += 1
+            elif status.startswith(("Waiting", "Pulling fs layer")):
+                waiting += 1
+
+        parts = [f"已完成 {done}/{total} 层"]
+        if downloading:
+            parts.append(f"下载中 {downloading} 层")
+        if extracting:
+            parts.append(f"解压中 {extracting} 层")
+        if verifying:
+            parts.append(f"校验中 {verifying} 层")
+        if waiting:
+            parts.append(f"等待中 {waiting} 层")
+        return "，".join(parts)
+
+    def _refresh_status_label(self):
+        text_parts = [part for part in [self._stage_header, self._summary_text] if part]
+        self.status_label.setText("\n".join(text_parts))
+
+
 class UpdateProgressDialog(QDialog):
     confirmed = pyqtSignal()
 
@@ -124,6 +286,7 @@ class UpdateProgressDialog(QDialog):
         self.desc_label = QLabel(text)
         self.desc_label.setProperty("role", "dialog_desc")
         self.desc_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.desc_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.desc_label.setWordWrap(True)
         layout.addWidget(self.desc_label)
 

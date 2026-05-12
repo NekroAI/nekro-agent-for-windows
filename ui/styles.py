@@ -464,6 +464,11 @@ QComboBox:hover {
     border-color: #8fc5dd;
 }
 
+QLineEdit[invalid="true"] {
+    border-color: #f26f82;
+    background: #fff5f7;
+}
+
 QComboBox:on {
     background: #ffffff;
 }
