@@ -1,4 +1,3 @@
 PyQt6>=6.6.0
 qtwebview2>=0.4.0
-Pillow>=10.0.0
 requests>=2.31.0

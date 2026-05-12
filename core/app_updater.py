@@ -84,7 +84,6 @@ def _try_github_api(url: str) -> dict | None:
                 timeout=REQUEST_TIMEOUT,
                 headers={"Accept": "application/vnd.github+json"},
             )
-            resp.close()
             if resp.status_code == 200:
                 data = resp.json()
                 if isinstance(data, dict):
@@ -123,6 +122,9 @@ def check_update() -> dict | None:
                     asset_name = name
                     asset_size = asset.get("size", 0)
                     break
+
+        if not asset_url:
+            return None
 
         return {
             "tag": tag,
