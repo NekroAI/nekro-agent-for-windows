@@ -100,6 +100,7 @@ class ConfigManager:
             "image_update_last_alert_signature": "",
             "runtime_image_cache": "runtime_cache",
             "active_instance": "",   # 当前活跃的实例 ID
+            "default_instance": "",  # 启动后默认展示和访问的实例 ID
             "instances": {},         # 多实例配置 {id: {instance_name, deploy_dir, data_dir, ...}}
             "skipped_app_version": "",        # 用户选择跳过的启动器版本 tag
             "last_app_update_check_ts": 0,    # 上次检查启动器更新的时间戳
@@ -206,10 +207,27 @@ class ConfigManager:
         with self._lock:
             self.config["instances"] = instances
             self.config["active_instance"] = inst_id
+            self.config["default_instance"] = inst_id
         self.save_config()
 
     def get_active_instance_id(self):
         return self.config.get("active_instance", "")
+
+    def get_default_instance_id(self):
+        instances = self.config.get("instances") or {}
+        default_id = self.config.get("default_instance", "")
+        if default_id in instances:
+            return default_id
+        active_id = self.get_active_instance_id()
+        if active_id in instances:
+            return active_id
+        return next(iter(instances), "")
+
+    def set_default_instance_id(self, inst_id):
+        instances = self.config.get("instances") or {}
+        if inst_id not in instances:
+            return False
+        return self.set("default_instance", inst_id)
 
     def get_instance(self, inst_id=None):
         """返回指定实例的配置 dict；不传 inst_id 时返回当前活跃实例。"""
@@ -237,8 +255,11 @@ class ConfigManager:
         with self._lock:
             instances = self.config.get("instances") or {}
             instances.pop(inst_id, None)
+            fallback = next(iter(instances), "")
             if self.config.get("active_instance") == inst_id:
-                self.config["active_instance"] = next(iter(instances), "")
+                self.config["active_instance"] = fallback
+            if self.config.get("default_instance") == inst_id:
+                self.config["default_instance"] = self.config.get("active_instance") or fallback
         return self.save_config()
 
     def list_instances(self):

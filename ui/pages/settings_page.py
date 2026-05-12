@@ -36,20 +36,24 @@ class SettingsPage(QWidget):
         self.w.instance_title_label.setObjectName("VersionDisplay")
         row.addWidget(self.w.instance_title_label)
         row.addStretch()
-
-        btn_add = QPushButton("部署新实例")
-        btn_add.setObjectName("HeroSecondary")
-        btn_add.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_add.clicked.connect(self.w._show_first_run_dialog)
-        row.addWidget(btn_add)
         card_layout.addLayout(row)
+
+        default_row = QHBoxLayout()
+        default_row.setSpacing(12)
+        default_row.addWidget(QLabel("启动默认实例"))
+        self.w.default_instance_combo = StyledComboBox()
+        self.w.default_instance_combo.setMinimumWidth(240)
+        self.w.default_instance_combo.currentIndexChanged.connect(self._on_default_instance_changed)
+        default_row.addWidget(self.w.default_instance_combo, 0, Qt.AlignmentFlag.AlignLeft)
+        default_row.addStretch()
+        card_layout.addLayout(default_row)
 
         self.w.instance_info_label = QLabel("")
         self.w.instance_info_label.setObjectName("SectionDesc")
         self.w.instance_info_label.setWordWrap(True)
         card_layout.addWidget(self.w.instance_info_label)
 
-        self.w.instance_switch_hint = QLabel("多实例切换入口已移动到总览页。")
+        self.w.instance_switch_hint = QLabel("多实例切换和新实例部署入口已移动到总览页。")
         self.w.instance_switch_hint.setObjectName("SectionDesc")
         self.w.instance_switch_hint.setWordWrap(True)
         card_layout.addWidget(self.w.instance_switch_hint)
@@ -57,7 +61,38 @@ class SettingsPage(QWidget):
 
         parent_layout.addWidget(card)
 
+    def _refresh_default_instance_combo(self):
+        if not hasattr(self.w, "default_instance_combo"):
+            return
+        combo = self.w.default_instance_combo
+        combo.blockSignals(True)
+        combo.clear()
+        instances = self.w.config.list_instances()
+        default_id = self.w.config.get_default_instance_id()
+        current_idx = 0
+        for i, (inst_id, inst_data) in enumerate(instances):
+            display = self.w._instance_display_name(inst_id, inst_data)
+            mode = "napcat" if inst_data.get("deploy_mode") == "napcat" else "lite"
+            port = inst_data.get("nekro_port", 8021)
+            combo.addItem(f"{display}  ({mode}, :{port})", inst_id)
+            if inst_id == default_id:
+                current_idx = i
+        if not instances:
+            combo.addItem("无实例", "")
+        combo.setCurrentIndex(current_idx)
+        combo.setEnabled(bool(instances))
+        combo.blockSignals(False)
+
+    def _on_default_instance_changed(self, index):
+        inst_id = self.w.default_instance_combo.itemData(index)
+        if not inst_id:
+            return
+        if self.w.config.set_default_instance_id(inst_id):
+            self.w._switch_active_instance(inst_id)
+            self._refresh_instance_info()
+
     def _refresh_instance_info(self):
+        self._refresh_default_instance_combo()
         inst = self.w.config.get_instance()
         inst_id = self.w.config.get_active_instance_id()
         if not inst:

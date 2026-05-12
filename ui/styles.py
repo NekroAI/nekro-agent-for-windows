@@ -528,6 +528,7 @@ QCheckBox::indicator {
 QCheckBox::indicator:checked {
     background: #57bfd6;
     border-color: #57bfd6;
+    image: url({{CHECK_SVG}});
 }
 
 QPushButton {
@@ -912,4 +913,8 @@ QLabel#VersionDisplay {
 }
 """
 
-STYLESHEET = _STYLESHEET_TEMPLATE.replace("{{CHEVRON_DOWN_SVG}}", _asset_path("chevron-down.svg"))
+STYLESHEET = (
+    _STYLESHEET_TEMPLATE
+    .replace("{{CHEVRON_DOWN_SVG}}", _asset_path("chevron-down.svg"))
+    .replace("{{CHECK_SVG}}", _asset_path("check.svg"))
+)

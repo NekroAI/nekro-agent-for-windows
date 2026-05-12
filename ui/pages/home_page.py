@@ -135,21 +135,24 @@ class HomePage(QWidget):
 
         self.w.btn_env_check = ActionButton("CHK", "环境检查", f"重新运行 {self.w.backend.display_name} 初始化向导")
         self.w.btn_deploy_action = ActionButton("RUN", "一键部署", "启动容器并写入运行配置", "primary")
-        self.w.btn_stop_action = ActionButton("STOP", "关闭服务", "停止 docker compose 以便修改部署模式")
+        self.w.btn_new_instance_action = ActionButton("NEW", "部署新实例", "创建并部署新的 Nekro Agent 实例")
+        self.w.btn_stop_action = ActionButton("STOP", "关闭服务", "停止当前实例 docker compose 服务")
         self.w.btn_update_action = ActionButton("UPD", "升级 Nekro Agent", "拉取镜像并重启服务")
         self.w.btn_uninstall_action = ActionButton("DEL", "卸载清理", "删除容器、镜像和运行环境", "danger")
 
         self.w.btn_env_check.clicked.connect(self.w._show_first_run_dialog)
         self.w.btn_deploy_action.clicked.connect(self.w.start_deploy)
+        self.w.btn_new_instance_action.clicked.connect(self.w._show_first_run_dialog)
         self.w.btn_stop_action.clicked.connect(self.w._stop_services_for_mode_change)
         self.w.btn_update_action.clicked.connect(self.w._update_services)
         self.w.btn_uninstall_action.clicked.connect(self.w._uninstall_environment)
 
         actions_grid.addWidget(self.w.btn_env_check, 0, 0)
         actions_grid.addWidget(self.w.btn_deploy_action, 0, 1)
-        actions_grid.addWidget(self.w.btn_stop_action, 1, 0)
-        actions_grid.addWidget(self.w.btn_update_action, 1, 1)
-        actions_grid.addWidget(self.w.btn_uninstall_action, 2, 0, 1, 2)
+        actions_grid.addWidget(self.w.btn_new_instance_action, 1, 0)
+        actions_grid.addWidget(self.w.btn_stop_action, 1, 1)
+        actions_grid.addWidget(self.w.btn_update_action, 2, 0)
+        actions_grid.addWidget(self.w.btn_uninstall_action, 2, 1)
         actions_layout.addLayout(actions_grid)
 
         activity_card = SectionCard("实时摘要", "显示最近的应用日志，完整内容在日志中心查看。")
@@ -167,6 +170,7 @@ class HomePage(QWidget):
         self.w._register_responsive_buttons(
             self.w.btn_env_check,
             self.w.btn_deploy_action,
+            self.w.btn_new_instance_action,
             self.w.btn_stop_action,
             self.w.btn_update_action,
             self.w.btn_uninstall_action,
