@@ -2,9 +2,9 @@ import sys
 import os
 import argparse
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QPalette, QColor
+from PyQt6.QtGui import QPalette, QColor, QIcon
 from PyQt6.QtWidgets import QApplication
-from ui.main_window import MainWindow
+from ui.main_window import MainWindow, get_resource_path
 from ui.splash import SplashScreen
 
 # 全局 debug 标志
@@ -80,6 +80,9 @@ def main():
     print(f"[LOG] 程序启动，日志文件: {log_file}")
 
     app = QApplication(sys.argv)
+    app_icon_path = get_resource_path(os.path.join("assets", "NekroAgent.ico"))
+    if os.path.exists(app_icon_path):
+        app.setWindowIcon(QIcon(app_icon_path))
 
     # 强制使用 Fusion 风格 + 亮色调色板，不跟随系统深色模式
     app.setStyle("Fusion")

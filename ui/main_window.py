@@ -1757,6 +1757,132 @@ class MainWindow(QMainWindow):
         )
         webbrowser.open(current_url)
 
+    def _instance_display_name(self, inst_id=None, inst=None):
+        if inst is None and inst_id:
+            inst = self.config.get_instance(inst_id)
+        if inst:
+            return inst.get("instance_name", "").rstrip("_") or inst_id or "default"
+        return inst_id or "default"
+
+    def _apply_active_instance_config(self, inst_id):
+        inst = self.config.get_instance(inst_id)
+        if not inst:
+            return None
+        self.config.set("active_instance", inst_id)
+        self.config.set("deploy_mode", inst.get("deploy_mode", ""))
+        self.config.set("nekro_port", inst.get("nekro_port", 8021))
+        self.config.set("napcat_port", inst.get("napcat_port", 6099))
+        self.config.set("release_channel", inst.get("release_channel", "stable"))
+        self.config.set("deploy_info", inst.get("deploy_info"))
+        return inst
+
+    def _sync_browser_to_active_instance(self, force_reload=True):
+        nekro_port = self.config.get("nekro_port") or 8021
+        napcat_port = self.config.get("napcat_port") or 6099
+        self.browser_urls["nekro"] = f"http://localhost:{nekro_port}"
+        self.browser_urls["napcat"] = f"http://localhost:{napcat_port}"
+
+        target = self.current_browser_target
+        if not self._can_access_target(target):
+            target = "nekro"
+        self.current_browser_target = target
+
+        if hasattr(self, "browser_tabs"):
+            current_view = self._current_webview()
+            if current_view is not None:
+                current_view.setProperty("browser_target", target)
+                self._set_browser_target(target, force_reload=force_reload, browser_view=current_view)
+            self._sync_browser_url_label(self._target_url(target))
+        self._refresh_browser_nav_buttons()
+
+    def _refresh_log_tabs_for_active_instance(self):
+        if not hasattr(self, "btn_log_napcat"):
+            return
+        service_active = bool(self.config.get("deploy_mode"))
+        napcat_active = self.config.get("deploy_mode") == "napcat"
+        if hasattr(self, "btn_log_nekro"):
+            self.btn_log_nekro.setVisible(service_active)
+        self.btn_log_napcat.setVisible(service_active and napcat_active)
+        if not napcat_active and self.btn_log_napcat.isChecked():
+            self._set_log_tab(1 if service_active else 0)
+
+    def _switch_active_instance(self, inst_id):
+        current = self.config.get_active_instance_id()
+        if not inst_id or inst_id == current:
+            return False
+
+        inst = self._apply_active_instance_config(inst_id)
+        if not inst:
+            return False
+
+        display = self._instance_display_name(inst_id, inst)
+        self.append_log(f"已切换到实例「{display}」，正在同步日志和内置浏览器。", "info")
+        self._switch_log_reader_to_active_instance()
+        self._sync_browser_to_active_instance(force_reload=True)
+        self._refresh_log_tabs_for_active_instance()
+        self.refresh_dashboard()
+        return True
+
+    def _show_instance_switch_dialog(self):
+        instances = self.config.list_instances()
+        if len(instances) <= 1:
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("切换实例")
+        dialog.setMinimumWidth(400)
+        dialog.setMaximumWidth(500)
+        dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        dialog.setStyleSheet(STYLESHEET)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(14)
+
+        title = QLabel("选择要切换的实例")
+        title.setProperty("role", "dialog_title")
+        layout.addWidget(title)
+
+        desc = QLabel("切换后，总览、日志和内置浏览器将指向所选实例；不会自动启动或停止实例服务。")
+        desc.setProperty("role", "dialog_desc")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        from ui.widgets import StyledComboBox
+        combo = StyledComboBox()
+        combo.setMinimumWidth(360)
+        active_id = self.config.get_active_instance_id()
+        active_index = 0
+        for index, (item_id, inst_data) in enumerate(instances):
+            name = self._instance_display_name(item_id, inst_data)
+            mode = "napcat" if inst_data.get("deploy_mode") == "napcat" else "lite"
+            port = inst_data.get("nekro_port", 8021)
+            combo.addItem(f"{name}  ({mode}, :{port})", item_id)
+            if item_id == active_id:
+                active_index = index
+        combo.setCurrentIndex(active_index)
+        layout.addWidget(combo)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+
+        btn_cancel = QPushButton("取消")
+        btn_cancel.setFixedHeight(36)
+        btn_cancel.clicked.connect(dialog.reject)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addStretch()
+
+        btn_switch = QPushButton("切换到选中实例")
+        btn_switch.setProperty("role", "primary")
+        btn_switch.setFixedHeight(36)
+        btn_switch.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_switch.clicked.connect(dialog.accept)
+        btn_row.addWidget(btn_switch)
+        layout.addLayout(btn_row)
+
+        if dialog.exec() == int(QDialog.DialogCode.Accepted):
+            self._switch_active_instance(combo.currentData())
+
     def _switch_log_reader_to_active_instance(self):
         """切换实例时，将日志读取和健康检查指向新的 active 实例。"""
         from core.wsl.constants import DISTRO_NAME
@@ -1795,9 +1921,19 @@ class MainWindow(QMainWindow):
 
         inst = self.config.get_instance()
         inst_id = self.config.get_active_instance_id()
+        instances = self.config.list_instances()
         if inst and inst_id:
-            inst_display = inst.get("instance_name", "").rstrip("_") or inst_id
+            inst_display = self._instance_display_name(inst_id, inst)
             mode_text = f"{mode_text}  [{inst_display}]"
+        else:
+            inst_display = ""
+
+        if hasattr(self, "btn_instance_switch"):
+            self.btn_instance_switch.setVisible(len(instances) > 1)
+            self.btn_instance_switch.setToolTip(
+                f"当前实例: {inst_display}。点击切换日志和内置浏览器指向的实例。"
+                if inst_display else "切换日志和内置浏览器指向的实例。"
+            )
 
         mode_value = self.metric_mode.findChild(QLabel, "MetricValue")
         if mode_value:
@@ -1808,8 +1944,7 @@ class MainWindow(QMainWindow):
             self.mode_display.setText(mode_text)
         if hasattr(self, "wsldir_edit"):
             self.wsldir_edit.setText(self.config.get("wsl_install_dir") or "未配置")
-        if hasattr(self, "_settings_page") and hasattr(self._settings_page, "_refresh_instance_combo"):
-            self._settings_page._refresh_instance_combo()
+        if hasattr(self, "_settings_page") and hasattr(self._settings_page, "_refresh_instance_info"):
             self._settings_page._refresh_instance_info()
         self._refresh_port_settings_ui()
         if hasattr(self, "datadir_edit"):
@@ -2646,12 +2781,11 @@ class MainWindow(QMainWindow):
             if was_active:
                 remaining = self.config.list_instances()
                 if remaining:
-                    first_id, first_data = remaining[0]
-                    self.config.set("active_instance", first_id)
-                    self.config.set("deploy_mode", first_data.get("deploy_mode", ""))
-                    self.config.set("nekro_port", first_data.get("nekro_port", 8021))
-                    self.config.set("napcat_port", first_data.get("napcat_port", 6099))
+                    first_id, _first_data = remaining[0]
+                    self._apply_active_instance_config(first_id)
                     self._switch_log_reader_to_active_instance()
+                    self._sync_browser_to_active_instance(force_reload=True)
+                    self._refresh_log_tabs_for_active_instance()
                 else:
                     self.config.set("active_instance", "")
                     self.config.set("deploy_mode", "")

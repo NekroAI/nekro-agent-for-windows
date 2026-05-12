@@ -27,58 +27,51 @@ class SettingsPage(QWidget):
         layout.addStretch()
 
     def _build_instance_card(self, parent_layout):
-        card = SectionCard("实例管理", "切换或管理已部署的 Nekro Agent 实例。")
+        card = SectionCard("当前实例", "查看启动器当前管理的 Nekro Agent 实例。")
         card_layout = card.body_layout()
 
         row = QHBoxLayout()
         row.setSpacing(12)
-        row.addWidget(QLabel("当前实例"))
-        self.w.instance_combo = StyledComboBox()
-        self.w.instance_combo.setMinimumWidth(200)
-        self._refresh_instance_combo()
-        self.w.instance_combo.currentIndexChanged.connect(self._on_instance_changed)
-        row.addWidget(self.w.instance_combo, 0, Qt.AlignmentFlag.AlignLeft)
+        self.w.instance_title_label = QLabel("")
+        self.w.instance_title_label.setObjectName("VersionDisplay")
+        row.addWidget(self.w.instance_title_label)
+        row.addStretch()
 
         btn_add = QPushButton("部署新实例")
         btn_add.setObjectName("HeroSecondary")
         btn_add.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_add.clicked.connect(self.w._show_first_run_dialog)
         row.addWidget(btn_add)
-        row.addStretch()
         card_layout.addLayout(row)
 
         self.w.instance_info_label = QLabel("")
         self.w.instance_info_label.setObjectName("SectionDesc")
         self.w.instance_info_label.setWordWrap(True)
         card_layout.addWidget(self.w.instance_info_label)
+
+        self.w.instance_switch_hint = QLabel("多实例切换入口已移动到总览页。")
+        self.w.instance_switch_hint.setObjectName("SectionDesc")
+        self.w.instance_switch_hint.setWordWrap(True)
+        card_layout.addWidget(self.w.instance_switch_hint)
         self._refresh_instance_info()
 
         parent_layout.addWidget(card)
 
-    def _refresh_instance_combo(self):
-        combo = self.w.instance_combo
-        combo.blockSignals(True)
-        combo.clear()
-        instances = self.w.config.list_instances()
-        active_id = self.w.config.get_active_instance_id()
-        current_idx = 0
-        for i, (inst_id, inst_data) in enumerate(instances):
-            display = inst_data.get("instance_name", "").rstrip("_") or inst_id
-            mode = "napcat" if inst_data.get("deploy_mode") == "napcat" else "lite"
-            port = inst_data.get("nekro_port", 8021)
-            combo.addItem(f"{display}  ({mode}, :{port})", inst_id)
-            if inst_id == active_id:
-                current_idx = i
-        if not instances:
-            combo.addItem("无实例", "")
-        combo.setCurrentIndex(current_idx)
-        combo.blockSignals(False)
-
     def _refresh_instance_info(self):
         inst = self.w.config.get_instance()
+        inst_id = self.w.config.get_active_instance_id()
         if not inst:
+            self.w.instance_title_label.setText("尚未部署实例")
             self.w.instance_info_label.setText("尚未部署任何实例。")
+            self.w.instance_switch_hint.setVisible(False)
             return
+
+        display = self.w._instance_display_name(inst_id, inst)
+        mode = "NapCat 完整版" if inst.get("deploy_mode") == "napcat" else "Lite 精简版"
+        port = inst.get("nekro_port", 8021)
+        channel = inst.get("release_channel", "stable")
+        self.w.instance_title_label.setText(f"{display}  ({mode}, :{port}, {channel})")
+
         parts = []
         if inst.get("deploy_dir"):
             parts.append(f"部署目录: {inst['deploy_dir']}")
@@ -87,29 +80,7 @@ class SettingsPage(QWidget):
         if inst.get("instance_name"):
             parts.append(f"INSTANCE_NAME: {inst['instance_name']}")
         self.w.instance_info_label.setText("  |  ".join(parts) if parts else "")
-
-    def _on_instance_changed(self, index):
-        inst_id = self.w.instance_combo.itemData(index)
-        if not inst_id:
-            return
-        current = self.w.config.get_active_instance_id()
-        if inst_id == current:
-            return
-
-        inst = self.w.config.get_instance(inst_id)
-        if not inst:
-            return
-
-        self.w.config.set("active_instance", inst_id)
-        self.w.config.set("deploy_mode", inst.get("deploy_mode", ""))
-        self.w.config.set("nekro_port", inst.get("nekro_port", 8021))
-        self.w.config.set("napcat_port", inst.get("napcat_port", 6099))
-        self.w.config.set("release_channel", inst.get("release_channel", "stable"))
-        self.w.config.set("deploy_info", inst.get("deploy_info"))
-
-        self.w._switch_log_reader_to_active_instance()
-        self._refresh_instance_info()
-        self.w.refresh_dashboard()
+        self.w.instance_switch_hint.setVisible(len(self.w.config.list_instances()) > 1)
 
     def _build_general_card(self, parent_layout):
         card = SectionCard("通用设置", "控制系统集成和自动检查选项。")
