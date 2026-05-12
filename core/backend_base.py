@@ -15,6 +15,7 @@ class BackendBase(QObject):
     image_pull_result = pyqtSignal(str, bool, str)  # (image_ref, success, message)
     update_optional_confirm = pyqtSignal(str, str)  # (step_label, prompt_with_size)
     update_finished = pyqtSignal(bool, str)  # (success, message)
+    instance_removed = pyqtSignal(bool, str, bool)  # (success, inst_id, was_active)
 
     backend_key = ""
     display_name = ""

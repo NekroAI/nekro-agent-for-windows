@@ -1,5 +1,6 @@
 import json
 import os
+import shlex
 import subprocess
 import threading
 import time
@@ -20,10 +21,34 @@ class WSLDeployMixin:
                 )
         return "/root/nekro_agent", "/root/nekro_agent_data", ""
 
-    def start_services(self, deploy_mode):
-        """部署 Docker Compose 服务"""
-        if self.is_running or self._deploying:
+    def _save_deploy_info(self, info, inst_id=None):
+        if not self.config:
+            return
+        self.config.set("deploy_info", info)
+        target_id = inst_id or self.config.get_active_instance_id()
+        if target_id:
+            self.config.update_instance(target_id, deploy_info=info)
+
+    def start_services(self, deploy_mode, force_new_instance=False):
+        """部署 Docker Compose 服务。
+
+        force_new_instance=True 时跳过 is_running 检查，用于部署新的共存实例。
+        旧实例的 compose 服务保持运行，仅切换日志读取到新实例。
+        """
+        if self._deploying:
             return True
+        if self.is_running and not force_new_instance:
+            return True
+
+        if force_new_instance:
+            self._stop_event.set()
+            if self._log_process and self._log_process.poll() is None:
+                try:
+                    self._log_process.terminate()
+                except Exception:
+                    pass
+                self._log_process = None
+            self._stop_event.clear()
 
         self._deploying = True
         distro = DISTRO_NAME
@@ -44,28 +69,37 @@ class WSLDeployMixin:
             self._deploying = False
             return False
 
+        inst_id = ""
+        if self.config:
+            inst_id = self.config.get_active_instance_id() or ""
+        inst_display = inst_id if inst_id and inst_id != "default" else ""
+        log_prefix = f"[{inst_display}] " if inst_display else ""
+
+        def _log(msg, level="info"):
+            self.log_received.emit(f"{log_prefix}{msg}", level)
+
         def _deploy():
             try:
                 deploy_dir, data_dir, _ = self._get_active_deploy_paths()
                 compose_dest = f"{deploy_dir}/docker-compose.yml"
                 env_dest = f"{deploy_dir}/.env"
 
-                self._wsl_exec(distro, f"mkdir -p {deploy_dir}")
-                self._wsl_exec(distro, f"mkdir -p {data_dir}")
+                self._wsl_exec(distro, f"mkdir -p {shlex.quote(deploy_dir)}")
+                self._wsl_exec(distro, f"mkdir -p {shlex.quote(data_dir)}")
 
-                env_exists = self._wsl_exec(distro, f"test -f {env_dest} && echo yes").strip()
-                compose_exists = self._wsl_exec(distro, f"test -f {compose_dest} && echo yes").strip()
+                env_exists = self._wsl_exec(distro, f"test -f {shlex.quote(env_dest)} && echo yes").strip()
+                compose_exists = self._wsl_exec(distro, f"test -f {shlex.quote(compose_dest)} && echo yes").strip()
                 existing_env_content = ""
                 existing_compose_content = ""
                 if env_exists == "yes":
-                    existing_env_content = self._wsl_exec(distro, f"cat {env_dest}")
+                    existing_env_content = self._wsl_exec(distro, f"cat {shlex.quote(env_dest)}")
                 if compose_exists == "yes":
-                    existing_compose_content = self._wsl_exec(distro, f"cat {compose_dest}")
+                    existing_compose_content = self._wsl_exec(distro, f"cat {shlex.quote(compose_dest)}")
 
                 if env_exists == "yes":
-                    self.log_received.emit("检测到已有部署配置，将保留旧凭据并按当前设置重写部署文件", "info")
+                    _log("检测到已有部署配置，将保留旧凭据并按当前设置重写部署文件")
                 else:
-                    self.log_received.emit("首次部署，写入配置文件", "info")
+                    _log("首次部署，写入配置文件")
 
                 compose_content = self._prepare_compose_content(compose_src)
                 env_content = self._prepare_env(env_src, data_dir, existing_env_content)
@@ -77,37 +111,37 @@ class WSLDeployMixin:
                 )
 
                 if reuse_existing_runtime:
-                    self.log_received.emit("检测到部署配置未变化，本次启动将复用现有容器，不强制重建", "info")
+                    _log("检测到部署配置未变化，本次启动将复用现有容器，不强制重建")
                 elif env_exists == "yes":
-                    self.log_received.emit("检测到部署配置发生变化，将重建 Compose 服务以应用新配置", "info")
+                    _log("检测到部署配置发生变化，将重建 Compose 服务以应用新配置")
 
                 self._write_to_wsl(distro, compose_content, compose_dest)
                 self._write_to_wsl(distro, env_content, env_dest)
 
-                ls_output = self._wsl_exec(distro, f"ls -la {deploy_dir}")
-                self.log_received.emit(f"部署目录内容:\n{ls_output}", "debug")
-                self.log_received.emit("配置文件已部署到 WSL", "info")
+                ls_output = self._wsl_exec(distro, f"ls -la {shlex.quote(deploy_dir)}")
+                _log(f"部署目录内容:\n{ls_output}", "debug")
+                _log("配置文件已部署到 WSL")
 
-                self.log_received.emit("确保 Docker 服务启动...", "info")
+                _log("确保 Docker 服务启动...")
                 self._wsl_exec(distro, "systemctl start docker", timeout=30)
 
                 docker_version = self._wsl_exec(distro, "docker version")
-                self.log_received.emit(f"Docker 版本:\n{docker_version}", "debug")
+                _log(f"Docker 版本:\n{docker_version}", "debug")
 
                 compose_version = self._wsl_exec(distro, "docker compose version")
-                self.log_received.emit(f"Docker Compose 版本: {compose_version}", "debug")
+                _log(f"Docker Compose 版本: {compose_version}", "debug")
 
                 missing = self._get_missing_images(distro, deploy_mode)
                 if missing:
-                    self.log_received.emit(f"检测到 {len(missing)} 个镜像需要拉取...", "info")
+                    _log(f"检测到 {len(missing)} 个镜像需要拉取...")
                     self._emit_pull_progress("start", f"准备拉取 {len(missing)} 个镜像")
                     if not self._pull_images(distro, missing):
                         self.status_changed.emit("启动失败")
                         return
                 else:
-                    self.log_received.emit("所有镜像已就绪", "info")
+                    _log("所有镜像已就绪")
 
-                self.log_received.emit("启动 Docker Compose 服务...", "info")
+                _log("启动 Docker Compose 服务...")
                 self.progress_updated.emit("启动 Compose 服务...")
                 compose_cmd = "docker compose -f docker-compose.yml --env-file .env up -d --remove-orphans"
                 if not reuse_existing_runtime:
@@ -120,7 +154,7 @@ class WSLDeployMixin:
                         "--",
                         "bash",
                         "-c",
-                        f"cd {deploy_dir} && {compose_cmd}",
+                        f"cd {shlex.quote(deploy_dir)} && {compose_cmd}",
                     ],
                     capture_output=True,
                     timeout=120,
@@ -128,49 +162,54 @@ class WSLDeployMixin:
                 )
 
                 if proc.returncode != 0:
-                    self.log_received.emit(f"返回码: {proc.returncode}", "error")
-                    self.log_received.emit(f"部署目录: {deploy_dir}", "error")
-                    self.log_received.emit(f"STDOUT:\n{self._clean_stderr(proc.stdout, 0)}", "error")
-                    self.log_received.emit(f"STDERR:\n{self._clean_stderr(proc.stderr, 0)}", "error")
-                    self.log_received.emit("Compose 启动失败，详见上方日志", "error")
+                    _log(f"返回码: {proc.returncode}", "error")
+                    _log(f"部署目录: {deploy_dir}", "error")
+                    _log(f"STDOUT:\n{self._clean_stderr(proc.stdout, 0)}", "error")
+                    _log(f"STDERR:\n{self._clean_stderr(proc.stderr, 0)}", "error")
+                    _log("Compose 启动失败，详见上方日志", "error")
                     self.status_changed.emit("启动失败")
                     return
 
                 self.is_running = True
-                self.log_received.emit("Compose 服务已启动，等待就绪...", "info")
+                _log("Compose 服务已启动，等待就绪...")
 
                 is_first_deploy = env_exists != "yes"
                 deploy_info = self._parse_deploy_info(env_content, deploy_mode)
+
+                inst_id_cfg = inst_id
+                if self.config:
+                    _, _, inst_name = self._get_active_deploy_paths()
+                    inst_id_cfg = self.config.get_active_instance_id()
+                    if not inst_id_cfg:
+                        inst_id_cfg = self.config.next_instance_id()
+                    if is_first_deploy:
+                        self.config.set_instance(inst_id_cfg, {
+                            "instance_name": inst_name,
+                            "deploy_dir": deploy_dir,
+                            "data_dir": data_dir,
+                            "deploy_mode": deploy_mode,
+                            "nekro_port": self.config.get("nekro_port") or 8021,
+                            "napcat_port": self.config.get("napcat_port") or 6099,
+                            "release_channel": self.config.get("release_channel") or "stable",
+                            "deploy_info": deploy_info,
+                        })
+                        self.config.set("active_instance", inst_id_cfg)
+                    else:
+                        self.config.update_instance(inst_id_cfg, deploy_info=deploy_info)
 
                 if is_first_deploy:
                     if deploy_mode == "napcat":
                         self._pending_deploy_info = deploy_info
                     else:
-                        self._show_deploy_info(deploy_info)
+                        self._show_deploy_info(deploy_info, inst_id=inst_id_cfg)
                 else:
-                    self._refresh_deploy_info(deploy_info)
+                    self._refresh_deploy_info(deploy_info, inst_id=inst_id_cfg)
 
-                if self.config and is_first_deploy:
-                    _, _, inst_name = self._get_active_deploy_paths()
-                    inst_id = self.config.get_active_instance_id()
-                    if not inst_id:
-                        inst_id = self.config.next_instance_id()
-                    self.config.set_instance(inst_id, {
-                        "instance_name": inst_name,
-                        "deploy_dir": deploy_dir,
-                        "data_dir": data_dir,
-                        "deploy_mode": deploy_mode,
-                        "nekro_port": self.config.get("nekro_port") or 8021,
-                        "napcat_port": self.config.get("napcat_port") or 6099,
-                        "release_channel": self.config.get("release_channel") or "stable",
-                        "deploy_info": deploy_info,
-                    })
-                    self.config.set("active_instance", inst_id)
-
-                threading.Thread(target=self._log_reader, args=(distro, deploy_dir), daemon=True).start()
-                threading.Thread(target=self._health_check, daemon=True).start()
+                nekro_port = int(deploy_info.get("port") or 8021)
+                threading.Thread(target=self._log_reader, args=(distro, deploy_dir, log_prefix, inst_id_cfg), daemon=True).start()
+                threading.Thread(target=self._health_check, args=(nekro_port,), daemon=True).start()
             except Exception as e:
-                self.log_received.emit(f"部署失败: {e}", "error")
+                _log(f"部署失败: {e}", "error")
                 self.status_changed.emit("启动失败")
             finally:
                 self._deploying = False
@@ -195,8 +234,14 @@ class WSLDeployMixin:
             self.status_changed.emit("已停止")
             return
 
+        inst_id = ""
+        if self.config:
+            inst_id = self.config.get_active_instance_id() or ""
+        inst_display = inst_id if inst_id and inst_id != "default" else ""
+        log_prefix = f"[{inst_display}] " if inst_display else ""
+
         distro = DISTRO_NAME
-        self.log_received.emit("正在停止服务...", "info")
+        self.log_received.emit(f"{log_prefix}正在停止服务...", "info")
         self.status_changed.emit("停止中...")
 
         def _do_stop():
@@ -206,49 +251,49 @@ class WSLDeployMixin:
                 self.is_running = True
                 self._stop_event.clear()
                 if self._log_process is None or self._log_process.poll() is not None:
-                    threading.Thread(target=self._log_reader, args=(distro, deploy_dir), daemon=True).start()
+                    threading.Thread(target=self._log_reader, args=(distro, deploy_dir, log_prefix, inst_id), daemon=True).start()
 
             try:
+                compose_check = f"test -f {shlex.quote(deploy_dir)}/docker-compose.yml && echo yes"
+                has_compose = False
+                try:
+                    check_result = subprocess.run(
+                        ["wsl", "-d", distro, "--", "bash", "-c", compose_check],
+                        capture_output=True, timeout=10,
+                        creationflags=self._creation_flags(),
+                    )
+                    has_compose = "yes" in (check_result.stdout.decode(errors="replace") if isinstance(check_result.stdout, bytes) else check_result.stdout)
+                except Exception:
+                    pass
 
-                stop_proc = subprocess.run(
-                    ["wsl", "-d", distro, "--", "bash", "-c", f"cd {deploy_dir} && docker compose -f docker-compose.yml stop"],
-                    capture_output=True,
-                    timeout=60,
-                    creationflags=self._creation_flags(),
-                )
-                if stop_proc.returncode != 0:
-                    stderr_text = self._clean_stderr(stop_proc.stderr, 0)
-                    stdout_text = self._clean_command_output(stop_proc.stdout, 0)
-                    detail = stderr_text or stdout_text or f"返回码: {stop_proc.returncode}"
-                    self.log_received.emit(f"停止 Compose 服务失败: {detail}", "error")
-                    _restore_runtime_state()
-                    self.status_changed.emit("停止失败")
-                    return
+                if has_compose:
+                    stop_proc = subprocess.run(
+                        ["wsl", "-d", distro, "--", "bash", "-c", f"cd {shlex.quote(deploy_dir)} && docker compose -f docker-compose.yml stop"],
+                        capture_output=True,
+                        timeout=60,
+                        creationflags=self._creation_flags(),
+                    )
+                    if stop_proc.returncode != 0:
+                        stderr_text = self._clean_stderr(stop_proc.stderr, 0)
+                        stdout_text = self._clean_command_output(stop_proc.stdout, 0)
+                        detail = stderr_text or stdout_text or f"返回码: {stop_proc.returncode}"
+                        self.log_received.emit(f"{log_prefix}停止 Compose 服务失败: {detail}", "error")
+                        _restore_runtime_state()
+                        self.status_changed.emit("停止失败")
+                        return
+                else:
+                    self.log_received.emit(f"{log_prefix}当前实例无 Compose 部署文件，跳过 docker compose stop", "warn")
 
                 self.is_running = False
-                self.log_received.emit("服务已停止", "info")
+                self.log_received.emit(f"{log_prefix}服务已停止", "info")
 
-                self.log_received.emit(f"关闭 {distro} 发行版...", "info")
-                terminate_proc = subprocess.run(
-                    ["wsl", "--terminate", distro],
-                    capture_output=True,
-                    timeout=30,
-                    creationflags=self._creation_flags(),
-                )
-                if terminate_proc.returncode != 0:
-                    stderr_text = self._clean_stderr(terminate_proc.stderr, 0)
-                    stdout_text = self._clean_command_output(terminate_proc.stdout, 0)
-                    detail = stderr_text or stdout_text or f"返回码: {terminate_proc.returncode}"
-                    self.log_received.emit(f"关闭 {distro} 发行版失败，将保留已停止状态: {detail}", "warn")
-                else:
-                    self.log_received.emit(f"{distro} 已关闭", "info")
                 self.status_changed.emit("已停止")
             except subprocess.TimeoutExpired:
-                self.log_received.emit("停止服务超时", "warn")
+                self.log_received.emit(f"{log_prefix}停止服务超时", "warn")
                 _restore_runtime_state()
                 self.status_changed.emit("停止失败")
             except Exception as e:
-                self.log_received.emit(f"停止服务异常: {e}", "error")
+                self.log_received.emit(f"{log_prefix}停止服务异常: {e}", "error")
                 _restore_runtime_state()
                 self.status_changed.emit("停止失败")
 
@@ -276,14 +321,14 @@ class WSLDeployMixin:
                 self.log_received.emit("[卸载] 1/3 停止并删除容器...", "info")
                 self._wsl_exec(
                     distro,
-                    f"cd {deploy_dir} && docker compose -f docker-compose.yml down -v 2>/dev/null; "
+                    f"cd {shlex.quote(deploy_dir)} && docker compose -f docker-compose.yml down -v 2>/dev/null; "
                     "docker system prune -af 2>/dev/null",
                     timeout=120,
                 )
                 self.log_received.emit("[卸载] ✓ 容器已清除", "info")
 
                 self.log_received.emit("[卸载] 2/3 清理部署文件...", "info")
-                self._wsl_exec(distro, f"rm -rf {deploy_dir}")
+                self._wsl_exec(distro, f"rm -rf {shlex.quote(deploy_dir)}")
                 self.log_received.emit("[卸载] ✓ 部署文件已清理", "info")
 
                 self.log_received.emit("[卸载] 3/3 删除 WSL 发行版...", "info")
@@ -313,10 +358,53 @@ class WSLDeployMixin:
 
         threading.Thread(target=_do_uninstall, daemon=True).start()
 
-    def _show_deploy_info(self, info):
+    def remove_single_instance(self, inst_id, inst_data, was_active=False):
+        """移除单个实例：停止其 compose 服务、删除 deploy_dir。保留数据目录。
+        完成后通过 instance_removed 信号通知 UI。"""
+        distro = DISTRO_NAME
+        deploy_dir = inst_data.get("deploy_dir", "")
+        name = inst_data.get("instance_name", "").rstrip("_") or inst_id
+
+        def _do_remove():
+            success = True
+            try:
+                self.log_received.emit(f"[移除 {name}] 1/2 停止并删除容器...", "info")
+                try:
+                    compose_check = f"test -f {shlex.quote(deploy_dir)}/docker-compose.yml && echo yes"
+                    check_result = subprocess.run(
+                        ["wsl", "-d", distro, "--", "bash", "-c", compose_check],
+                        capture_output=True, timeout=10,
+                        creationflags=self._creation_flags(),
+                    )
+                    has_compose = "yes" in (check_result.stdout.decode(errors="replace") if isinstance(check_result.stdout, bytes) else check_result.stdout)
+                except Exception:
+                    has_compose = False
+
+                if has_compose:
+                    self._wsl_exec(
+                        distro,
+                        f"cd {shlex.quote(deploy_dir)} && docker compose -f docker-compose.yml down -v 2>/dev/null",
+                        timeout=60,
+                    )
+                    self.log_received.emit(f"[移除 {name}] ✓ 容器已停止并清除", "info")
+                else:
+                    self.log_received.emit(f"[移除 {name}] 无 Compose 文件，跳过容器清理", "warn")
+
+                self.log_received.emit(f"[移除 {name}] 2/2 清理部署目录...", "info")
+                if deploy_dir:
+                    self._wsl_exec(distro, f"rm -rf {shlex.quote(deploy_dir)}", timeout=30)
+                self.log_received.emit(f"[移除 {name}] ✓ 实例已移除", "info")
+            except Exception as e:
+                self.log_received.emit(f"[移除 {name}] 异常: {e}", "error")
+                success = False
+
+            self.instance_removed.emit(success, inst_id, was_active)
+
+        threading.Thread(target=_do_remove, daemon=True).start()
+
+    def _show_deploy_info(self, info, inst_id=None):
         """保存凭据并发送信号给 UI 弹窗"""
-        if self.config:
-            self.config.set("deploy_info", info)
+        self._save_deploy_info(info, inst_id=inst_id)
 
         self.log_received.emit("=== 部署完成！===", "info")
         self.log_received.emit(f"管理员账号: admin | 密码: {info['admin_password']}", "info")
@@ -324,13 +412,13 @@ class WSLDeployMixin:
 
         self.deploy_info_ready.emit(info)
 
-    def _refresh_deploy_info(self, info):
+    def _refresh_deploy_info(self, info, inst_id=None):
         """非首次启动时静默刷新凭据（不弹窗），防止上次中途退出丢失"""
         if self.config:
             old_info = self.config.get("deploy_info") or {}
             if old_info.get("napcat_token"):
                 info["napcat_token"] = old_info["napcat_token"]
-            self.config.set("deploy_info", info)
+            self._save_deploy_info(info, inst_id=inst_id)
 
     def _parse_deploy_info(self, env_content, deploy_mode):
         """从 .env 内容中解析部署凭据信息"""
@@ -529,7 +617,7 @@ class WSLDeployMixin:
                         "--",
                         "bash",
                         "-c",
-                        f'cd "{deploy_dir}" && docker compose -f docker-compose.yml restart nekro_napcat',
+                        f'cd {shlex.quote(deploy_dir)} && docker compose -f docker-compose.yml restart nekro_napcat',
                     ],
                     capture_output=True,
                     timeout=60,

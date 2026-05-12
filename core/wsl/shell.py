@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import secrets
+import shlex
 import string
 import subprocess
 import sys
@@ -166,7 +167,7 @@ class WSLShellMixin:
     def _write_to_wsl(self, distro, content, wsl_path):
         """将字符串内容写入 WSL 内文件"""
         encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
-        self._wsl_exec_checked(distro, f'echo "{encoded}" | base64 -d > "{wsl_path}"')
+        self._wsl_exec_checked(distro, f'printf %s {shlex.quote(encoded)} | base64 -d > {shlex.quote(wsl_path)}')
 
     @staticmethod
     def _random_token(length=32):

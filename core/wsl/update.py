@@ -71,7 +71,7 @@ class WSLUpdateMixin:
 
         def _exec(cmd, timeout=300):
             proc = subprocess.run(
-                ["wsl", "-d", distro, "--", "bash", "-c", f"cd {deploy_dir} && {cmd}"],
+                ["wsl", "-d", distro, "--", "bash", "-c", f"cd {shlex.quote(deploy_dir)} && {cmd}"],
                 capture_output=True,
                 timeout=timeout,
                 creationflags=self._creation_flags(),
@@ -176,9 +176,13 @@ class WSLUpdateMixin:
 
             self._emit_pull_progress("done", "更新完成")
             self.is_running = True
+            inst_id = self.config.get_active_instance_id() if self.config else ""
+            inst_display = inst_id if inst_id and inst_id != "default" else ""
+            log_prefix = f"[{inst_display}] " if inst_display else ""
+            nekro_port = int(self.config.get("nekro_port") or 8021) if self.config else 8021
             if self._log_process is None or self._log_process.poll() is not None:
-                threading.Thread(target=self._log_reader, args=(distro, deploy_dir), daemon=True).start()
-            threading.Thread(target=self._health_check, daemon=True).start()
+                threading.Thread(target=self._log_reader, args=(distro, deploy_dir, log_prefix, inst_id), daemon=True).start()
+            threading.Thread(target=self._health_check, args=(nekro_port,), daemon=True).start()
             self.update_finished.emit(True, "Nekro Agent 更新完成，正在等待服务重新就绪。")
 
         threading.Thread(target=_do_update, daemon=True).start()
@@ -190,7 +194,7 @@ class WSLUpdateMixin:
 
         def _exec(cmd, timeout=300):
             proc = subprocess.run(
-                ["wsl", "-d", distro, "--", "bash", "-c", f"cd {deploy_dir} && {cmd}"],
+                ["wsl", "-d", distro, "--", "bash", "-c", f"cd {shlex.quote(deploy_dir)} && {cmd}"],
                 capture_output=True,
                 timeout=timeout,
                 creationflags=self._creation_flags(),
@@ -208,7 +212,7 @@ class WSLUpdateMixin:
         def _rewrite_compose_to_preview():
             compose_path = f"{deploy_dir}/docker-compose.yml"
             self._emit_pull_progress("stage", "写入预览版镜像配置")
-            compose_content = self._wsl_exec(distro, f"cat {compose_path}")
+            compose_content = self._wsl_exec(distro, f"cat {shlex.quote(compose_path)}")
             if PREVIEW_IMAGE in compose_content:
                 return True
             if PREVIEW_COMPOSE_IMAGE not in compose_content:
@@ -257,12 +261,18 @@ class WSLUpdateMixin:
 
                 self._emit_pull_progress("done", "预览版切换完成")
                 self.is_running = True
+                inst_id = self.config.get_active_instance_id() if self.config else ""
+                inst_display = inst_id if inst_id and inst_id != "default" else ""
+                log_prefix = f"[{inst_display}] " if inst_display else ""
+                nekro_port = int(self.config.get("nekro_port") or 8021) if self.config else 8021
                 if self.config:
                     self.config.set("release_channel", "preview")
                     self.config.set("preview_backup_available", bool(create_backup))
+                    if inst_id:
+                        self.config.update_instance(inst_id, release_channel="preview")
                 if self._log_process is None or self._log_process.poll() is not None:
-                    threading.Thread(target=self._log_reader, args=(distro, deploy_dir), daemon=True).start()
-                threading.Thread(target=self._health_check, daemon=True).start()
+                    threading.Thread(target=self._log_reader, args=(distro, deploy_dir, log_prefix, inst_id), daemon=True).start()
+                threading.Thread(target=self._health_check, args=(nekro_port,), daemon=True).start()
                 self.update_finished.emit(True, "预览版切换完成，正在等待服务重新就绪。")
             except subprocess.TimeoutExpired:
                 self.status_changed.emit("更新失败")
@@ -280,7 +290,7 @@ class WSLUpdateMixin:
 
         def _exec(cmd, timeout=300):
             proc = subprocess.run(
-                ["wsl", "-d", distro, "--", "bash", "-c", f"cd {deploy_dir} && {cmd}"],
+                ["wsl", "-d", distro, "--", "bash", "-c", f"cd {shlex.quote(deploy_dir)} && {cmd}"],
                 capture_output=True,
                 timeout=timeout,
                 creationflags=self._creation_flags(),
@@ -291,7 +301,7 @@ class WSLUpdateMixin:
         def _rewrite_compose_to_stable():
             compose_path = f"{deploy_dir}/docker-compose.yml"
             self._emit_pull_progress("stage", "写回正式版镜像配置")
-            compose_content = self._wsl_exec(distro, f"cat {compose_path}")
+            compose_content = self._wsl_exec(distro, f"cat {shlex.quote(compose_path)}")
             if STABLE_IMAGE in compose_content and PREVIEW_IMAGE not in compose_content:
                 return True
             if PREVIEW_IMAGE not in compose_content:
@@ -354,12 +364,18 @@ class WSLUpdateMixin:
 
                 self._emit_pull_progress("done", "正式版恢复完成")
                 self.is_running = True
+                inst_id = self.config.get_active_instance_id() if self.config else ""
+                inst_display = inst_id if inst_id and inst_id != "default" else ""
+                log_prefix = f"[{inst_display}] " if inst_display else ""
+                nekro_port = int(self.config.get("nekro_port") or 8021) if self.config else 8021
                 if self.config:
                     self.config.set("release_channel", "stable")
                     self.config.set("preview_backup_available", False)
+                    if inst_id:
+                        self.config.update_instance(inst_id, release_channel="stable")
                 if self._log_process is None or self._log_process.poll() is not None:
-                    threading.Thread(target=self._log_reader, args=(distro, deploy_dir), daemon=True).start()
-                threading.Thread(target=self._health_check, daemon=True).start()
+                    threading.Thread(target=self._log_reader, args=(distro, deploy_dir, log_prefix, inst_id), daemon=True).start()
+                threading.Thread(target=self._health_check, args=(nekro_port,), daemon=True).start()
                 self.update_finished.emit(True, "正式版恢复完成，正在等待服务重新就绪。")
             except subprocess.TimeoutExpired:
                 self.status_changed.emit("更新失败")

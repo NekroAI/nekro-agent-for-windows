@@ -1,8 +1,11 @@
 import json
+import logging
 import os
 import shutil
 import sys
 import threading
+
+logger = logging.getLogger(__name__)
 
 _app_data_dir_cache: str | None = None
 _app_data_dir_lock = threading.Lock()
@@ -122,7 +125,8 @@ class ConfigManager:
                 try:
                     shutil.copy2(src, self.config_path)
                     break
-                except Exception:
+                except Exception as e:
+                    logger.warning("迁移配置文件失败 %s -> %s: %s", src, self.config_path, e)
                     continue
 
         legacy_browser_dirs = [
@@ -137,7 +141,8 @@ class ConfigManager:
                 try:
                     shutil.copytree(src, self.browser_profile_dir)
                     break
-                except Exception:
+                except Exception as e:
+                    logger.warning("迁移浏览器数据失败 %s -> %s: %s", src, self.browser_profile_dir, e)
                     continue
 
     def load_config(self):
@@ -145,7 +150,11 @@ class ConfigManager:
             try:
                 with open(self.config_path, "r", encoding="utf-8") as f:
                     return {**self.default_config, **json.load(f)}
-            except Exception:
+            except json.JSONDecodeError as e:
+                logger.error("配置文件格式错误，将使用默认配置: %s", e)
+                return self.default_config.copy()
+            except Exception as e:
+                logger.error("读取配置文件失败: %s", e)
                 return self.default_config.copy()
         return self.default_config.copy()
 

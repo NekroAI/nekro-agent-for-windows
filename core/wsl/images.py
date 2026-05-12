@@ -1,5 +1,6 @@
 import subprocess
 import threading
+import time
 from urllib.request import Request, urlopen
 
 from core.wsl.constants import DISTRO_NAME, MANAGED_IMAGES_BASE, PREVIEW_IMAGE, REQUIRED_IMAGES_BASE, STABLE_IMAGE
@@ -79,6 +80,8 @@ class WSLImageMixin:
         qualified = f"docker.io/{name}"
         return f"{qualified}:{tag}" if tag else qualified
 
+    _PULL_TIMEOUT = 1800
+
     def _pull_image_once(self, distro, image_ref):
         proc = subprocess.Popen(
             ["wsl", "-d", distro, "--", "docker", "pull", image_ref],
@@ -87,7 +90,12 @@ class WSLImageMixin:
             creationflags=self._creation_flags(),
         )
         last_lines = []
+        deadline = time.monotonic() + self._PULL_TIMEOUT
         while True:
+            if time.monotonic() > deadline:
+                proc.kill()
+                last_lines.append("镜像拉取超时")
+                return False, last_lines
             line = proc.stdout.readline()
             if not line and proc.poll() is not None:
                 break

@@ -8,52 +8,61 @@ from urllib.request import urlopen
 class WSLMonitorMixin:
     _health_generation: int = 0
     _health_lock = threading.Lock()
-    def _log_reader(self, distro, deploy_dir):
+    def _log_reader(self, distro, deploy_dir, log_prefix="", inst_id=""):
         """通过 docker compose logs -f 流式读取日志"""
+        import shlex
         napcat_token_pattern = re.compile(r"WebUi.*token=([a-zA-Z0-9]+)")
+        proc = None
         try:
-            self._log_process = subprocess.Popen(
-                ["wsl", "-d", distro, "--", "bash", "-c", f"cd {deploy_dir} && docker compose -f docker-compose.yml logs -f --tail=50"],
+            quoted_dir = shlex.quote(deploy_dir)
+            proc = subprocess.Popen(
+                ["wsl", "-d", distro, "--", "bash", "-c", f"cd {quoted_dir} && docker compose -f docker-compose.yml logs -f --tail=50"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 creationflags=self._creation_flags(),
             )
+            self._log_process = proc
 
-            for line in iter(self._log_process.stdout.readline, b""):
+            for line in iter(proc.stdout.readline, b""):
                 if self._stop_event.is_set():
                     break
                 text = line.decode("utf-8", errors="ignore").rstrip()
                 if text:
-                    self.log_received.emit(text, "vm")
+                    self.log_received.emit(f"{log_prefix}{text}", "vm")
                     m = napcat_token_pattern.search(text)
                     if m and self.config:
                         token = m.group(1)
                         info = self.config.get("deploy_info") or {}
                         if info.get("napcat_token") != token:
                             info["napcat_token"] = token
-                            self.config.set("deploy_info", info)
-                            self.log_received.emit(f"[NapCat] 已捕获 WebUI Token: {token}", "info")
+                            self._save_deploy_info(info, inst_id=inst_id)
+                            self.log_received.emit(f"{log_prefix}[NapCat] 已捕获 WebUI Token: {token}", "info")
                             if self._pending_deploy_info:
                                 self._pending_deploy_info["napcat_token"] = token
-                                self._show_deploy_info(self._pending_deploy_info)
+                                self._show_deploy_info(self._pending_deploy_info, inst_id=inst_id)
                                 self._pending_deploy_info = None
         except Exception as e:
             if not self._stop_event.is_set():
-                self.log_received.emit(f"日志读取异常: {e}", "debug")
+                self.log_received.emit(f"{log_prefix}日志读取异常: {e}", "debug")
         finally:
-            if self._log_process and self._log_process.poll() is None:
+            if proc and proc.poll() is None:
                 try:
-                    self._log_process.terminate()
+                    proc.terminate()
                 except Exception:
                     pass
+            if self._log_process is proc:
+                self._log_process = None
 
-    def _health_check(self):
+    def _health_check(self, nekro_port=None):
         """轮询 Nekro Agent 服务直到返回 200，自动取消前一轮检查"""
         with self._health_lock:
             self._health_generation += 1
             my_gen = self._health_generation
 
-        nekro_port = self.config.get("nekro_port") or 8021
+        if nekro_port is None:
+            nekro_port = 8021
+            if self.config:
+                nekro_port = self.config.get("nekro_port") or 8021
         timeout = 300
         start = time.time()
         interval = 2.0

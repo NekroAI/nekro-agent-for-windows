@@ -45,15 +45,17 @@ class WSLDiscoveryMixin:
                 self.log_received.emit(f"[实例扫描] 扫描 {distro} 时异常: {e}", "debug")
         return instances
 
-    def takeover_instance(self, instance: dict) -> bool:
+    def takeover_instance(self, instance: dict, on_step=None) -> bool:
         """将发现的实例接管到本启动器管理。
+
+        on_step: 可选回调 (step_index: int, total: int, desc: str) -> None
 
         场景 A（is_managed=True）：直接读取 .env 写入 config，无需迁移。
         场景 B（is_managed=False）：迁移数据到 NekroAgent 发行版后接管。
         """
         if instance.get("is_managed"):
-            return self._takeover_managed(instance)
-        return self._takeover_foreign(instance)
+            return self._takeover_managed(instance, on_step=on_step)
+        return self._takeover_foreign(instance, on_step=on_step)
 
     # ------------------------------------------------------------------ #
     # 扫描内部实现
@@ -178,8 +180,8 @@ class WSLDiscoveryMixin:
         try:
             result = self._wsl_exec(
                 distro,
-                "find /root /home /opt -maxdepth 4 -name 'docker-compose.yml' 2>/dev/null"
-                " | xargs grep -l 'nekro' 2>/dev/null",
+                "find /root /home /opt -maxdepth 4 -name 'docker-compose.yml' -print0 2>/dev/null"
+                " | xargs -0 grep -l 'nekro' 2>/dev/null",
                 user="root",
             )
             dirs = []
@@ -233,8 +235,10 @@ class WSLDiscoveryMixin:
     # 接管：场景 A（NekroAgent 发行版内的实例）
     # ------------------------------------------------------------------ #
 
-    def _takeover_managed(self, instance: dict) -> bool:
+    def _takeover_managed(self, instance: dict, on_step=None) -> bool:
         """接管已在 NekroAgent 发行版内的实例（无需迁移，仅同步 config）。"""
+        if on_step:
+            on_step(1, 1, "同步配置...")
         self.progress_updated.emit("正在接管已有实例...")
         self.log_received.emit("[接管] 场景A：接管 NekroAgent 发行版内的实例", "info")
 
@@ -249,11 +253,20 @@ class WSLDiscoveryMixin:
     # 接管：场景 B（其他发行版内的实例 → 迁移到 NekroAgent 发行版）
     # ------------------------------------------------------------------ #
 
-    def _takeover_foreign(self, instance: dict) -> bool:
+    _FOREIGN_TOTAL_STEPS = 7
+
+    def _takeover_foreign(self, instance: dict, on_step=None) -> bool:
         """将其他 WSL 发行版中的 nekro-agent 数据迁移到 NekroAgent 发行版。"""
         src_distro = instance["distro"]
         deploy_dir = instance["deploy_dir"]
         data_dir = instance["data_dir"]
+        total = self._FOREIGN_TOTAL_STEPS
+
+        def _step(idx, desc):
+            self.log_received.emit(f"[接管] {idx}/{total} {desc}", "info")
+            self.progress_updated.emit(desc)
+            if on_step:
+                on_step(idx, total, desc)
 
         self.log_received.emit(f"[接管] 场景B：从 {src_distro} 迁移到 {DISTRO_NAME}", "info")
 
@@ -263,10 +276,9 @@ class WSLDiscoveryMixin:
             self.progress_updated.emit("__need_create_runtime__")
             return False
 
-        # 2. 停止源实例（避免数据不一致，仅在运行中时尝试）
-        self.log_received.emit("[接管] 1/6 停止源实例容器...", "info")
+        # 2. 停止源实例
+        _step(1, "停止源实例容器...")
         if instance.get("status") == "running":
-            self.progress_updated.emit("正在停止源实例容器...")
             stop_ok = self._stop_source_instance(src_distro, deploy_dir)
             if not stop_ok:
                 self.log_received.emit("[接管] ⚠ 源实例停止失败，将继续迁移（数据可能不完整）", "warn")
@@ -274,50 +286,81 @@ class WSLDiscoveryMixin:
             self.log_received.emit("[接管] 源实例未运行，跳过停止步骤", "debug")
 
         # 3. 迁移镜像（docker save → docker load，跳过拉取）
-        self.progress_updated.emit("正在迁移 Docker 镜像...")
-        self.log_received.emit("[接管] 2/6 迁移 Docker 镜像...", "info")
-        self._migrate_images(src_distro)
+        _step(2, "迁移 Docker 镜像...")
+        images_ok = self._migrate_images(src_distro)
+        if not images_ok:
+            self.log_received.emit(
+                "[接管] ⚠ 镜像迁移未完成，后续首次启动将需要联网拉取镜像",
+                "warn",
+            )
 
-        # 4. 打包数据到共享目录
-        self.progress_updated.emit("正在打包源实例数据...")
-        self.log_received.emit("[接管] 3/6 打包数据...", "info")
+        # 4. 打包数据到共享目录（包含 deploy_dir + data_dir + volumes）
+        _step(3, "打包源实例数据...")
         archive_path = "/mnt/wsl/na_migrate.tar.gz"
-        if not self._pack_source_data(src_distro, data_dir, archive_path, instance):
-            # 降级：尝试通过 Windows 临时目录中转
+        if not self._pack_source_data(src_distro, deploy_dir, data_dir, archive_path, instance):
             self.log_received.emit("[接管] /mnt/wsl 不可用，尝试 Windows 临时目录中转...", "warn")
-            archive_path = self._pack_via_windows_temp(src_distro, data_dir, instance)
+            archive_path = self._pack_via_windows_temp(src_distro, deploy_dir, data_dir, instance)
             if not archive_path:
                 self.log_received.emit("[接管] ✗ 数据打包失败", "error")
                 return False
 
-        # 5. 在 NekroAgent 发行版中解压
-        self.progress_updated.emit("正在还原数据到目标环境...")
-        self.log_received.emit("[接管] 4/6 还原数据...", "info")
+        # 5. 计算目标路径（保留源 INSTANCE_NAME 以确保 volume 名称一致）
+        instance_name = instance.get("instance_name") or instance.get("env", {}).get("INSTANCE_NAME", "")
+        if instance_name and not instance_name.endswith("_"):
+            instance_name += "_"
+        dest_deploy_dir = f"/root/{instance_name}nekro_agent" if instance_name else "/root/nekro_agent"
+        dest_data_dir = f"/root/{instance_name}nekro_agent_data" if instance_name else "/root/nekro_agent_data"
+
+        # 6. 在 NekroAgent 发行版中解压（Docker daemon 尚未启动，避免 metadata 冲突）
+        _step(4, "还原数据到目标环境...")
         if not self._restore_data(archive_path):
             self.log_received.emit("[接管] ✗ 数据还原失败", "error")
             return False
 
-        # 6. 清理临时文件
-        self.log_received.emit("[接管] 5/6 清理临时文件...", "info")
+        # 7. 将解压出的数据移动到 /root 下的标准路径
+        _step(5, "整理目录结构...")
+        self._relocate_dir(data_dir, dest_data_dir, timeout=300)
+        self._relocate_dir(deploy_dir, dest_deploy_dir)
+
+        # 8. 清理临时文件
+        _step(6, "清理临时文件...")
         self._cleanup_archive(src_distro, archive_path)
 
-        # 7. 写入 .env 到目标发行版，保留原始凭据供 start_services 复用
-        self.log_received.emit("[接管] 6/6 写入配置并同步...", "info")
+        # 9. 写入 .env 到目标发行版，保留原始凭据但修正数据目录路径
+        _step(7, "写入配置并同步...")
         raw_env = instance.get("raw_env", "")
         if raw_env:
-            dest_deploy_dir = deploy_dir if deploy_dir.startswith("/root") else "/root/nekro_agent"
+            fixed_env = self._rewrite_env_data_dir(raw_env, dest_data_dir)
             self._wsl_exec(DISTRO_NAME, f"mkdir -p {dest_deploy_dir}", user="root")
-            self._write_to_wsl(DISTRO_NAME, raw_env, f"{dest_deploy_dir}/.env")
-            self.log_received.emit("[接管] ✓ 原始 .env 已写入目标发行版", "info")
+            self._write_to_wsl(DISTRO_NAME, fixed_env, f"{dest_deploy_dir}/.env")
+            self.log_received.emit("[接管] ✓ 原始 .env 已写入目标发行版（数据目录已修正）", "info")
         else:
             self.log_received.emit("[接管] ⚠ 未获取到原始 .env，凭据将在首次启动时重新生成", "warn")
 
         env = instance["env"]
-        self._sync_config_from_env(env, instance["deploy_mode"], instance.get("agent_image", ""), instance)
+        normalized_instance = {**instance, "deploy_dir": dest_deploy_dir, "data_dir": dest_data_dir}
+        self._sync_config_from_env(env, instance["deploy_mode"], instance.get("agent_image", ""), normalized_instance)
 
         self.log_received.emit("[接管] ✓ 迁移完成，启动器接管", "info")
         self.progress_updated.emit("迁移完成！")
         return True
+
+    def _relocate_dir(self, src, dest, timeout=120):
+        """将 src 目录移动到 dest（同路径则跳过），优先 mv 快速重命名。"""
+        if src == dest:
+            return
+        self.log_received.emit(f"[接管] 移动目录: {src} → {dest}", "info")
+        self._wsl_exec(DISTRO_NAME, f'mkdir -p "$(dirname {dest})"', user="root")
+        proc = self._wsl_run(DISTRO_NAME, f'mv -T "{src}" "{dest}" 2>/dev/null', timeout=timeout, user="root")
+        if proc.returncode != 0:
+            self._wsl_exec(DISTRO_NAME, f'mkdir -p "{dest}"', user="root")
+            mv_result = self._wsl_run(
+                DISTRO_NAME, f'cp -a "{src}/." "{dest}/" && rm -rf "{src}"',
+                timeout=timeout, user="root",
+            )
+            if mv_result.returncode != 0:
+                err = self._clean_command_output(self._safe_decode(mv_result.stderr))
+                self.log_received.emit(f"[接管] ⚠ 目录移动失败: {err}", "warn")
 
     def _stop_source_instance(self, distro: str, deploy_dir: str) -> bool:
         """停止源发行版中的 nekro-agent 容器，兼容新版插件式和旧版独立 docker-compose。"""
@@ -345,14 +388,13 @@ class WSLDiscoveryMixin:
             self.log_received.emit(f"[接管] 停止源实例异常: {e}", "debug")
             return False
 
-    def _migrate_images(self, src_distro: str):
+    def _migrate_images(self, src_distro: str) -> bool:
         """将源发行版中的 nekro/napcat/postgres/qdrant 镜像通过 /mnt/wsl 导入到 NekroAgent 发行版。
 
-        使用 docker save | gzip 管道直接写入共享路径，避免重复拉取镜像，节省带宽和时间。
-        失败时静默跳过（后续 start_deploy 会按需拉取缺失镜像）。
+        返回 True 表示镜像迁移成功（或无需迁移），False 表示失败（后续需联网拉取）。
+        不会中断接管流程：start_services 会按需拉取缺失镜像。
         """
         try:
-            # 收集源发行版中与 nekro-agent 相关的镜像
             images_raw = self._wsl_exec(
                 src_distro,
                 "docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null",
@@ -365,52 +407,49 @@ class WSLDiscoveryMixin:
             ]
             if not images:
                 self.log_received.emit("[接管] 源发行版中未发现相关镜像，跳过镜像迁移", "debug")
-                return
+                return True
 
             self.log_received.emit(f"[接管] 待迁移镜像: {images}", "info")
 
-            # 确认 /mnt/wsl 可写
             check = self._wsl_exec(src_distro, "test -d /mnt/wsl && echo yes", user="root")
             if check.strip() != "yes":
                 self.log_received.emit("[接管] /mnt/wsl 不可用，跳过镜像迁移", "warn")
-                return
+                return False
 
             image_archive = "/mnt/wsl/na_images.tar.gz"
             image_list = " ".join(f'"{img}"' for img in images)
-            save_cmd = f"docker save {image_list} | gzip > {image_archive} 2>/dev/null; echo done"
-            result = self._wsl_exec(src_distro, save_cmd, timeout=600, user="root")
-            if "done" not in result:
+            save_cmd = f"docker save {image_list} | gzip > {image_archive}"
+            save_proc = self._wsl_run(src_distro, save_cmd, timeout=600, user="root")
+            if save_proc.returncode != 0:
                 self.log_received.emit("[接管] 镜像导出失败，跳过镜像迁移", "warn")
-                return
+                return False
 
             verify = self._wsl_exec(src_distro, f'test -f "{image_archive}" && echo yes', user="root")
             if verify.strip() != "yes":
                 self.log_received.emit("[接管] 镜像包未生成，跳过镜像迁移", "warn")
-                return
+                return False
 
-            # 在 NekroAgent 发行版中启动 Docker daemon 并导入
-            self._wsl_exec(DISTRO_NAME, "systemctl start docker", timeout=30, user="root")
-            time.sleep(2)
-            load_cmd = f"gzip -dc {image_archive} | docker load 2>/dev/null; echo done"
-            load_result = self._wsl_exec(DISTRO_NAME, load_cmd, timeout=600, user="root")
-            if "done" in load_result:
+            load_cmd = f"gzip -dc {image_archive} | docker load"
+            load_proc = self._wsl_run(DISTRO_NAME, load_cmd, timeout=600, user="root")
+            ok = load_proc.returncode == 0
+            if ok:
                 self.log_received.emit("[接管] ✓ 镜像迁移完成", "info")
             else:
                 self.log_received.emit("[接管] ⚠ 镜像导入可能未完成", "warn")
 
-            # 清理镜像包
             self._wsl_exec(src_distro, f'rm -f "{image_archive}" 2>/dev/null', user="root")
             self._wsl_exec(DISTRO_NAME, f'rm -f "{image_archive}" 2>/dev/null', user="root")
+            return ok
         except Exception as e:
-            self.log_received.emit(f"[接管] 镜像迁移异常（已跳过）: {e}", "warn")
+            self.log_received.emit(f"[接管] 镜像迁移异常: {e}", "warn")
+            return False
 
-    def _pack_source_data(self, src_distro: str, data_dir: str, archive_path: str, instance: dict) -> bool:
+    def _pack_source_data(self, src_distro: str, deploy_dir: str, data_dir: str, archive_path: str, instance: dict) -> bool:
         """在源发行版中以 root 打包数据到 /mnt/wsl 共享路径。
 
-        /var/lib/docker/volumes/ 只有 root 可读，必须用 root 执行 tar。
+        打包内容：deploy_dir（含 docker-compose.yml, .env）、data_dir、相关 docker volumes。
         """
         try:
-            # 确保 /mnt/wsl 可写（以 root 检测）
             check = self._wsl_exec(src_distro, "test -d /mnt/wsl && echo yes", user="root")
             if check.strip() != "yes":
                 return False
@@ -421,13 +460,14 @@ class WSLDiscoveryMixin:
 
             pack_cmd = (
                 f'tar --ignore-failed-read -czf "{archive_path}" '
+                f'"{deploy_dir}" '
                 f'"{data_dir}" '
                 f'"/var/lib/docker/volumes/{postgres_vol}" '
                 f'"/var/lib/docker/volumes/{qdrant_vol}" '
-                f'2>/dev/null; echo done'
+                f'2>/dev/null'
             )
-            result = self._wsl_exec(src_distro, pack_cmd, timeout=300, user="root")
-            if "done" not in result:
+            proc = self._wsl_run(src_distro, pack_cmd, timeout=300, user="root")
+            if proc.returncode != 0 and proc.returncode != 1:
                 return False
 
             verify = self._wsl_exec(src_distro, f'test -f "{archive_path}" && echo yes', user="root")
@@ -436,7 +476,7 @@ class WSLDiscoveryMixin:
             self.log_received.emit(f"[接管] 打包异常: {e}", "debug")
             return False
 
-    def _pack_via_windows_temp(self, src_distro: str, data_dir: str, instance: dict) -> str:
+    def _pack_via_windows_temp(self, src_distro: str, deploy_dir: str, data_dir: str, instance: dict) -> str:
         """通过 Windows %TEMP% 目录作为中转，全程以 root 执行，失败返回空串。"""
         import tempfile
         try:
@@ -458,20 +498,20 @@ class WSLDiscoveryMixin:
 
             pack_cmd = (
                 f'tar --ignore-failed-read -czf "{archive_wsl_src}" '
+                f'"{deploy_dir}" '
                 f'"{data_dir}" '
                 f'"/var/lib/docker/volumes/{postgres_vol}" '
                 f'"/var/lib/docker/volumes/{qdrant_vol}" '
-                f'2>/dev/null; echo done'
+                f'2>/dev/null'
             )
-            result = self._wsl_exec(src_distro, pack_cmd, timeout=300, user="root")
-            if "done" not in result:
+            proc = self._wsl_run(src_distro, pack_cmd, timeout=300, user="root")
+            if proc.returncode != 0 and proc.returncode != 1:
                 return ""
 
             verify = self._wsl_exec(src_distro, f'test -f "{archive_wsl_src}" && echo yes', user="root")
             if verify.strip() != "yes":
                 return ""
 
-            # 将 Windows 路径转换为 NekroAgent 发行版内的挂载路径
             archive_wsl_dst = self._wsl_exec(
                 DISTRO_NAME,
                 f'wslpath "{archive_win.replace(chr(92), "/")}"',
@@ -485,16 +525,18 @@ class WSLDiscoveryMixin:
     def _restore_data(self, archive_path: str) -> bool:
         """在 NekroAgent 发行版中以 root 解压迁移包。
 
-        必须在 Docker daemon 启动前解压，否则 daemon 会以空的 metadata.db 初始化，
-        后续 compose 创建 volume 时绕过已有的目录数据，导致数据库内容丢失。
+        确保 Docker daemon 已停止再解压，避免 daemon 内部 metadata 与磁盘目录不一致。
+        解压完毕后启动 Docker daemon，让它重新扫描 volumes 目录注册已有 volume。
         """
         try:
-            restore_cmd = f'tar --ignore-failed-read -xzf "{archive_path}" -C / 2>/dev/null; echo done'
-            result = self._wsl_exec(DISTRO_NAME, restore_cmd, timeout=300, user="root")
-            if "done" not in result:
+            self._wsl_exec(DISTRO_NAME, "systemctl stop docker 2>/dev/null || true", timeout=20, user="root")
+
+            restore_cmd = f'tar --ignore-failed-read -xzf "{archive_path}" -C / 2>/dev/null'
+            proc = self._wsl_run(DISTRO_NAME, restore_cmd, timeout=300, user="root")
+            if proc.returncode != 0 and proc.returncode != 1:
                 return False
-            # 解压完毕后 restart Docker daemon，让它重新扫描 volumes 目录注册已有 volume
-            self._wsl_exec(DISTRO_NAME, "systemctl restart docker", timeout=30, user="root")
+
+            self._wsl_exec(DISTRO_NAME, "systemctl start docker", timeout=30, user="root")
             time.sleep(2)
             return True
         except Exception as e:
@@ -512,6 +554,18 @@ class WSLDiscoveryMixin:
     # ------------------------------------------------------------------ #
     # 公共工具
     # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _rewrite_env_data_dir(raw_env: str, new_data_dir: str) -> str:
+        """将 .env 内容中的 NEKRO_DATA_DIR 替换为目标路径。"""
+        lines = []
+        for line in raw_env.splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#") and stripped.startswith("NEKRO_DATA_DIR="):
+                lines.append(f"NEKRO_DATA_DIR={new_data_dir}")
+            else:
+                lines.append(line)
+        return "\n".join(lines) + "\n"
 
     def _sync_config_from_env(self, env: dict, deploy_mode: str, agent_image: str = "", instance: dict | None = None):
         """将从 .env 读取的凭据写入 config 和 deploy_info，同时注册到多实例配置。"""
