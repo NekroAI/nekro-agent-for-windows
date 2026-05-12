@@ -648,7 +648,7 @@ class FirstRunDialog(QDialog):
     def _init_deploy_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setSpacing(18)
+        layout.setSpacing(12)
 
         title = QLabel("部署服务")
         title.setObjectName("WizardTitle")
@@ -660,10 +660,6 @@ class FirstRunDialog(QDialog):
         desc.setWordWrap(True)
         layout.addWidget(desc)
 
-        self.deploy_progress = create_install_progress_bar(0, 100, height=8, radius=4)
-        self.deploy_progress.setValue(0)
-        layout.addWidget(self.deploy_progress)
-
         self.deploy_status_label = QLabel("准备开始部署...")
         self.deploy_status_label.setObjectName("WizardDesc")
         self.deploy_status_label.setWordWrap(True)
@@ -673,10 +669,12 @@ class FirstRunDialog(QDialog):
         self.deploy_detail_label.setObjectName("WizardHint")
         self.deploy_detail_label.setWordWrap(True)
         self.deploy_detail_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.deploy_detail_label.setVisible(False)
         layout.addWidget(self.deploy_detail_label)
 
         self.deploy_pull_view = PullProgressView(self)
         layout.addWidget(self.deploy_pull_view)
+        layout.setSpacing(10)
 
         self.deploy_step_order = ["config", "docker", "images", "optional", "cc_sandbox", "compose", "health"]
         self.deploy_steps = {
@@ -821,10 +819,9 @@ class FirstRunDialog(QDialog):
 
     def _start_deploy_progress(self):
         self._goto_page("deploy")
-        self.deploy_progress.setRange(0, 100)
-        self.deploy_progress.setValue(0)
         self.deploy_status_label.setText("正在启动部署流程...")
         self.deploy_detail_label.clear()
+        self.deploy_detail_label.setVisible(False)
         self._clear_pull_progress()
         for key in self.deploy_step_order:
             self._set_deploy_step(key, "pending")
@@ -892,7 +889,8 @@ class FirstRunDialog(QDialog):
             for done_key in self.deploy_step_order[:index]:
                 self._set_deploy_step(done_key, "done")
             self._set_deploy_step(key, "running", message)
-            self.deploy_progress.setValue(min(95, index * 20 + 8))
+        if key not in {"images", "cc_sandbox"}:
+            self._clear_pull_progress()
         if message:
             self.deploy_status_label.setText(message)
 
@@ -902,16 +900,17 @@ class FirstRunDialog(QDialog):
         if status == "运行中":
             for key in self.deploy_step_order:
                 self._set_deploy_step(key, "done")
-            self.deploy_progress.setValue(100)
+            self._clear_pull_progress()
             self.deploy_status_label.setText("部署完成，服务已就绪。")
             self.deploy_detail_label.setText("可以开始使用 Nekro Agent。")
+            self.deploy_detail_label.setVisible(True)
             self.btn_deploy_done.setText("完成")
             self.btn_deploy_done.setEnabled(True)
             QTimer.singleShot(800, self.accept)
         elif status == "启动失败":
-            self.deploy_progress.setValue(max(1, self.deploy_progress.value()))
             self.deploy_status_label.setText("部署失败，请查看日志详情后重试。")
             self.deploy_detail_label.setText("详细错误仍会记录到主窗口日志页。")
+            self.deploy_detail_label.setVisible(True)
             for key in reversed(self.deploy_step_order):
                 label = self.deploy_steps.get(key)
                 if label and label.property("state") == "pending" and "—" in label.text():
@@ -937,14 +936,22 @@ class FirstRunDialog(QDialog):
                     self.deploy_pull_view.start(message)
                     self._set_deploy_stage("images", message)
                 elif phase == "stage":
-                    self.deploy_pull_view.begin_stage(message)
-                    self._set_deploy_stage("images", message)
+                    current = 0
+                    total = 0
+                    stage_message = message
+                    meta_match = re.match(r"^(\d+)/(\d+)\|(.+)$", message)
+                    if meta_match:
+                        current = int(meta_match.group(1))
+                        total = int(meta_match.group(2))
+                        stage_message = meta_match.group(3)
+                    self.deploy_pull_view.begin_stage(stage_message, current, total)
+                    self._set_deploy_stage("images", stage_message)
                 elif phase == "update":
                     self.deploy_pull_view.update(detail=message)
                 elif phase == "done":
                     self.deploy_pull_view.finish(message)
+                    QTimer.singleShot(500, self._clear_pull_progress)
                     self._set_deploy_step("images", "done")
-                    self.deploy_progress.setValue(max(self.deploy_progress.value(), 60))
                 elif phase == "error":
                     self._set_deploy_step("images", "fail", "镜像拉取失败")
                     self.deploy_pull_view.fail("镜像拉取失败，请查看主窗口日志。")
@@ -962,7 +969,7 @@ class FirstRunDialog(QDialog):
                             self._set_deploy_step(key, "done", "已跳过")
                         else:
                             self._set_deploy_step(key, "done")
-                    self.deploy_progress.setValue(100)
+                    self._clear_pull_progress()
                     self.deploy_status_label.setText(message)
                 else:
                     self._set_deploy_stage(stage, message)
