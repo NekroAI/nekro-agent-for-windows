@@ -1,6 +1,9 @@
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QPoint, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
-from PyQt6.QtWidgets import QComboBox, QDialog, QFrame, QHBoxLayout, QLabel, QListView, QProgressBar, QPushButton, QSizePolicy, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import (
+    QDialog, QFrame, QHBoxLayout, QLabel, QProgressBar, QPushButton,
+    QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
+)
 
 from ui.styles import STYLESHEET
 
@@ -167,6 +170,8 @@ class UpdateProgressDialog(QDialog):
         self.action_button.clicked.connect(self._handle_action)
         button_row.addWidget(self.action_button)
 
+        layout.addLayout(button_row)
+
     def _schedule_resize(self):
         QTimer.singleShot(0, self._refresh_size)
 
@@ -320,17 +325,233 @@ class ActionButton(QPushButton):
         self.setMinimumHeight(int(self._base_min_height * scale))
 
 
-class StyledComboBox(QComboBox):
+class _DropdownPopup(QFrame):
+    """浮动弹出菜单，用于 StyledComboBox 的选项列表。"""
+    item_clicked = pyqtSignal(int)
+
+    def __init__(self, parent_btn):
+        super().__init__(None)
+        self._parent_btn = parent_btn
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.NoDropShadowWindowHint
+        )
+        self.setObjectName("DropdownPopup")
+        self.setStyleSheet("""
+            #DropdownPopup {
+                background: #ffffff;
+                border: 1px solid #d7e2ec;
+                border-radius: 8px;
+            }
+            #DropdownItem {
+                padding: 8px 14px;
+                font-size: 13px;
+                color: #264057;
+                border-radius: 6px;
+                border: none;
+                background: transparent;
+                text-align: left;
+            }
+            #DropdownItem:hover {
+                background: #fff0ed;
+                color: #c46b62;
+            }
+            #DropdownItem[selected="true"] {
+                background: #fff5f3;
+                color: #bf655d;
+                font-weight: 600;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(2)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        layout.addWidget(self._scroll)
+
+        self._item_container = QWidget()
+        self._item_container.setStyleSheet("background: transparent;")
+        self._item_layout = QVBoxLayout(self._item_container)
+        self._item_layout.setContentsMargins(0, 0, 0, 0)
+        self._item_layout.setSpacing(2)
+        self._scroll.setWidget(self._item_container)
+
+        self._buttons: list[QPushButton] = []
+
+    def rebuild(self, items: list[tuple[str, object]], selected_index: int):
+        for btn in self._buttons:
+            btn.deleteLater()
+        self._buttons.clear()
+
+        for i, (text, _data) in enumerate(items):
+            btn = QPushButton(text)
+            btn.setObjectName("DropdownItem")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setProperty("selected", "true" if i == selected_index else "false")
+            btn.setFixedHeight(34)
+            btn.setStyleSheet(btn.styleSheet())
+            idx = i
+            btn.clicked.connect(lambda _checked=False, ii=idx: self._on_click(ii))
+            self._item_layout.addWidget(btn)
+            self._buttons.append(btn)
+
+        count = len(items)
+        visible = min(count, 8)
+        item_h = 34 + 2
+        popup_h = visible * item_h + 12
+        btn_w = self._parent_btn.width()
+        self.setFixedWidth(max(btn_w, 160))
+        self.setFixedHeight(min(popup_h, 320))
+
+    def _on_click(self, index):
+        self.item_clicked.emit(index)
+        self.close()
+
+    def show_below(self, ref_widget):
+        pos = ref_widget.mapToGlobal(QPoint(0, ref_widget.height() + 4))
+        self.move(pos)
+        self.show()
+
+    def focusOutEvent(self, event):
+        self.close()
+        super().focusOutEvent(event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.activateWindow()
+        self.setFocus()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.close()
+        super().keyPressEvent(event)
+
+
+class StyledComboBox(QWidget):
+    """自绘下拉框，不依赖 QComboBox，避免平台样式问题。"""
+    currentIndexChanged = pyqtSignal(int)
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setObjectName("FieldSelect")
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setMinimumHeight(38)
+        self._items: list[tuple[str, object]] = []
+        self._current = -1
+        self._signals_blocked = False
 
-        popup_view = QListView(self)
-        popup_view.setObjectName("FieldSelectPopup")
-        popup_view.setFrameShape(QFrame.Shape.NoFrame)
-        self.setView(popup_view)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self._btn = QPushButton("")
+        self._btn.setObjectName("DropdownTrigger")
+        self._btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn.setMinimumHeight(38)
+        self._btn.setStyleSheet("""
+            QPushButton#DropdownTrigger {
+                background: #ffffff;
+                border: 1px solid #d7e2ec;
+                border-radius: 8px;
+                padding: 8px 32px 8px 12px;
+                font-size: 13px;
+                color: #264057;
+                text-align: left;
+            }
+            QPushButton#DropdownTrigger:hover {
+                border-color: #8fc5dd;
+            }
+        """)
+        self._btn.clicked.connect(self._toggle_popup)
+        layout.addWidget(self._btn)
+
+        self._arrow = QLabel("▾")
+        self._arrow.setFixedSize(28, 38)
+        self._arrow.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._arrow.setStyleSheet(
+            "color: #7B90A3; font-size: 14px; background: transparent; border: none;"
+        )
+        self._arrow.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._arrow.setParent(self._btn)
+
+        self._popup: _DropdownPopup | None = None
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._arrow.move(self._btn.width() - 28, 0)
+        self._arrow.setFixedHeight(self._btn.height())
+
+    def _toggle_popup(self):
+        if self._popup and self._popup.isVisible():
+            self._popup.close()
+            return
+        if not self._items:
+            return
+        self._popup = _DropdownPopup(self._btn)
+        self._popup.item_clicked.connect(self._on_popup_item)
+        self._popup.rebuild(self._items, self._current)
+        self._popup.show_below(self._btn)
+
+    def _on_popup_item(self, index):
+        if index == self._current:
+            return
+        self._current = index
+        self._btn.setText(self._items[index][0] if 0 <= index < len(self._items) else "")
+        if not self._signals_blocked:
+            self.currentIndexChanged.emit(index)
+
+    def addItem(self, text: str, data=None):
+        self._items.append((text, data))
+        if self._current < 0:
+            self._current = 0
+            self._btn.setText(text)
+
+    def clear(self):
+        self._items.clear()
+        self._current = -1
+        self._btn.setText("")
+
+    def setCurrentIndex(self, index):
+        if 0 <= index < len(self._items):
+            self._current = index
+            self._btn.setText(self._items[index][0])
+
+    def currentIndex(self):
+        return self._current
+
+    def itemData(self, index):
+        if 0 <= index < len(self._items):
+            return self._items[index][1]
+        return None
+
+    def findData(self, data):
+        for i, (_, d) in enumerate(self._items):
+            if d == data:
+                return i
+        return -1
+
+    def count(self):
+        return len(self._items)
+
+    def setMinimumWidth(self, w):
+        super().setMinimumWidth(w)
+        self._btn.setMinimumWidth(w)
+
+    def blockSignals(self, block):
+        self._signals_blocked = block
+
+    def currentText(self):
+        if 0 <= self._current < len(self._items):
+            return self._items[self._current][0]
+        return ""
+
+    def currentData(self):
+        if 0 <= self._current < len(self._items):
+            return self._items[self._current][1]
+        return None
 
 
 class MetricCard(QFrame):

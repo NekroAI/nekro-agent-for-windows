@@ -96,12 +96,6 @@ class SettingsPage(QWidget):
         if inst_id == current:
             return
 
-        if self.w.backend.is_running:
-            from ui.widgets import show_notice_dialog
-            show_notice_dialog(self.w, "提示", "请先停止当前实例的服务后再切换。")
-            self._refresh_instance_combo()
-            return
-
         inst = self.w.config.get_instance(inst_id)
         if not inst:
             return
@@ -113,6 +107,7 @@ class SettingsPage(QWidget):
         self.w.config.set("release_channel", inst.get("release_channel", "stable"))
         self.w.config.set("deploy_info", inst.get("deploy_info"))
 
+        self.w._switch_log_reader_to_active_instance()
         self._refresh_instance_info()
         self.w.refresh_dashboard()
 

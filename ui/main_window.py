@@ -230,6 +230,7 @@ class MainWindow(QMainWindow):
         self.backend.image_pull_result.connect(self._on_image_pull_result)
         self.backend.update_optional_confirm.connect(self._on_update_optional_confirm)
         self.backend.update_finished.connect(self._on_update_finished)
+        self.backend.instance_removed.connect(self._on_remove_instance_done)
 
         if self._splash:
             self.backend.status_changed.connect(self._splash.on_status_changed)
@@ -1145,9 +1146,9 @@ class MainWindow(QMainWindow):
         if is_first_run:
             self._dismiss_splash_for_wizard()
             if not self._splash:
-                self._show_first_run_dialog()
+                self._show_first_run_with_scan()
             else:
-                QTimer.singleShot(500, self._show_first_run_dialog)
+                QTimer.singleShot(500, self._show_first_run_with_scan)
             return
 
         if not self._backend_runtime_exists():
@@ -1175,6 +1176,48 @@ class MainWindow(QMainWindow):
 
         self.start_deploy(show_logs=False)
 
+    def _show_first_run_with_scan(self):
+        """首次运行：先快速扫描已有实例，有则弹迁移向导，无则进全新部署向导。"""
+        from ui.migration_dialog import ScanInstancesThread
+
+        class _QuickScan(ScanInstancesThread):
+            pass
+
+        self._quick_scan = _QuickScan(self.backend)
+        self._quick_scan.scan_done.connect(self._on_quick_scan_done)
+        self._quick_scan.start()
+
+    def _on_quick_scan_done(self, instances: list):
+        if instances:
+            self._show_migration_choice(instances)
+        else:
+            self._show_first_run_dialog()
+
+    def _show_migration_choice(self, instances):
+        """发现已有实例，询问用户是迁移还是全新部署。"""
+        from PyQt6.QtWidgets import QMessageBox
+
+        count = len(instances)
+        msg = QMessageBox(self)
+        msg.setWindowTitle("发现已有部署")
+        msg.setIcon(QMessageBox.Icon.Question)
+        msg.setText(
+            f"检测到本机存在 {count} 个 Nekro Agent 部署实例。\n\n"
+            "是否将已有实例迁移到此启动器管理？\n"
+            "选择「迁移」进入迁移向导，选择「全新部署」忽略已有实例。"
+        )
+        msg.setStyleSheet(self.styleSheet())
+        for label in msg.findChildren(QLabel):
+            label.setWordWrap(True)
+        btn_migrate = msg.addButton("迁移已有实例", QMessageBox.ButtonRole.AcceptRole)
+        msg.addButton("全新部署", QMessageBox.ButtonRole.RejectRole)
+        msg.exec()
+
+        if msg.clickedButton() == btn_migrate:
+            self._show_migration_dialog()
+        else:
+            self._show_first_run_dialog()
+
     def _show_first_run_dialog(self):
         from ui.first_run_dialog import FirstRunDialog
 
@@ -1182,11 +1225,21 @@ class MainWindow(QMainWindow):
         dialog.deploy_requested.connect(self._on_deploy_mode_selected)
         dialog.exec()
 
-    def _on_deploy_mode_selected(self, mode):
+    def _show_migration_dialog(self):
+        from ui.migration_dialog import MigrationDialog
+
+        dialog = MigrationDialog(self.backend, self.config, parent=self)
+        dialog.deploy_requested.connect(self._on_deploy_mode_selected)
+        dialog.exec()
+
+    def _on_deploy_mode_selected(self, mode, inst_data: dict | None = None):
         self._is_first_deploy = True
-        # 向导里可能更新了端口，同步刷新 browser_urls 和设置页输入框
-        nekro_port = self.config.get("nekro_port") or 8021
-        napcat_port = self.config.get("napcat_port") or 6099
+        if inst_data:
+            self._pending_inst_data = inst_data
+        else:
+            self._pending_inst_data = None
+        nekro_port = (inst_data or {}).get("nekro_port") or self.config.get("nekro_port") or 8021
+        napcat_port = (inst_data or {}).get("napcat_port") or self.config.get("napcat_port") or 6099
         self.browser_urls["nekro"] = f"http://localhost:{nekro_port}"
         self.browser_urls["napcat"] = f"http://localhost:{napcat_port}"
         if hasattr(self, "nekro_port_setting"):
@@ -1194,9 +1247,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, "napcat_port_setting"):
             self.napcat_port_setting.setText(str(napcat_port))
         self._refresh_port_settings_ui()
-        self.refresh_dashboard()
         self._schedule_next_image_update_check()
-        self.start_deploy()
+        self.start_deploy(deploy_mode_override=mode)
 
     _LOG_MAX_BLOCKS = 5000
     _LOG_PREVIEW_MAX_BLOCKS = 500
@@ -1705,6 +1757,36 @@ class MainWindow(QMainWindow):
         )
         webbrowser.open(current_url)
 
+    def _switch_log_reader_to_active_instance(self):
+        """切换实例时，将日志读取和健康检查指向新的 active 实例。"""
+        from core.wsl.constants import DISTRO_NAME
+
+        self.backend._stop_event.set()
+        if self.backend._log_process and self.backend._log_process.poll() is None:
+            try:
+                self.backend._log_process.terminate()
+            except Exception:
+                pass
+            self.backend._log_process = None
+        self.backend._stop_event.clear()
+
+        deploy_dir, _, _ = self.backend._get_active_deploy_paths()
+        inst_id = self.config.get_active_instance_id() or ""
+        inst_display = inst_id if inst_id and inst_id != "default" else ""
+        log_prefix = f"[{inst_display}] " if inst_display else ""
+
+        nekro_port = self.config.get("nekro_port") or 8021
+        self.browser_urls["nekro"] = f"http://localhost:{nekro_port}"
+        napcat_port = self.config.get("napcat_port") or 6099
+        self.browser_urls["napcat"] = f"http://localhost:{napcat_port}"
+
+        import threading
+        threading.Thread(
+            target=self.backend._log_reader,
+            args=(DISTRO_NAME, deploy_dir, log_prefix, inst_id),
+            daemon=True,
+        ).start()
+
     def refresh_dashboard(self):
         if not hasattr(self, "status_badge"):
             return
@@ -1751,16 +1833,46 @@ class MainWindow(QMainWindow):
         self.metric_data_dir.setToolTip(host_data or data_dir)
         self.metric_data_dir.set_clickable(bool(host_data))
 
-    def start_deploy(self, show_logs=True):
+    def start_deploy(self, show_logs=True, deploy_mode_override=None):
         if not self._guard_napcat_network_config_busy("开始部署"):
             return
         if not self._guard_blocking_status_idle("开始部署"):
             return
-        if self.backend.is_running:
-            self._show_notice_dialog("提示", "服务已在运行中")
-            return
 
-        deploy_mode = self.config.get("deploy_mode")
+        pending = getattr(self, "_pending_inst_data", None)
+        is_new_instance = bool(pending)
+
+        if pending:
+            self._apply_pending_instance()
+        else:
+            self._prev_active_instance = None
+            self._prev_deploy_mode = None
+            if self.backend.is_running:
+                self._show_notice_dialog("提示", "服务已在运行中")
+                return
+
+        self._do_deploy(deploy_mode_override, show_logs, force_new_instance=is_new_instance)
+
+    def _apply_pending_instance(self):
+        """将 pending 新实例写入 config 并切换为 active。"""
+        pending = self._pending_inst_data
+        if not pending:
+            return
+        self._prev_active_instance = self.config.get_active_instance_id()
+        self._prev_deploy_mode = self.config.get("deploy_mode")
+        inst_id = pending["inst_id"]
+        inst_save = {k: v for k, v in pending.items() if k != "inst_id"}
+        self.config.set_instance(inst_id, inst_save)
+        self.config.set("active_instance", inst_id)
+        self.config.set("nekro_port", pending["nekro_port"])
+        self.config.set("napcat_port", pending["napcat_port"])
+        self.config.set("deploy_mode", pending["deploy_mode"])
+        self.config.set("first_run", False)
+        self.refresh_dashboard()
+
+    def _do_deploy(self, deploy_mode_override=None, show_logs=True, force_new_instance=False):
+        """实际执行部署（前置检查已通过）。"""
+        deploy_mode = deploy_mode_override or self.config.get("deploy_mode")
         if not deploy_mode:
             self._show_first_run_dialog()
             return
@@ -1781,7 +1893,7 @@ class MainWindow(QMainWindow):
             self.log_preview.clear()
             self.log_preview.append(f"<span style='color:#7ce0a3;'>[INFO]</span> 开始部署服务 (模式: {deploy_mode})...")
 
-        self.backend.start_services(deploy_mode)
+        self.backend.start_services(deploy_mode, force_new_instance=force_new_instance)
 
     def _stop_services_for_mode_change(self):
         if not self._guard_napcat_network_config_busy("关闭服务"):
@@ -1810,6 +1922,29 @@ class MainWindow(QMainWindow):
         if hasattr(self, "log_preview"):
             self.log_preview.append("<span style='color:#7ce0a3;'>[INFO]</span> 开始停止服务，用于修改部署模式...")
         self.backend.stop_services()
+
+    def _rollback_pending_instance(self):
+        """部署新实例失败后，回滚到之前的 active_instance 和 deploy_mode。"""
+        prev_id = getattr(self, "_prev_active_instance", None)
+        prev_mode = getattr(self, "_prev_deploy_mode", None)
+        pending = getattr(self, "_pending_inst_data", None)
+
+        if pending and pending.get("inst_id"):
+            self.config.remove_instance(pending["inst_id"])
+
+        if prev_id:
+            self.config.set("active_instance", prev_id)
+        if prev_mode:
+            self.config.set("deploy_mode", prev_mode)
+        prev_inst = self.config.get_instance(prev_id) if prev_id else None
+        if prev_inst:
+            self.config.set("nekro_port", prev_inst.get("nekro_port", 8021))
+            self.config.set("napcat_port", prev_inst.get("napcat_port", 6099))
+
+        self._pending_inst_data = None
+        self._prev_active_instance = None
+        self._prev_deploy_mode = None
+        self.refresh_dashboard()
 
     def update_status_ui(self, status):
         previous_status = self._last_status
@@ -1878,6 +2013,9 @@ class MainWindow(QMainWindow):
                 self._finish_update_session(True, success_title, self._pending_remote_update_message)
             if hasattr(self, "_is_first_deploy") and self._is_first_deploy:
                 self._is_first_deploy = False
+                self._pending_inst_data = None
+                self._prev_active_instance = None
+                self._prev_deploy_mode = None
             if self._current_webview() is not None and not was_running:
                 self.switch_tab(1)
                 self._set_browser_target(self.current_browser_target, force_reload=True)
@@ -1905,6 +2043,9 @@ class MainWindow(QMainWindow):
                 )
                 _success_title, failure_title = self._active_update_result_titles()
                 self._finish_update_session(False, failure_title, failure_message)
+            if status == "启动失败" and getattr(self, "_prev_active_instance", None) is not None:
+                self._rollback_pending_instance()
+
             if self._quit_after_stop and status in {"已停止", "已卸载"}:
                 self._quit_after_stop = False
                 QApplication.quit()
@@ -2344,20 +2485,24 @@ class MainWindow(QMainWindow):
                 self.config.set("napcat_port", napcat_port)
 
             active_id = self.config.get_active_instance_id()
-            if active_id:
-                update_kwargs = {"nekro_port": nekro_port}
-                if deploy_mode == "napcat":
-                    update_kwargs["napcat_port"] = napcat_port
-                self.config.update_instance(active_id, **update_kwargs)
-
-            self.browser_urls["nekro"] = f"http://localhost:{nekro_port}"
-            self.browser_urls["napcat"] = f"http://localhost:{napcat_port}"
             deploy_info = self.config.get("deploy_info")
             if deploy_info:
                 deploy_info["port"] = str(nekro_port)
                 if deploy_mode == "napcat":
                     deploy_info["napcat_port"] = str(napcat_port)
                 self.config.set("deploy_info", deploy_info)
+
+            if active_id:
+                update_kwargs = {"nekro_port": nekro_port}
+                if deploy_mode == "napcat":
+                    update_kwargs["napcat_port"] = napcat_port
+                if deploy_info:
+                    update_kwargs["deploy_info"] = deploy_info
+                self.config.update_instance(active_id, **update_kwargs)
+
+            if not getattr(self.backend, "is_running", False):
+                self.browser_urls["nekro"] = f"http://localhost:{nekro_port}"
+                self.browser_urls["napcat"] = f"http://localhost:{napcat_port}"
             current_view = self._current_webview()
             if getattr(self.backend, "is_running", False):
                 if hasattr(self, "browser_url_label"):
@@ -2402,23 +2547,119 @@ class MainWindow(QMainWindow):
             return
         if not self._guard_blocking_status_idle("卸载环境"):
             return
+
+        instances = self.config.list_instances()
+        if not instances:
+            self._show_notice_dialog("无可移除的实例", "当前没有已部署的实例。")
+            return
+
+        if len(instances) == 1:
+            self._confirm_remove_instance(instances[0][0])
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("移除实例")
+        dialog.setMinimumWidth(400)
+        dialog.setMaximumWidth(500)
+        dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        dialog.setStyleSheet(STYLESHEET)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(14)
+
+        title = QLabel("选择要移除的实例")
+        title.setProperty("role", "dialog_title")
+        layout.addWidget(title)
+
+        desc = QLabel(f"当前共有 {len(instances)} 个部署实例，请选择要移除的实例：")
+        desc.setProperty("role", "dialog_desc")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        from ui.widgets import StyledComboBox
+        combo = StyledComboBox()
+        combo.setMinimumWidth(360)
+        for inst_id, inst_data in instances:
+            name = inst_data.get("instance_name", "").rstrip("_") or inst_id
+            mode = "napcat" if inst_data.get("deploy_mode") == "napcat" else "lite"
+            port = inst_data.get("nekro_port", 8021)
+            combo.addItem(f"{name}  ({mode}, :{port})", inst_id)
+        layout.addWidget(combo)
+
+        selected_id = [None]
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+
+        btn_cancel = QPushButton("取消")
+        btn_cancel.setFixedHeight(36)
+        btn_cancel.clicked.connect(dialog.reject)
+        btn_row.addWidget(btn_cancel)
+
+        btn_row.addStretch()
+
+        btn_remove = QPushButton("移除选中实例")
+        btn_remove.setProperty("role", "danger")
+        btn_remove.setFixedHeight(36)
+        btn_remove.setCursor(Qt.CursorShape.PointingHandCursor)
+        def _on_remove():
+            selected_id[0] = combo.currentData()
+            dialog.accept()
+        btn_remove.clicked.connect(_on_remove)
+        btn_row.addWidget(btn_remove)
+
+        layout.addLayout(btn_row)
+        dialog.exec()
+
+        if selected_id[0]:
+            self._confirm_remove_instance(selected_id[0])
+
+    def _confirm_remove_instance(self, inst_id):
+        """移除单个实例：停止其 compose 服务、删除 deploy_dir、从 config 中移除。"""
+        inst = self.config.get_instance(inst_id)
+        if not inst:
+            return
+        name = inst.get("instance_name", "").rstrip("_") or inst_id
         reply = self._show_confirm_dialog(
-            "确认卸载",
-            "此操作将：\n"
-            "  1. 停止所有运行中的容器\n"
-            "  2. 删除所有容器和镜像数据\n"
-            f"  3. 删除 {self.backend.display_name} 运行环境\n\n"
-            "此操作不可撤销，确定要继续吗？",
-            confirm_text="确认卸载",
+            f"移除实例「{name}」",
+            f"将停止该实例的容器并删除其部署目录。\n\n"
+            f"部署目录: {inst.get('deploy_dir', '?')}\n"
+            f"数据目录: {inst.get('data_dir', '?')}\n\n"
+            "数据目录将保留，不会被删除。此操作不可撤销。",
+            confirm_text="确认移除",
             danger=True,
         )
         if not reply:
             return
 
-        self._uninstall_in_progress = True
+        is_active = (inst_id == self.config.get_active_instance_id())
         self.switch_tab(2)
-        self.log_viewer_app.append("<span style='color:#7ce0a3;'>[INFO]</span> 开始卸载环境...")
-        self.backend.uninstall_environment()
+        self.log_viewer_app.append(
+            f"<span style='color:#7ce0a3;'>[INFO]</span> 开始移除实例「{name}」..."
+        )
+        self.backend.remove_single_instance(inst_id, inst, was_active=is_active)
+
+    def _on_remove_instance_done(self, success, inst_id, was_active):
+        if success:
+            self.config.remove_instance(inst_id)
+            if was_active:
+                remaining = self.config.list_instances()
+                if remaining:
+                    first_id, first_data = remaining[0]
+                    self.config.set("active_instance", first_id)
+                    self.config.set("deploy_mode", first_data.get("deploy_mode", ""))
+                    self.config.set("nekro_port", first_data.get("nekro_port", 8021))
+                    self.config.set("napcat_port", first_data.get("napcat_port", 6099))
+                    self._switch_log_reader_to_active_instance()
+                else:
+                    self.config.set("active_instance", "")
+                    self.config.set("deploy_mode", "")
+                    self.config.set("first_run", True)
+            self.refresh_dashboard()
+            self._show_notice_dialog("移除完成", "实例已移除。")
+        else:
+            self._show_notice_dialog("移除失败", "移除实例时发生错误，请查看日志。", danger=True)
 
     def _open_wsl_path(self, wsl_path):
         win_path = self.backend.get_host_access_path(wsl_path)
@@ -2498,8 +2739,8 @@ class MainWindow(QMainWindow):
 
     def _on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
-            self.show()
-            self.tray_icon.hide()
+            self.showNormal()
+            self.activateWindow()
 
     def _quit_app(self):
         if not self._guard_napcat_network_config_busy("退出启动器"):
@@ -2601,7 +2842,11 @@ class MainWindow(QMainWindow):
             _spinner = SpinnerLabel(dialog)
             _signal_cleaned = [False]
 
-            boot_row = boot_status.parent().layout()
+            boot_row = QHBoxLayout()
+            boot_row.setSpacing(8)
+            boot_row.addWidget(_spinner)
+            boot_row.addWidget(boot_status, 1)
+            layout.insertLayout(layout.count() - 1, boot_row)
 
             def _update_boot_text():
                 boot_status.setText("<span style='color:#58a6ff;'>等待服务启动...</span>")

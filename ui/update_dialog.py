@@ -392,6 +392,9 @@ class AppUpdateDialog(QDialog):
         except Exception as e:
             self._status_label.setText(f"启动安装程序失败: {e}")
             self._status_label.setStyleSheet("font-size: 12px; color: #e26050;")
+            self._btn_download.setEnabled(True)
+            self._btn_download.setText("重新下载")
+            self._btn_skip.setEnabled(True)
             self._btn_later.setEnabled(True)
 
     def reject(self):

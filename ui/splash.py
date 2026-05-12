@@ -52,7 +52,6 @@ class SplashScreen(QWidget):
         super().__init__(parent)
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.SplashScreen
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -271,10 +270,13 @@ class SplashScreen(QWidget):
         self._target_progress = min(max(value, 0.0), 1.0)
 
     def _tick(self):
-        if self._phase == _PHASE_DEPLOY and self._progress < self._target_progress:
-            gap = self._target_progress - self._progress
-            step = max(gap * 0.08, 0.003)
-            self._progress = min(self._progress + step, self._target_progress)
+        if self._phase == _PHASE_DEPLOY:
+            if self._progress < self._target_progress:
+                gap = self._target_progress - self._progress
+                step = max(gap * 0.08, 0.003)
+                self._progress = min(self._progress + step, self._target_progress)
+            elif self._progress < 0.85:
+                self._progress = min(self._progress + 0.0004, 0.85)
         self.update()
 
     def _begin_fade_out(self):

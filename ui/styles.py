@@ -1,4 +1,17 @@
-STYLESHEET = """
+import os
+import sys
+
+
+def _asset_path(filename):
+    """Return an absolute filesystem path for a bundled asset (forward-slashed for QSS url())."""
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    else:
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, "assets", filename).replace("\\", "/")
+
+
+_STYLESHEET_TEMPLATE = """
 QMainWindow {
     background: #f4f7fb;
 }
@@ -476,7 +489,7 @@ QComboBox:hover::drop-down {
 }
 
 QComboBox::down-arrow {
-    image: url(assets/chevron-down.svg);
+    image: url({{CHEVRON_DOWN_SVG}});
     width: 10px;
     height: 6px;
 }
@@ -898,3 +911,5 @@ QLabel#VersionDisplay {
     font-weight: 600;
 }
 """
+
+STYLESHEET = _STYLESHEET_TEMPLATE.replace("{{CHEVRON_DOWN_SVG}}", _asset_path("chevron-down.svg"))

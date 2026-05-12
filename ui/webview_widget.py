@@ -51,6 +51,7 @@ class WebViewWidget(QWidget):
 
     urlChanged = pyqtSignal(str)
     titleChanged = pyqtSignal(str)
+    init_failed = pyqtSignal(str)
 
     def __init__(self, parent=None, data_subfolder="default"):
         super().__init__(parent)
@@ -101,6 +102,8 @@ class WebViewWidget(QWidget):
                 url = self._pending_url
                 self._pending_url = None
                 self.load_url(url)
+        else:
+            self.init_failed.emit(error_msg or "WebView2 初始化失败")
 
     def _on_dom_loaded(self):
         self._inject_nav_hook()
