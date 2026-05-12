@@ -52,6 +52,10 @@ class BackendBase(QObject):
         raise NotImplementedError
 
     @abstractmethod
+    def start_all_services(self, default_instance_id=None):
+        raise NotImplementedError
+
+    @abstractmethod
     def stop_services(self):
         raise NotImplementedError
 

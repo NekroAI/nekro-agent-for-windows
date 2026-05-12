@@ -618,6 +618,8 @@ class WSLDiscoveryMixin:
             "deploy_info": deploy_info,
         }
         self.config.set_instance(inst_id, inst_data)
+        if not self.config.get_default_instance_id():
+            self.config.set_default_instance_id(inst_id)
         self.config.set("active_instance", inst_id)
 
         self.log_received.emit(

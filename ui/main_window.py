@@ -155,6 +155,7 @@ class MainWindow(QMainWindow):
         self.config = ConfigManager()
         self.backend = BackendFactory.create(self.config)
         self._quit_after_stop = False
+        self._force_quit_after_stop = False
         self._responsive_buttons = []
         self._last_status = ""
         self._uninstall_in_progress = False
@@ -1171,10 +1172,19 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(500, _show_after_splash)
             return
 
+        default_id = self.config.get_default_instance_id()
+        if default_id:
+            self._apply_active_instance_config(default_id)
+            self.refresh_dashboard()
+            self._sync_browser_to_active_instance(force_reload=False)
+
         if self._splash:
             self._splash.enter_deploy_phase()
 
-        self.start_deploy(show_logs=False)
+        if self.config.list_instances():
+            self.backend.start_all_services(default_id)
+        else:
+            self.start_deploy(show_logs=False)
 
     def _show_first_run_with_scan(self):
         """首次运行：先快速扫描已有实例，有则弹迁移向导，无则进全新部署向导。"""
@@ -1998,6 +2008,8 @@ class MainWindow(QMainWindow):
         inst_id = pending["inst_id"]
         inst_save = {k: v for k, v in pending.items() if k != "inst_id"}
         self.config.set_instance(inst_id, inst_save)
+        if not self.config.get_default_instance_id():
+            self.config.set_default_instance_id(inst_id)
         self.config.set("active_instance", inst_id)
         self.config.set("nekro_port", pending["nekro_port"])
         self.config.set("napcat_port", pending["napcat_port"])
@@ -2115,6 +2127,8 @@ class MainWindow(QMainWindow):
 
         self.btn_deploy_action.setEnabled(not service_active and not blocking)
         self.btn_primary_deploy.setEnabled(not service_active and not blocking)
+        if hasattr(self, "btn_new_instance_action"):
+            self.btn_new_instance_action.setEnabled(not blocking and not self._napcat_network_config_in_progress)
         can_update = (
             bool(self.config.get("deploy_mode"))
             and running
@@ -2183,6 +2197,7 @@ class MainWindow(QMainWindow):
 
             if self._quit_after_stop and status in {"已停止", "已卸载"}:
                 self._quit_after_stop = False
+                self._force_quit_after_stop = True
                 QApplication.quit()
             if self._quit_after_stop and status == "停止失败":
                 self._quit_after_stop = False
@@ -2849,6 +2864,9 @@ class MainWindow(QMainWindow):
         return choice.exec()
 
     def closeEvent(self, event: QCloseEvent):
+        if self._force_quit_after_stop:
+            event.accept()
+            return
         if not self._guard_napcat_network_config_busy("退出启动器"):
             event.ignore()
             return
