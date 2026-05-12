@@ -564,7 +564,7 @@ class FirstRunDialog(QDialog):
         self.instance_name_edit.textChanged.connect(self._on_instance_name_changed)
         layout.addWidget(self.instance_name_edit)
 
-        instance_hint = QLabel("实例名称将作为容器和数据卷的前缀，用于隔离多个实例。建议以下划线结尾，如 bot1_。")
+        instance_hint = QLabel("实例名称将作为容器和数据卷的前缀，仅支持英文字母、数字、下划线和短横线；建议以下划线结尾，如 bot1_。")
         instance_hint.setObjectName("WizardHint")
         instance_hint.setWordWrap(True)
         layout.addWidget(instance_hint)
