@@ -1771,7 +1771,7 @@ class MainWindow(QMainWindow):
         if inst is None and inst_id:
             inst = self.config.get_instance(inst_id)
         if inst:
-            return inst.get("instance_name", "").rstrip("_") or inst_id or "default"
+            return inst.get("remark", "").strip() or inst.get("instance_name", "").rstrip("_") or inst_id or "default"
         return inst_id or "default"
 
     def _apply_active_instance_config(self, inst_id):
@@ -1867,7 +1867,7 @@ class MainWindow(QMainWindow):
             name = self._instance_display_name(item_id, inst_data)
             mode = "napcat" if inst_data.get("deploy_mode") == "napcat" else "lite"
             port = inst_data.get("nekro_port", 8021)
-            combo.addItem(f"{name}  ({mode}, :{port})", item_id)
+            combo.addItem(f"{name}  ({mode}, 端口：{port})", item_id)
             if item_id == active_id:
                 active_index = index
         combo.setCurrentIndex(active_index)
@@ -1959,6 +1959,8 @@ class MainWindow(QMainWindow):
         self._refresh_port_settings_ui()
         if hasattr(self, "datadir_edit"):
             self.datadir_edit.setText(self.config.get_active_data_dir())
+        if hasattr(self, "_files_page") and hasattr(self._files_page, "refresh_paths"):
+            self._files_page.refresh_paths()
         self._schedule_next_image_update_check()
 
     def _refresh_metric_data_dir_card(self):
@@ -2305,15 +2307,12 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "image_update_check_hint"):
             return
 
-        interval_hours = self._image_update_check_interval_hours()
-        if interval_hours <= 0:
-            text = "已关闭自动检查。仅在启动器运行期间生效，不会自动拉取更新。"
+        last_check_ts = int(self.config.get("last_image_update_check_ts") or 0)
+        if last_check_ts > 0:
+            last_text = time.strftime("%Y-%m-%d %H:%M", time.localtime(last_check_ts))
+            text = f"上次检查：{last_text}"
         else:
-            text = f"当前：{self._image_update_check_interval_label(interval_hours)}。仅在启动器运行期间自动检查镜像状态，不会自动拉取更新。"
-            last_check_ts = int(self.config.get("last_image_update_check_ts") or 0)
-            if last_check_ts > 0:
-                last_text = time.strftime("%Y-%m-%d %H:%M", time.localtime(last_check_ts))
-                text += f"\n上次检查：{last_text}"
+            text = "上次检查：从未"
         self.image_update_check_hint.setText(text)
 
     def _schedule_next_image_update_check(self, delay_ms=None):
@@ -2592,10 +2591,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "napcat_port_setting"):
             self.napcat_port_setting.setVisible(show_napcat)
         if hasattr(self, "port_hint_label"):
-            hint = "修改端口后需重新部署服务才能生效。"
-            if not show_napcat:
-                hint = "Lite 模式仅使用 Nekro Agent 端口。修改端口后需重新部署服务才能生效。"
-            self.port_hint_label.setText(hint)
+            self.port_hint_label.setText("修改端口后需重新部署服务才能生效。")
 
     def _save_ports(self):
         deploy_mode = self.config.get("deploy_mode") or "lite"
@@ -2678,6 +2674,12 @@ class MainWindow(QMainWindow):
         if hasattr(self, "datadir_edit"):
             self.datadir_edit.setText(data_dir)
 
+    def _open_path_in_explorer(self, path):
+        try:
+            os.startfile(path)
+        except Exception as error:
+            self._show_notice_dialog("提示", f"无法打开目录。\n\n路径: {path}\n错误: {error}", danger=True)
+
     def _open_datadir_in_explorer(self):
         data_dir = self.config.get_active_data_dir()
         win_path = self.backend.get_host_access_path(data_dir)
@@ -2734,7 +2736,7 @@ class MainWindow(QMainWindow):
             name = inst_data.get("instance_name", "").rstrip("_") or inst_id
             mode = "napcat" if inst_data.get("deploy_mode") == "napcat" else "lite"
             port = inst_data.get("nekro_port", 8021)
-            combo.addItem(f"{name}  ({mode}, :{port})", inst_id)
+            combo.addItem(f"{name}  ({mode}, 端口：{port})", inst_id)
         layout.addWidget(combo)
 
         selected_id = [None]

@@ -17,49 +17,65 @@ class SettingsPage(QWidget):
         layout.setContentsMargins(34, 30, 34, 30)
         layout.setSpacing(18)
 
-        self._build_instance_card(layout)
-        self._build_general_card(layout)
-        self._build_about_card(layout)
-        self._build_advanced_card(layout)
-        self._build_deploy_card(layout)
-        self._build_storage_card(layout)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(18)
+        grid.setVerticalSpacing(18)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
 
+        self._build_instance_card(grid, 0, 0)
+        self._build_deploy_card(grid, 1, 0)
+        self._build_storage_card(grid, 2, 0)
+        self._build_general_card(grid, 0, 1)
+        self._build_advanced_card(grid, 1, 1)
+        self._build_about_card(grid, 2, 1)
+
+        layout.addLayout(grid)
         layout.addStretch()
 
-    def _build_instance_card(self, parent_layout):
+    def _build_instance_card(self, parent_layout, row, column):
         card = SectionCard("当前实例", "查看启动器当前管理的 Nekro Agent 实例。")
         card_layout = card.body_layout()
 
-        row = QHBoxLayout()
-        row.setSpacing(12)
+        title_row = QHBoxLayout()
+        title_row.setSpacing(12)
         self.w.instance_title_label = QLabel("")
         self.w.instance_title_label.setObjectName("VersionDisplay")
-        row.addWidget(self.w.instance_title_label)
-        row.addStretch()
-        card_layout.addLayout(row)
+        title_row.addWidget(self.w.instance_title_label)
+        title_row.addStretch()
+        card_layout.addLayout(title_row)
 
         default_row = QHBoxLayout()
         default_row.setSpacing(12)
         default_row.addWidget(QLabel("启动默认实例"))
         self.w.default_instance_combo = StyledComboBox()
-        self.w.default_instance_combo.setMinimumWidth(240)
+        self.w.default_instance_combo.setMinimumWidth(300)
         self.w.default_instance_combo.currentIndexChanged.connect(self._on_default_instance_changed)
         default_row.addWidget(self.w.default_instance_combo, 0, Qt.AlignmentFlag.AlignLeft)
         default_row.addStretch()
         card_layout.addLayout(default_row)
+
+        remark_row = QHBoxLayout()
+        remark_row.setSpacing(12)
+        remark_row.addWidget(QLabel("实例备注"))
+        self.w.instance_remark_edit = QLineEdit()
+        self.w.instance_remark_edit.setPlaceholderText("例如：主号、测试 Bot、群管实例")
+        remark_row.addWidget(self.w.instance_remark_edit, 1)
+        btn_save_remark = QPushButton("保存备注")
+        btn_save_remark.setObjectName("HeroSecondary")
+        btn_save_remark.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_save_remark.clicked.connect(self._save_instance_remark)
+        remark_row.addWidget(btn_save_remark)
+        card_layout.addLayout(remark_row)
 
         self.w.instance_info_label = QLabel("")
         self.w.instance_info_label.setObjectName("SectionDesc")
         self.w.instance_info_label.setWordWrap(True)
         card_layout.addWidget(self.w.instance_info_label)
 
-        self.w.instance_switch_hint = QLabel("多实例切换和新实例部署入口已移动到总览页。")
-        self.w.instance_switch_hint.setObjectName("SectionDesc")
-        self.w.instance_switch_hint.setWordWrap(True)
-        card_layout.addWidget(self.w.instance_switch_hint)
         self._refresh_instance_info()
 
-        parent_layout.addWidget(card)
+        parent_layout.addWidget(card, row, column)
 
     def _refresh_default_instance_combo(self):
         if not hasattr(self.w, "default_instance_combo"):
@@ -71,10 +87,10 @@ class SettingsPage(QWidget):
         default_id = self.w.config.get_default_instance_id()
         current_idx = 0
         for i, (inst_id, inst_data) in enumerate(instances):
-            display = self.w._instance_display_name(inst_id, inst_data)
+            display = inst_data.get("remark") or self.w._instance_display_name(inst_id, inst_data)
             mode = "napcat" if inst_data.get("deploy_mode") == "napcat" else "lite"
             port = inst_data.get("nekro_port", 8021)
-            combo.addItem(f"{display}  ({mode}, :{port})", inst_id)
+            combo.addItem(f"{display}  ({mode}, 端口：{port})", inst_id)
             if inst_id == default_id:
                 current_idx = i
         if not instances:
@@ -91,6 +107,15 @@ class SettingsPage(QWidget):
             self.w._switch_active_instance(inst_id)
             self._refresh_instance_info()
 
+    def _save_instance_remark(self):
+        inst_id = self.w.config.get_active_instance_id()
+        if not inst_id:
+            return
+        remark = self.w.instance_remark_edit.text().strip()
+        self.w.config.update_instance(inst_id, remark=remark)
+        self._refresh_instance_info()
+        self.w.refresh_dashboard()
+
     def _refresh_instance_info(self):
         self._refresh_default_instance_combo()
         inst = self.w.config.get_instance()
@@ -98,26 +123,30 @@ class SettingsPage(QWidget):
         if not inst:
             self.w.instance_title_label.setText("尚未部署实例")
             self.w.instance_info_label.setText("尚未部署任何实例。")
-            self.w.instance_switch_hint.setVisible(False)
             return
 
         display = self.w._instance_display_name(inst_id, inst)
         mode = "NapCat 完整版" if inst.get("deploy_mode") == "napcat" else "Lite 精简版"
         port = inst.get("nekro_port", 8021)
         channel = inst.get("release_channel", "stable")
-        self.w.instance_title_label.setText(f"{display}  ({mode}, :{port}, {channel})")
+        remark = inst.get("remark", "")
+        title = remark or display
+        self.w.instance_title_label.setText(f"{title}  ({mode}, 端口：{port}, {channel})")
+        self.w.instance_remark_edit.blockSignals(True)
+        self.w.instance_remark_edit.setText(remark)
+        self.w.instance_remark_edit.blockSignals(False)
 
         parts = []
+        parts.append(f"实例 ID: {inst_id}")
+        if inst.get("instance_name"):
+            parts.append(f"实例前缀: {inst['instance_name']}")
         if inst.get("deploy_dir"):
             parts.append(f"部署目录: {inst['deploy_dir']}")
         if inst.get("data_dir"):
             parts.append(f"数据目录: {inst['data_dir']}")
-        if inst.get("instance_name"):
-            parts.append(f"INSTANCE_NAME: {inst['instance_name']}")
-        self.w.instance_info_label.setText("  |  ".join(parts) if parts else "")
-        self.w.instance_switch_hint.setVisible(len(self.w.config.list_instances()) > 1)
+        self.w.instance_info_label.setText("  |  ".join(parts))
 
-    def _build_general_card(self, parent_layout):
+    def _build_general_card(self, parent_layout, row, column):
         card = SectionCard("通用设置", "控制系统集成和自动检查选项。")
         card_layout = card.body_layout()
 
@@ -152,9 +181,9 @@ class SettingsPage(QWidget):
         card_layout.addWidget(self.w.image_update_check_hint)
         self.w._refresh_image_update_check_hint()
 
-        parent_layout.addWidget(card)
+        parent_layout.addWidget(card, row, column)
 
-    def _build_about_card(self, parent_layout):
+    def _build_about_card(self, parent_layout, row, column):
         card = SectionCard("关于启动器", f"Nekro Agent Windows 启动器 v{APP_VERSION}")
         card_layout = card.body_layout()
 
@@ -174,9 +203,36 @@ class SettingsPage(QWidget):
         version_row.addWidget(self.w.btn_check_update)
         card_layout.addLayout(version_row)
 
-        parent_layout.addWidget(card)
+        info = QLabel(
+            f"配置目录: {self.w.config.app_data_dir}\n"
+            f"浏览器数据: {self.w.config.browser_profile_dir}\n"
+            f"当前后端: {self.w.backend.display_name}"
+        )
+        info.setObjectName("SectionDesc")
+        info.setWordWrap(True)
+        info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        card_layout.addWidget(info)
 
-    def _build_advanced_card(self, parent_layout):
+        link_row = QHBoxLayout()
+        link_row.setSpacing(10)
+
+        btn_open_config = QPushButton("打开配置目录")
+        btn_open_config.setObjectName("HeroSecondary")
+        btn_open_config.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_open_config.clicked.connect(lambda: self.w._open_path_in_explorer(self.w.config.app_data_dir))
+        link_row.addWidget(btn_open_config)
+
+        btn_open_logs = QPushButton("查看应用日志")
+        btn_open_logs.setObjectName("HeroSecondary")
+        btn_open_logs.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_open_logs.clicked.connect(lambda: self.w.switch_tab(2))
+        link_row.addWidget(btn_open_logs)
+        link_row.addStretch()
+        card_layout.addLayout(link_row)
+
+        parent_layout.addWidget(card, row, column)
+
+    def _build_advanced_card(self, parent_layout, row, column):
         card = SectionCard("高级功能", "启用后可在总览控制台使用预览版切换等功能。")
         card_layout = card.body_layout()
 
@@ -198,55 +254,60 @@ class SettingsPage(QWidget):
         self.w.advanced_hint.setWordWrap(True)
         card_layout.addWidget(self.w.advanced_hint)
 
-        parent_layout.addWidget(card)
+        parent_layout.addWidget(card, row, column)
 
-    def _build_deploy_card(self, parent_layout):
+    def _build_deploy_card(self, parent_layout, row, column):
         card = SectionCard("部署配置", "管理部署版本和服务端口。")
         card_layout = card.body_layout()
 
         form = QGridLayout()
         form.setHorizontalSpacing(14)
         form.setVerticalSpacing(12)
-        form.setColumnStretch(1, 1)
+        form.setColumnStretch(0, 0)
+        form.setColumnStretch(1, 0)
+        form.setColumnStretch(2, 0)
+        form.setColumnStretch(3, 1)
 
-        form.addWidget(QLabel("部署版本"), 0, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.w.mode_display = QLineEdit(self.w._format_mode_text(self.w.config.get("deploy_mode")))
-        self.w.mode_display.setReadOnly(True)
-        form.addWidget(self.w.mode_display, 0, 1)
+        mode_label = QLabel("部署版本")
+        mode_label.setMinimumWidth(118)
+        form.addWidget(mode_label, 0, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.w.mode_display = QLabel(self.w._format_mode_text(self.w.config.get("deploy_mode")))
+        self.w.mode_display.setObjectName("VersionDisplay")
+        self.w.mode_display.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        form.addWidget(self.w.mode_display, 0, 1, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
         self.w.nekro_port_label = QLabel("Nekro Agent 端口")
-        form.addWidget(self.w.nekro_port_label, 1, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.w.nekro_port_label.setMinimumWidth(118)
+        form.addWidget(self.w.nekro_port_label, 1, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.w.nekro_port_setting = QLineEdit(str(self.w.config.get("nekro_port") or 8021))
         self.w.nekro_port_setting.setPlaceholderText("8021")
-        self.w.nekro_port_setting.setMaximumWidth(120)
-        form.addWidget(self.w.nekro_port_setting, 1, 1)
+        self.w.nekro_port_setting.setFixedWidth(120)
+        form.addWidget(self.w.nekro_port_setting, 1, 1, Qt.AlignmentFlag.AlignLeft)
 
         self.w.napcat_port_label = QLabel("NapCat 端口")
-        form.addWidget(self.w.napcat_port_label, 2, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.w.napcat_port_label.setMinimumWidth(118)
+        form.addWidget(self.w.napcat_port_label, 2, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.w.napcat_port_setting = QLineEdit(str(self.w.config.get("napcat_port") or 6099))
         self.w.napcat_port_setting.setPlaceholderText("6099")
-        self.w.napcat_port_setting.setMaximumWidth(120)
-        form.addWidget(self.w.napcat_port_setting, 2, 1)
+        self.w.napcat_port_setting.setFixedWidth(120)
+        form.addWidget(self.w.napcat_port_setting, 2, 1, Qt.AlignmentFlag.AlignLeft)
 
-        card_layout.addLayout(form)
-
-        btn_row = QHBoxLayout()
         btn_save_ports = QPushButton("保存端口设置")
         btn_save_ports.setObjectName("HeroSecondary")
         btn_save_ports.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_save_ports.clicked.connect(self.w._save_ports)
-        btn_row.addWidget(btn_save_ports)
-        btn_row.addStretch()
-        card_layout.addLayout(btn_row)
+        form.addWidget(btn_save_ports, 1, 2, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
+        card_layout.addLayout(form)
 
         self.w.port_hint_label = QLabel()
         self.w.port_hint_label.setObjectName("SectionDesc")
         self.w.port_hint_label.setWordWrap(True)
         card_layout.addWidget(self.w.port_hint_label)
 
-        parent_layout.addWidget(card)
+        parent_layout.addWidget(card, row, column)
 
-    def _build_storage_card(self, parent_layout):
+    def _build_storage_card(self, parent_layout, row, column):
         card = SectionCard("存储路径", "查看运行环境的安装位置和数据目录。")
         card_layout = card.body_layout()
 
@@ -274,4 +335,4 @@ class SettingsPage(QWidget):
         card_layout.addWidget(self.w.datadir_hint)
         self.w._refresh_datadir_hint()
 
-        parent_layout.addWidget(card)
+        parent_layout.addWidget(card, row, column)
