@@ -1,45 +1,46 @@
-import re
-import os
-import shutil
-import sys
 import json
+import os
+import re
+import sys
 import time
 import webbrowser
-from collections import OrderedDict
 
-from PyQt6.QtCore import QRect, QSize, QThread, QTimer, Qt
-from PyQt6.QtGui import QCloseEvent, QColor, QIcon, QPainter, QPixmap, QTextCursor
+from PyQt6.QtCore import QRect, QSize, Qt, QThread, QTimer
+from PyQt6.QtGui import QCloseEvent, QColor, QIcon, QPixmap, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
     QDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
-    QSizePolicy,
     QStackedWidget,
-    QSystemTrayIcon,
     QStyle,
-    QTabBar,
     QStyleOptionTab,
     QStylePainter,
+    QSystemTrayIcon,
+    QTabBar,
     QVBoxLayout,
     QWidget,
 )
-from ui.webview_widget import WebViewWidget
 
-from core.autostart import set_autostart_enabled
 from core.app_updater import APP_VERSION, UpdateChecker
+from core.autostart import set_autostart_enabled
 from core.backend_factory import BackendFactory
 from core.config_manager import ConfigManager
 from core.port_utils import validate_port_bindings
 from ui.styles import STYLESHEET
-from ui.widgets import ActionButton, MetricCard, SectionCard, SpinnerLabel, StyledComboBox, SPINNER_FRAMES, UpdateProgressDialog, show_notice_dialog
+from ui.webview_widget import WebViewWidget
+from ui.widgets import (
+    SpinnerLabel,
+    StyledComboBox,
+    UpdateProgressDialog,
+    show_notice_dialog,
+)
 
 
 def get_resource_path(relative_path):
@@ -72,7 +73,11 @@ class BrowserTabBar(QTabBar):
     def paintEvent(self, event):
         painter = QStylePainter(self)
         self._close_rects = {}
-        hovered_tab = self.tabAt(self.mapFromGlobal(self.cursor().pos())) if self.underMouse() else -1
+        hovered_tab = (
+            self.tabAt(self.mapFromGlobal(self.cursor().pos()))
+            if self.underMouse()
+            else -1
+        )
 
         for index in range(self.count()):
             option = QStyleOptionTab()
@@ -89,12 +94,27 @@ class BrowserTabBar(QTabBar):
             raw_text_width = metrics.horizontalAdvance(text)
             close_size = 12
             close_gap = self._close_gap(raw_text_width)
-            close_x = min(rect.right() - close_size - 8, rect.x() + 16 + raw_text_width + close_gap)
-            close_rect = QRect(close_x, rect.y() + (rect.height() - close_size) // 2, close_size, close_size)
+            close_x = min(
+                rect.right() - close_size - 8,
+                rect.x() + 16 + raw_text_width + close_gap,
+            )
+            close_rect = QRect(
+                close_x,
+                rect.y() + (rect.height() - close_size) // 2,
+                close_size,
+                close_size,
+            )
             self._close_rects[index] = close_rect
 
-            text_rect = QRect(rect.x() + 14, rect.y(), max(12, close_rect.x() - rect.x() - 20), rect.height())
-            elided_text = metrics.elidedText(text, Qt.TextElideMode.ElideRight, text_rect.width())
+            text_rect = QRect(
+                rect.x() + 14,
+                rect.y(),
+                max(12, close_rect.x() - rect.x() - 20),
+                rect.height(),
+            )
+            elided_text = metrics.elidedText(
+                text, Qt.TextElideMode.ElideRight, text_rect.width()
+            )
 
             if index == self.currentIndex():
                 text_color = QColor("#274055")
@@ -104,10 +124,18 @@ class BrowserTabBar(QTabBar):
                 text_color = QColor("#607789")
 
             painter.setPen(text_color)
-            baseline_y = text_rect.y() + (text_rect.height() + metrics.ascent() - metrics.descent()) // 2 + 4
+            baseline_y = (
+                text_rect.y()
+                + (text_rect.height() + metrics.ascent() - metrics.descent()) // 2
+                + 4
+            )
             painter.drawText(text_rect.x(), baseline_y, elided_text)
 
-            close_color = QColor("#bf655d") if index == self._hovered_close_index else QColor("#90a3b4")
+            close_color = (
+                QColor("#bf655d")
+                if index == self._hovered_close_index
+                else QColor("#90a3b4")
+            )
             painter.setPen(close_color)
             close_font = painter.font()
             close_font.setBold(True)
@@ -163,10 +191,6 @@ class MainWindow(QMainWindow):
         self._active_update_dialog = None
         self._active_update_kind = None
         self._pending_remote_update_message = ""
-        self._pull_stage_header = ""
-        self._pull_summary_text = ""
-        self._pull_layers = OrderedDict()
-        self._pull_layer_order = []
         self._sidebar_collapsed = False
         self._pending_browser_refresh = None
         self._napcat_network_config_in_progress = False
@@ -192,11 +216,11 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         main_layout.addWidget(self.stack, 1)
 
-        from ui.pages.home_page import HomePage
         from ui.pages.browser_page import BrowserPage
-        from ui.pages.logs_page import LogsPage
         from ui.pages.files_page import FilesPage
+        from ui.pages.home_page import HomePage
         from ui.pages.images_page import ImagesPage
+        from ui.pages.logs_page import LogsPage
         from ui.pages.settings_page import SettingsPage
 
         self._home_page = HomePage(self)
@@ -226,7 +250,9 @@ class MainWindow(QMainWindow):
         self.backend.progress_updated.connect(self._on_backend_progress)
         self.backend.status_changed.connect(self.update_status_ui)
         self.backend.deploy_info_ready.connect(self._show_credentials_dialog)
-        self.backend.napcat_network_config_finished.connect(self._finish_napcat_network_config)
+        self.backend.napcat_network_config_finished.connect(
+            self._finish_napcat_network_config
+        )
         self.backend.image_status_result.connect(self._on_image_status_result)
         self.backend.image_pull_result.connect(self._on_image_pull_result)
         self.backend.update_optional_confirm.connect(self._on_update_optional_confirm)
@@ -333,7 +359,9 @@ class MainWindow(QMainWindow):
         self.btn_repo.setToolTip("主仓库: KroMiose/nekro-agent")
         self.btn_repo.setFixedHeight(32)
         self.btn_repo.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_repo.clicked.connect(lambda: webbrowser.open("https://github.com/KroMiose/nekro-agent"))
+        self.btn_repo.clicked.connect(
+            lambda: webbrowser.open("https://github.com/KroMiose/nekro-agent")
+        )
         footer_row.addWidget(self.btn_repo, 0, Qt.AlignmentFlag.AlignLeft)
 
         footer_row.addStretch()
@@ -345,7 +373,11 @@ class MainWindow(QMainWindow):
         self.btn_feedback.setToolTip("反馈问题")
         self.btn_feedback.setFixedHeight(32)
         self.btn_feedback.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_feedback.clicked.connect(lambda: webbrowser.open("https://github.com/NekroAI/nekro-agent-for-windows/issues/new"))
+        self.btn_feedback.clicked.connect(
+            lambda: webbrowser.open(
+                "https://github.com/NekroAI/nekro-agent-for-windows/issues/new"
+            )
+        )
         footer_row.addWidget(self.btn_feedback, 0, Qt.AlignmentFlag.AlignRight)
         sidebar_layout.addLayout(footer_row)
 
@@ -405,7 +437,9 @@ class MainWindow(QMainWindow):
 
         if hasattr(self, "sidebar_toggle_btn"):
             self.sidebar_toggle_btn.setText("»" if collapsed else "«")
-            self.sidebar_toggle_btn.setToolTip("展开侧边栏" if collapsed else "收起侧边栏")
+            self.sidebar_toggle_btn.setToolTip(
+                "展开侧边栏" if collapsed else "收起侧边栏"
+            )
 
         if hasattr(self, "sidebar_layout"):
             margins = (10, 18, 10, 18) if collapsed else (22, 24, 22, 24)
@@ -416,14 +450,25 @@ class MainWindow(QMainWindow):
 
         for button in getattr(self, "_sidebar_nav_buttons", []):
             button.setProperty("collapsed", collapsed)
-            button.setText(button.property("compact_text") if collapsed else button.property("full_text"))
+            button.setText(
+                button.property("compact_text")
+                if collapsed
+                else button.property("full_text")
+            )
             button.style().unpolish(button)
             button.style().polish(button)
 
-        for button in [getattr(self, "btn_repo", None), getattr(self, "btn_feedback", None)]:
+        for button in [
+            getattr(self, "btn_repo", None),
+            getattr(self, "btn_feedback", None),
+        ]:
             if button is None:
                 continue
-            button.setText(button.property("compact_text") if collapsed else button.property("full_text"))
+            button.setText(
+                button.property("compact_text")
+                if collapsed
+                else button.property("full_text")
+            )
             button.setFixedWidth(32 if collapsed else 84)
 
     def resizeEvent(self, event):
@@ -539,6 +584,7 @@ class MainWindow(QMainWindow):
         if current_url:
             try:
                 from urllib.parse import urlparse
+
                 host = urlparse(current_url).hostname
                 if host:
                     return host
@@ -551,8 +597,16 @@ class MainWindow(QMainWindow):
     def _refresh_browser_nav_buttons(self):
         current_view = self._current_webview()
         has_view = current_view is not None
-        target = current_view.property("browser_target") if current_view else self.current_browser_target
-        napcat_visible = bool(has_view and target == "napcat" and self.config.get("deploy_mode") == "napcat")
+        target = (
+            current_view.property("browser_target")
+            if current_view
+            else self.current_browser_target
+        )
+        napcat_visible = bool(
+            has_view
+            and target == "napcat"
+            and self.config.get("deploy_mode") == "napcat"
+        )
 
         if hasattr(self, "browser_back_btn"):
             self.browser_back_btn.setEnabled(has_view)
@@ -561,7 +615,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, "browser_reload_btn"):
             self.browser_reload_btn.setEnabled(has_view)
         if hasattr(self, "browser_fill_credentials_btn"):
-            self.browser_fill_credentials_btn.setEnabled(has_view and self._has_fillable_browser_credentials())
+            self.browser_fill_credentials_btn.setEnabled(
+                has_view and self._has_fillable_browser_credentials()
+            )
         if hasattr(self, "browser_config_napcat_btn"):
             self.browser_config_napcat_btn.setVisible(napcat_visible)
             self.browser_config_napcat_btn.setEnabled(
@@ -569,14 +625,20 @@ class MainWindow(QMainWindow):
                 and self._has_napcat_network_config_payload()
                 and not self._napcat_network_config_in_progress
             )
-            self.browser_config_napcat_btn.setText("配网中..." if self._napcat_network_config_in_progress else "一键配网")
+            self.browser_config_napcat_btn.setText(
+                "配网中..." if self._napcat_network_config_in_progress else "一键配网"
+            )
         if hasattr(self, "browser_open_external_btn"):
             self.browser_open_external_btn.setEnabled(has_view)
 
     def _has_fillable_browser_credentials(self):
         info = self.config.get("deploy_info") or {}
         current_view = self._current_webview()
-        target = current_view.property("browser_target") if current_view else self.current_browser_target
+        target = (
+            current_view.property("browser_target")
+            if current_view
+            else self.current_browser_target
+        )
         if target == "napcat":
             return bool(info.get("napcat_token"))
         return bool(info.get("admin_password"))
@@ -584,7 +646,11 @@ class MainWindow(QMainWindow):
     def _browser_fill_credentials_payload(self):
         info = self.config.get("deploy_info") or {}
         current_view = self._current_webview()
-        target = current_view.property("browser_target") if current_view else self.current_browser_target
+        target = (
+            current_view.property("browser_target")
+            if current_view
+            else self.current_browser_target
+        )
         if target == "napcat":
             token = info.get("napcat_token", "")
             if not token:
@@ -614,7 +680,9 @@ class MainWindow(QMainWindow):
     def _guard_napcat_network_config_busy(self, action_text):
         if not self._napcat_network_config_in_progress:
             return True
-        self._show_notice_dialog("提示", f"NapCat 一键配网进行中，请等待完成后再{action_text}。")
+        self._show_notice_dialog(
+            "提示", f"NapCat 一键配网进行中，请等待完成后再{action_text}。"
+        )
         return False
 
     def _blocking_status_detail(self, status=None):
@@ -662,13 +730,23 @@ class MainWindow(QMainWindow):
             return
         index = self.browser_tabs.indexOf(browser_view)
         if index >= 0:
-            self.browser_tabs.setTabText(index, self._browser_tab_text(browser_view, title=title, url=url))
+            self.browser_tabs.setTabText(
+                index, self._browser_tab_text(browser_view, title=title, url=url)
+            )
 
     def _create_browser_tab(self, switch_to=True, title="新标签页"):
         channel = self._release_channel()
         browser_view = WebViewWidget(parent=self, data_subfolder=channel)
-        browser_view.urlChanged.connect(lambda changed_url, view=browser_view: self._on_browser_url_changed(view, changed_url))
-        browser_view.titleChanged.connect(lambda changed_title, view=browser_view: self._on_browser_title_changed(view, changed_title))
+        browser_view.urlChanged.connect(
+            lambda changed_url, view=browser_view: self._on_browser_url_changed(
+                view, changed_url
+            )
+        )
+        browser_view.titleChanged.connect(
+            lambda changed_title, view=browser_view: self._on_browser_title_changed(
+                view, changed_title
+            )
+        )
 
         index = self.browser_tabs.addTab(browser_view, title)
         if switch_to:
@@ -677,7 +755,11 @@ class MainWindow(QMainWindow):
         return browser_view
 
     def _close_browser_tab(self, index):
-        if not hasattr(self, "browser_tabs") or index < 0 or index >= self.browser_tabs.count():
+        if (
+            not hasattr(self, "browser_tabs")
+            or index < 0
+            or index >= self.browser_tabs.count()
+        ):
             return
 
         widget = self.browser_tabs.widget(index)
@@ -686,8 +768,14 @@ class MainWindow(QMainWindow):
             widget.deleteLater()
 
         if self.browser_tabs.count() == 0:
-            browser_view = self._create_browser_tab(switch_to=True, title=self._target_label(self.current_browser_target))
-            self._set_browser_target(self.current_browser_target, force_reload=True, browser_view=browser_view)
+            browser_view = self._create_browser_tab(
+                switch_to=True, title=self._target_label(self.current_browser_target)
+            )
+            self._set_browser_target(
+                self.current_browser_target,
+                force_reload=True,
+                browser_view=browser_view,
+            )
         else:
             self._on_browser_tab_changed(self.browser_tabs.currentIndex())
 
@@ -695,19 +783,25 @@ class MainWindow(QMainWindow):
         enabled = self._advanced_features_enabled()
         preview_mode = self._release_channel() == "preview"
         if hasattr(self, "btn_enable_advanced"):
-            self.btn_enable_advanced.setText("关闭高级功能" if enabled else "启用高级功能")
+            self.btn_enable_advanced.setText(
+                "关闭高级功能" if enabled else "启用高级功能"
+            )
             self.btn_enable_advanced.setChecked(enabled)
             self.btn_enable_advanced.setEnabled(not (enabled and preview_mode))
         if hasattr(self, "advanced_hint"):
             self.advanced_hint.setText(
                 "当前处于预览版模式，高级功能已锁定；恢复到正式版后才可关闭。"
                 if enabled and preview_mode
-                else "已启用后，总览控制台会显示预览版入口。"
-                if enabled
-                else "开启后会在总览控制台显示“切换至预览版”入口。"
+                else (
+                    "已启用后，总览控制台会显示预览版入口。"
+                    if enabled
+                    else "开启后会在总览控制台显示“切换至预览版”入口。"
+                )
             )
         if hasattr(self, "advanced_status_badge"):
-            self.advanced_status_badge.setText("预览版模式" if preview_mode else "高级功能已启用")
+            self.advanced_status_badge.setText(
+                "预览版模式" if preview_mode else "高级功能已启用"
+            )
             self.advanced_status_badge.setVisible(enabled)
         if hasattr(self, "advanced_status_hint"):
             self.advanced_status_hint.setText(
@@ -749,18 +843,26 @@ class MainWindow(QMainWindow):
         self._begin_update_session(dialog, "preview")
         self.btn_primary_preview.setEnabled(False)
         self.btn_primary_preview.setText(self._preview_button_label())
-        self.log_viewer_app.append("<span style='color:#7ce0a3;'>[INFO]</span> 开始切换到预览版 Nekro Agent...")
+        self.log_viewer_app.append(
+            "<span style='color:#7ce0a3;'>[INFO]</span> 开始切换到预览版 Nekro Agent..."
+        )
         if hasattr(self, "log_preview"):
-            self.log_preview.append("<span style='color:#7ce0a3;'>[INFO]</span> 开始切换到预览版 Nekro Agent...")
+            self.log_preview.append(
+                "<span style='color:#7ce0a3;'>[INFO]</span> 开始切换到预览版 Nekro Agent..."
+            )
         self.backend.switch_to_preview(create_backup=create_backup)
 
     def _start_restore_stable(self, dialog):
         self._begin_update_session(dialog, "restore")
         self.btn_primary_preview.setEnabled(False)
         self.btn_primary_preview.setText(self._preview_button_label())
-        self.log_viewer_app.append("<span style='color:#7ce0a3;'>[INFO]</span> 开始恢复正式版 Nekro Agent...")
+        self.log_viewer_app.append(
+            "<span style='color:#7ce0a3;'>[INFO]</span> 开始恢复正式版 Nekro Agent..."
+        )
         if hasattr(self, "log_preview"):
-            self.log_preview.append("<span style='color:#7ce0a3;'>[INFO]</span> 开始恢复正式版 Nekro Agent...")
+            self.log_preview.append(
+                "<span style='color:#7ce0a3;'>[INFO]</span> 开始恢复正式版 Nekro Agent..."
+            )
         self.backend.restore_stable_from_backup()
 
     def _show_preview_switch_dialog(self, backup_size):
@@ -825,24 +927,37 @@ class MainWindow(QMainWindow):
         if not self._guard_blocking_status_idle("切换预览版"):
             return
         if self._update_in_progress:
-            self._show_notice_dialog("提示", "当前已有更新任务正在进行，请等待完成后再试。")
+            self._show_notice_dialog(
+                "提示", "当前已有更新任务正在进行，请等待完成后再试。"
+            )
             return
         if not self.config.get("deploy_mode"):
             self._show_notice_dialog("提示", "尚未完成部署，无法切换到预览版。")
             return
         if not self._service_ready():
-            self._show_notice_dialog("提示", "服务未处于运行中，无法切换预览版。请先启动并等待服务就绪。")
+            self._show_notice_dialog(
+                "提示", "服务未处于运行中，无法切换预览版。请先启动并等待服务就绪。"
+            )
             return
         preview_mode = self._release_channel() == "preview"
         if preview_mode:
             if not hasattr(self.backend, "restore_stable_from_backup"):
-                self._show_notice_dialog("提示", f"当前后端 {self.backend.display_name} 暂不支持恢复正式版。")
+                self._show_notice_dialog(
+                    "提示", f"当前后端 {self.backend.display_name} 暂不支持恢复正式版。"
+                )
                 return
             if not self.config.get("preview_backup_available"):
-                self._show_notice_dialog("提示", "当前预览版是在未备份的情况下切换的，无法恢复到正式版。")
+                self._show_notice_dialog(
+                    "提示", "当前预览版是在未备份的情况下切换的，无法恢复到正式版。"
+                )
                 return
-            if hasattr(self.backend, "preview_backup_exists") and not self.backend.preview_backup_exists():
-                self._show_notice_dialog("提示", "未找到预览版备份文件，无法恢复到正式版。")
+            if (
+                hasattr(self.backend, "preview_backup_exists")
+                and not self.backend.preview_backup_exists()
+            ):
+                self._show_notice_dialog(
+                    "提示", "未找到预览版备份文件，无法恢复到正式版。"
+                )
                 return
 
             dialog = self._create_update_dialog(
@@ -858,7 +973,9 @@ class MainWindow(QMainWindow):
             return
 
         if not hasattr(self.backend, "switch_to_preview"):
-            self._show_notice_dialog("提示", f"当前后端 {self.backend.display_name} 暂不支持切换到预览版。")
+            self._show_notice_dialog(
+                "提示", f"当前后端 {self.backend.display_name} 暂不支持切换到预览版。"
+            )
             return
 
         backup_size = "未知"
@@ -875,12 +992,22 @@ class MainWindow(QMainWindow):
         dialog = self._create_update_dialog(
             "切换到预览版",
             "正在准备切换到预览版 Nekro Agent。",
-            lambda dlg=None, create_backup=(action == "backup"): self._start_preview_switch(dialog, create_backup),
+            lambda dlg=None, create_backup=(
+                action == "backup"
+            ): self._start_preview_switch(dialog, create_backup),
             confirm_text="开始切换",
         )
         dialog.exec()
 
-    def _show_confirm_dialog(self, title, text, confirm_text="确认", cancel_text="取消", danger=False, parent=None):
+    def _show_confirm_dialog(
+        self,
+        title,
+        text,
+        confirm_text="确认",
+        cancel_text="取消",
+        danger=False,
+        parent=None,
+    ):
         dialog = QDialog(parent or self)
         dialog.setWindowTitle(title)
         dialog.setMinimumWidth(360)
@@ -895,7 +1022,9 @@ class MainWindow(QMainWindow):
         title_label = QLabel(title)
         title_label.setProperty("role", "dialog_title")
         title_label.setWordWrap(True)
-        title_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        title_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
         layout.addWidget(title_label)
 
         desc_label = QLabel(text)
@@ -925,7 +1054,9 @@ class MainWindow(QMainWindow):
     def _create_update_dialog(self, title, text, on_confirm, confirm_text="开始更新"):
         dialog = UpdateProgressDialog(self, title, text, confirm_text=confirm_text)
         dialog.confirmed.connect(on_confirm)
-        dialog.finished.connect(lambda _result, dlg=dialog: self._on_update_dialog_closed(dlg))
+        dialog.finished.connect(
+            lambda _result, dlg=dialog: self._on_update_dialog_closed(dlg)
+        )
         return dialog
 
     def _on_update_dialog_closed(self, dialog):
@@ -954,24 +1085,33 @@ class MainWindow(QMainWindow):
         if not self._active_update_dialog:
             return
 
-        header = self._pull_stage_header or message
-        detail_text = self._pull_summary_text
+        pull_view = getattr(self, "pull_progress_view", None)
+        header = pull_view.stage_header if pull_view and pull_view.stage_header else message
+        detail_text = pull_view.summary_text if pull_view else ""
         if phase in {"start", "stage"}:
-            self._active_update_dialog.set_progress(status_text=header, detail_text="", busy=True)
+            self._active_update_dialog.set_progress(
+                status_text=header, detail_text="", busy=True
+            )
         elif phase == "update":
-            if self._pull_layer_order:
+            if pull_view and pull_view.has_layers:
                 self._active_update_dialog.set_progress(
                     status_text=header,
                     detail_text=detail_text,
-                    value=self.pull_overall_bar.value(),
+                    value=pull_view.value,
                     busy=False,
                 )
             else:
-                self._active_update_dialog.set_progress(status_text=header, detail_text="", busy=True)
+                self._active_update_dialog.set_progress(
+                    status_text=header, detail_text="", busy=True
+                )
         elif phase == "done":
-            self._active_update_dialog.set_progress(status_text=header, detail_text=detail_text, value=100, busy=False)
+            self._active_update_dialog.set_progress(
+                status_text=header, detail_text=detail_text, value=100, busy=False
+            )
         elif phase == "error":
-            self._active_update_dialog.set_progress(status_text=message, detail_text="", busy=False)
+            self._active_update_dialog.set_progress(
+                status_text=message, detail_text="", busy=False
+            )
 
     def _lookup_image_meta(self, image_ref):
         for ref, name, desc, modes in self._managed_images():
@@ -979,11 +1119,18 @@ class MainWindow(QMainWindow):
                 return name, desc
         return image_ref, ""
 
+    def _is_cc_sandbox_image(self, image_ref):
+        return image_ref.split(":", 1)[0] == "kromiose/nekro-cc-sandbox"
+
     def _start_remote_update(self, dialog):
         self._begin_update_session(dialog, "remote")
-        self.log_viewer_app.append("<span style='color:#7ce0a3;'>[INFO]</span> 开始升级 Nekro Agent...")
+        self.log_viewer_app.append(
+            "<span style='color:#7ce0a3;'>[INFO]</span> 开始升级 Nekro Agent..."
+        )
         if hasattr(self, "log_preview"):
-            self.log_preview.append("<span style='color:#7ce0a3;'>[INFO]</span> 开始升级 Nekro Agent...")
+            self.log_preview.append(
+                "<span style='color:#7ce0a3;'>[INFO]</span> 开始升级 Nekro Agent..."
+            )
         self.btn_update_action.setEnabled(False)
         self.btn_primary_update.setEnabled(False)
         self.btn_primary_update.setText("升级中...")
@@ -1012,10 +1159,14 @@ class MainWindow(QMainWindow):
             self._show_notice_dialog("提示", "尚未完成部署，无法执行升级。")
             return
         if not self._service_ready():
-            self._show_notice_dialog("提示", "服务未处于运行中，无法执行升级。请先启动并等待服务就绪。")
+            self._show_notice_dialog(
+                "提示", "服务未处于运行中，无法执行升级。请先启动并等待服务就绪。"
+            )
             return
         if not hasattr(self.backend, "run_remote_update"):
-            self._show_notice_dialog("提示", f"当前后端 {self.backend.display_name} 暂不支持升级。")
+            self._show_notice_dialog(
+                "提示", f"当前后端 {self.backend.display_name} 暂不支持升级。"
+            )
             return
 
         dialog = self._create_update_dialog(
@@ -1027,17 +1178,28 @@ class MainWindow(QMainWindow):
 
     def _show_image_update_dialog(self, image_ref):
         if self._update_in_progress:
-            self._show_notice_dialog("提示", "当前已有更新任务正在进行，请等待完成后再试。")
+            self._show_notice_dialog(
+                "提示", "当前已有更新任务正在进行，请等待完成后再试。"
+            )
             return
 
         image_name, image_desc = self._lookup_image_meta(image_ref)
         desc = f"将拉取最新的 {image_name} 镜像并应用更新。"
         if image_desc:
             desc += f"\n\n{image_desc}"
+        if self._is_cc_sandbox_image(image_ref):
+            doc_url = "https://doc.nekro.ai/docs/03_workspace/claude_code_sandbox.html"
+            desc += (
+                "\n\nClaude Code 沙盒属于进阶功能。"
+                "请先阅读文档确认自己需要该功能：\n"
+                f"{doc_url}"
+            )
         dialog = self._create_update_dialog(
             f"确认更新 {image_name}",
             desc,
-            lambda dlg=None, ref=image_ref: self._start_single_image_update(ref, dialog),
+            lambda dlg=None, ref=image_ref: self._start_single_image_update(
+                ref, dialog
+            ),
         )
         dialog.exec()
 
@@ -1057,7 +1219,14 @@ class MainWindow(QMainWindow):
 
     def switch_tab(self, index):
         self.stack.setCurrentIndex(index)
-        buttons = [self.btn_home, self.btn_browser, self.btn_logs, self.btn_files, self.btn_images, self.btn_settings]
+        buttons = [
+            self.btn_home,
+            self.btn_browser,
+            self.btn_logs,
+            self.btn_files,
+            self.btn_images,
+            self.btn_settings,
+        ]
         for current, button in enumerate(buttons):
             button.setChecked(current == index)
 
@@ -1106,6 +1275,7 @@ class MainWindow(QMainWindow):
 
     def _on_app_update_available(self, info: dict):
         import time
+
         self.config.set("last_app_update_check_ts", int(time.time()))
         self._app_update_found = True
 
@@ -1124,9 +1294,12 @@ class MainWindow(QMainWindow):
 
         if not getattr(self, "_app_update_silent", True):
             import time
+
             self.config.set("last_app_update_check_ts", int(time.time()))
             if not getattr(self, "_app_update_found", False):
-                self._show_notice_dialog("检查完成", f"当前已是最新版本 v{APP_VERSION}。")
+                self._show_notice_dialog(
+                    "检查完成", f"当前已是最新版本 v{APP_VERSION}。"
+                )
 
     def _show_app_update_dialog(self, info: dict):
         from ui.update_dialog import AppUpdateDialog
@@ -1142,7 +1315,9 @@ class MainWindow(QMainWindow):
         self._run_app_update_check(silent=False)
 
     def _on_startup(self):
-        is_first_run = self.config.get("first_run") or not self.config.get("deploy_mode")
+        is_first_run = self.config.get("first_run") or not self.config.get(
+            "deploy_mode"
+        )
 
         if is_first_run:
             self._dismiss_splash_for_wizard()
@@ -1162,6 +1337,7 @@ class MainWindow(QMainWindow):
                 )
                 self._show_first_run_dialog()
             else:
+
                 def _show_after_splash():
                     self._show_notice_dialog(
                         "运行环境缺失",
@@ -1169,6 +1345,7 @@ class MainWindow(QMainWindow):
                         danger=True,
                     )
                     self._show_first_run_dialog()
+
                 QTimer.singleShot(500, _show_after_splash)
             return
 
@@ -1205,7 +1382,6 @@ class MainWindow(QMainWindow):
 
     def _show_migration_choice(self, instances):
         """发现已有实例，询问用户是迁移还是全新部署。"""
-        from PyQt6.QtWidgets import QMessageBox
 
         count = len(instances)
         msg = QMessageBox(self)
@@ -1248,8 +1424,14 @@ class MainWindow(QMainWindow):
             self._pending_inst_data = inst_data
         else:
             self._pending_inst_data = None
-        nekro_port = (inst_data or {}).get("nekro_port") or self.config.get("nekro_port") or 8021
-        napcat_port = (inst_data or {}).get("napcat_port") or self.config.get("napcat_port") or 6099
+        nekro_port = (
+            (inst_data or {}).get("nekro_port") or self.config.get("nekro_port") or 8021
+        )
+        napcat_port = (
+            (inst_data or {}).get("napcat_port")
+            or self.config.get("napcat_port")
+            or 6099
+        )
         self.browser_urls["nekro"] = f"http://localhost:{nekro_port}"
         self.browser_urls["napcat"] = f"http://localhost:{napcat_port}"
         if hasattr(self, "nekro_port_setting"):
@@ -1258,7 +1440,7 @@ class MainWindow(QMainWindow):
             self.napcat_port_setting.setText(str(napcat_port))
         self._refresh_port_settings_ui()
         self._schedule_next_image_update_check()
-        self.start_deploy(deploy_mode_override=mode)
+        self.start_deploy(show_logs=False, deploy_mode_override=mode)
 
     _LOG_MAX_BLOCKS = 5000
     _LOG_PREVIEW_MAX_BLOCKS = 500
@@ -1297,7 +1479,9 @@ class MainWindow(QMainWindow):
             self.log_viewer_app.append(formatted)
             self._trim_log_viewer(self.log_viewer_app)
             if hasattr(self, "log_preview"):
-                self.log_preview.append(f"<span style='color:{color};'>[{level.upper()}] {msg}</span>")
+                self.log_preview.append(
+                    f"<span style='color:{color};'>[{level.upper()}] {msg}</span>"
+                )
                 self._trim_log_viewer(self.log_preview, self._LOG_PREVIEW_MAX_BLOCKS)
 
         try:
@@ -1316,7 +1500,11 @@ class MainWindow(QMainWindow):
         if overflow > 0:
             cursor = QTextCursor(doc)
             cursor.movePosition(QTextCursor.MoveOperation.Start)
-            cursor.movePosition(QTextCursor.MoveOperation.Down, QTextCursor.MoveMode.KeepAnchor, overflow)
+            cursor.movePosition(
+                QTextCursor.MoveOperation.Down,
+                QTextCursor.MoveMode.KeepAnchor,
+                overflow,
+            )
             cursor.removeSelectedText()
             cursor.deleteChar()
 
@@ -1328,85 +1516,9 @@ class MainWindow(QMainWindow):
         for current, button in enumerate(buttons):
             button.setChecked(current == index)
 
-    def _set_pull_view_visible(self, visible):
-        if hasattr(self, "pull_view_frame"):
-            self.pull_view_frame.setVisible(visible)
-        if hasattr(self, "pull_spinner_label"):
-            if visible:
-                self.pull_spinner_label.start(80)
-            else:
-                self.pull_spinner_label.stop()
-
-    def _summarize_pull_layers(self):
-        total = len(self._pull_layer_order)
-        if total <= 0:
-            return ""
-
-        done = 0
-        downloading = 0
-        extracting = 0
-        verifying = 0
-        waiting = 0
-
-        for layer_id in self._pull_layer_order:
-            status = self._pull_layers.get(layer_id, "")
-            if status.startswith(("Pull complete", "Already exists", "Download complete")):
-                done += 1
-            elif status.startswith("Downloading"):
-                downloading += 1
-            elif status.startswith("Extracting"):
-                extracting += 1
-            elif status.startswith("Verifying"):
-                verifying += 1
-            elif status.startswith(("Waiting", "Pulling fs layer")):
-                waiting += 1
-
-        parts = [f"已完成 {done}/{total} 层"]
-        if downloading:
-            parts.append(f"下载中 {downloading} 层")
-        if extracting:
-            parts.append(f"解压中 {extracting} 层")
-        if verifying:
-            parts.append(f"校验中 {verifying} 层")
-        if waiting:
-            parts.append(f"等待中 {waiting} 层")
-        return "，".join(parts)
-
-    def _refresh_pull_status_label(self):
-        text_parts = [part for part in [self._pull_stage_header, self._pull_summary_text] if part]
-        self.pull_status_label.setText("\n".join(text_parts))
-
-    def _update_pull_view(self, header="", detail=""):
-        if header:
-            self._pull_stage_header = header
-        if detail:
-            layer_match = re.match(r"^([a-f0-9]{6,64}):\s*(.+)$", detail, re.IGNORECASE)
-            if layer_match:
-                layer_id, status = layer_match.groups()
-                short_id = layer_id[:12]
-                if short_id not in self._pull_layers:
-                    self._pull_layer_order.append(short_id)
-                self._pull_layers[short_id] = status
-                # 更新进度条
-                total = len(self._pull_layer_order)
-                done = sum(
-                    1 for lid in self._pull_layer_order
-                    if self._pull_layers.get(lid, "").startswith(("Pull complete", "Already exists", "Download complete"))
-                )
-                if total > 0:
-                    self.pull_overall_bar.setValue(int(done * 100 / total))
-                self._pull_summary_text = self._summarize_pull_layers()
-        self._refresh_pull_status_label()
-        self._set_pull_view_visible(True)
-
     def _clear_pull_progress(self):
-        self._pull_stage_header = ""
-        self._pull_summary_text = ""
-        self._pull_layers.clear()
-        self._pull_layer_order.clear()
-        self.pull_status_label.setText("")
-        self.pull_overall_bar.setValue(0)
-        self._set_pull_view_visible(False)
+        if hasattr(self, "pull_progress_view"):
+            self.pull_progress_view.reset()
 
     def _on_backend_progress(self, text):
         if text.startswith("__pull_progress__|"):
@@ -1414,24 +1526,20 @@ class MainWindow(QMainWindow):
             if len(parts) < 3:
                 return
             _, phase, message = parts
+            pull_view = getattr(self, "pull_progress_view", None)
+            if not pull_view:
+                return
             if phase == "start":
-                self._clear_pull_progress()
-                self._update_pull_view(header=message)
+                pull_view.start(message)
             elif phase == "update":
-                self._update_pull_view(detail=message)
+                pull_view.update(detail=message)
             elif phase == "stage":
-                self._pull_stage_header = message
-                self._pull_summary_text = ""
-                self._pull_layers.clear()
-                self._pull_layer_order.clear()
-                self.pull_overall_bar.setValue(0)
-                self._update_pull_view(header=message)
+                pull_view.begin_stage(message)
             elif phase == "done":
-                self.pull_overall_bar.setValue(100)
-                self._update_pull_view(header=message)
+                pull_view.finish(message)
                 QTimer.singleShot(2000, self._clear_pull_progress)
             elif phase == "error":
-                self._update_pull_view(header=message)
+                pull_view.fail(message)
             self._set_active_update_progress(phase, message)
             return
         if text in {"__docker_done__", "__docker_fail__"}:
@@ -1449,7 +1557,9 @@ class MainWindow(QMainWindow):
         return "NapCat" if target == "napcat" else "Nekro Agent"
 
     def _target_url(self, target=None):
-        return self.browser_urls.get(target or self.current_browser_target, self.browser_urls["nekro"])
+        return self.browser_urls.get(
+            target or self.current_browser_target, self.browser_urls["nekro"]
+        )
 
     def _can_access_target(self, target):
         return target == "nekro" or self.config.get("deploy_mode") == "napcat"
@@ -1501,11 +1611,17 @@ class MainWindow(QMainWindow):
         for state in tab_states:
             target = state["target"]
             url = state["url"]
-            title = self._target_label(target) if target in {"nekro", "napcat"} else "新标签页"
+            title = (
+                self._target_label(target)
+                if target in {"nekro", "napcat"}
+                else "新标签页"
+            )
             browser_view = self._create_browser_tab(switch_to=False, title=title)
             browser_view.setProperty("browser_target", target)
             if target in {"nekro", "napcat"}:
-                self._set_browser_target(target, force_reload=True, browser_view=browser_view)
+                self._set_browser_target(
+                    target, force_reload=True, browser_view=browser_view
+                )
             elif url:
                 browser_view.load_url(url)
 
@@ -1532,7 +1648,9 @@ class MainWindow(QMainWindow):
 
         browser_view = browser_view or self._current_webview()
         if browser_view is None:
-            browser_view = self._create_browser_tab(switch_to=True, title=self._target_label(target))
+            browser_view = self._create_browser_tab(
+                switch_to=True, title=self._target_label(target)
+            )
 
         self.current_browser_target = target
         self.btn_browser_nekro.setChecked(target == "nekro")
@@ -1559,7 +1677,9 @@ class MainWindow(QMainWindow):
                 f"{target_name} 服务尚未启动。<br><br>"
                 "先在“总览控制台”完成部署，然后回到这里点击“刷新内嵌页面”。"
             )
-            browser_view.load_html(f"<html><body style='font-family:Segoe UI;padding:24px;color:#243649;'>{placeholder}</body></html>")
+            browser_view.load_html(
+                f"<html><body style='font-family:Segoe UI;padding:24px;color:#243649;'>{placeholder}</body></html>"
+            )
 
         self._refresh_browser_nav_buttons()
 
@@ -1699,12 +1819,18 @@ class MainWindow(QMainWindow):
         if current_view is None:
             return
 
-        target = current_view.property("browser_target") if current_view else self.current_browser_target
+        target = (
+            current_view.property("browser_target")
+            if current_view
+            else self.current_browser_target
+        )
         if target != "napcat":
             self._show_notice_dialog("提示", "请先切换到 NapCat 页面，再执行一键配网。")
             return
         if not getattr(self.backend, "is_running", False):
-            self._show_notice_dialog("提示", "当前服务未启动，请先完成部署并等待 NapCat 可访问。")
+            self._show_notice_dialog(
+                "提示", "当前服务未启动，请先完成部署并等待 NapCat 可访问。"
+            )
             return
         if self._napcat_network_config_in_progress:
             return
@@ -1771,7 +1897,12 @@ class MainWindow(QMainWindow):
         if inst is None and inst_id:
             inst = self.config.get_instance(inst_id)
         if inst:
-            return inst.get("remark", "").strip() or inst.get("instance_name", "").rstrip("_") or inst_id or "default"
+            return (
+                inst.get("remark", "").strip()
+                or inst.get("instance_name", "").rstrip("_")
+                or inst_id
+                or "default"
+            )
         return inst_id or "default"
 
     def _apply_active_instance_config(self, inst_id):
@@ -1801,7 +1932,9 @@ class MainWindow(QMainWindow):
             current_view = self._current_webview()
             if current_view is not None:
                 current_view.setProperty("browser_target", target)
-                self._set_browser_target(target, force_reload=force_reload, browser_view=current_view)
+                self._set_browser_target(
+                    target, force_reload=force_reload, browser_view=current_view
+                )
             self._sync_browser_url_label(self._target_url(target))
         self._refresh_browser_nav_buttons()
 
@@ -1826,7 +1959,9 @@ class MainWindow(QMainWindow):
             return False
 
         display = self._instance_display_name(inst_id, inst)
-        self.append_log(f"已切换到实例「{display}」，正在同步日志和内置浏览器。", "info")
+        self.append_log(
+            f"已切换到实例「{display}」，正在同步日志和内置浏览器。", "info"
+        )
         self._switch_log_reader_to_active_instance()
         self._sync_browser_to_active_instance(force_reload=True)
         self._refresh_log_tabs_for_active_instance()
@@ -1853,12 +1988,13 @@ class MainWindow(QMainWindow):
         title.setProperty("role", "dialog_title")
         layout.addWidget(title)
 
-        desc = QLabel("切换后，总览、日志和内置浏览器将指向所选实例；不会自动启动或停止实例服务。")
+        desc = QLabel(
+            "切换后，总览、日志和内置浏览器将指向所选实例；不会自动启动或停止实例服务。"
+        )
         desc.setProperty("role", "dialog_desc")
         desc.setWordWrap(True)
         layout.addWidget(desc)
 
-        from ui.widgets import StyledComboBox
         combo = StyledComboBox()
         combo.setMinimumWidth(360)
         active_id = self.config.get_active_instance_id()
@@ -1917,6 +2053,7 @@ class MainWindow(QMainWindow):
         self.browser_urls["napcat"] = f"http://localhost:{napcat_port}"
 
         import threading
+
         threading.Thread(
             target=self.backend._log_reader,
             args=(DISTRO_NAME, deploy_dir, log_prefix, inst_id),
@@ -1942,7 +2079,8 @@ class MainWindow(QMainWindow):
             self.btn_instance_switch.setVisible(len(instances) > 1)
             self.btn_instance_switch.setToolTip(
                 f"当前实例: {inst_display}。点击切换日志和内置浏览器指向的实例。"
-                if inst_display else "切换日志和内置浏览器指向的实例。"
+                if inst_display
+                else "切换日志和内置浏览器指向的实例。"
             )
 
         mode_value = self.metric_mode.findChild(QLabel, "MetricValue")
@@ -1954,7 +2092,9 @@ class MainWindow(QMainWindow):
             self.mode_display.setText(mode_text)
         if hasattr(self, "wsldir_edit"):
             self.wsldir_edit.setText(self.config.get("wsl_install_dir") or "未配置")
-        if hasattr(self, "_settings_page") and hasattr(self._settings_page, "_refresh_instance_info"):
+        if hasattr(self, "_settings_page") and hasattr(
+            self._settings_page, "_refresh_instance_info"
+        ):
             self._settings_page._refresh_instance_info()
         self._refresh_port_settings_ui()
         if hasattr(self, "datadir_edit"):
@@ -1975,7 +2115,9 @@ class MainWindow(QMainWindow):
         if value_label is not None:
             value_label.setText(host_data or "当前后端暂未提供 Windows 映射路径")
         if hint_label is not None:
-            hint_label.setText("点击打开 Windows 侧文件夹" if host_data else f"容器内路径: {data_dir}")
+            hint_label.setText(
+                "点击打开 Windows 侧文件夹" if host_data else f"容器内路径: {data_dir}"
+            )
 
         self.metric_data_dir.setToolTip(host_data or data_dir)
         self.metric_data_dir.set_clickable(bool(host_data))
@@ -1998,7 +2140,9 @@ class MainWindow(QMainWindow):
                 self._show_notice_dialog("提示", "服务已在运行中")
                 return
 
-        self._do_deploy(deploy_mode_override, show_logs, force_new_instance=is_new_instance)
+        self._do_deploy(
+            deploy_mode_override, show_logs, force_new_instance=is_new_instance
+        )
 
     def _apply_pending_instance(self):
         """将 pending 新实例写入 config 并切换为 active。"""
@@ -2019,7 +2163,9 @@ class MainWindow(QMainWindow):
         self.config.set("first_run", False)
         self.refresh_dashboard()
 
-    def _do_deploy(self, deploy_mode_override=None, show_logs=True, force_new_instance=False):
+    def _do_deploy(
+        self, deploy_mode_override=None, show_logs=True, force_new_instance=False
+    ):
         """实际执行部署（前置检查已通过）。"""
         deploy_mode = deploy_mode_override or self.config.get("deploy_mode")
         if not deploy_mode:
@@ -2037,10 +2183,14 @@ class MainWindow(QMainWindow):
         if show_logs:
             self.switch_tab(2)
         self.log_viewer_app.clear()
-        self.log_viewer_app.append(f"<span style='color:#7ce0a3;'>[INFO]</span> 开始部署服务 (模式: {deploy_mode})...")
+        self.log_viewer_app.append(
+            f"<span style='color:#7ce0a3;'>[INFO]</span> 开始部署服务 (模式: {deploy_mode})..."
+        )
         if hasattr(self, "log_preview"):
             self.log_preview.clear()
-            self.log_preview.append(f"<span style='color:#7ce0a3;'>[INFO]</span> 开始部署服务 (模式: {deploy_mode})...")
+            self.log_preview.append(
+                f"<span style='color:#7ce0a3;'>[INFO]</span> 开始部署服务 (模式: {deploy_mode})..."
+            )
 
         self.backend.start_services(deploy_mode, force_new_instance=force_new_instance)
 
@@ -2050,7 +2200,9 @@ class MainWindow(QMainWindow):
         if not self._guard_blocking_status_idle("关闭服务"):
             return
         if self._update_in_progress:
-            self._show_notice_dialog("提示", "当前有更新任务正在进行，请等待完成后再关闭服务。")
+            self._show_notice_dialog(
+                "提示", "当前有更新任务正在进行，请等待完成后再关闭服务。"
+            )
             return
         if not self.backend.is_running:
             self._show_notice_dialog("提示", "当前服务未在运行。")
@@ -2067,9 +2219,13 @@ class MainWindow(QMainWindow):
             return
 
         self.switch_tab(2)
-        self.log_viewer_app.append("<span style='color:#7ce0a3;'>[INFO]</span> 开始停止服务，用于修改部署模式...")
+        self.log_viewer_app.append(
+            "<span style='color:#7ce0a3;'>[INFO]</span> 开始停止服务，用于修改部署模式..."
+        )
         if hasattr(self, "log_preview"):
-            self.log_preview.append("<span style='color:#7ce0a3;'>[INFO]</span> 开始停止服务，用于修改部署模式...")
+            self.log_preview.append(
+                "<span style='color:#7ce0a3;'>[INFO]</span> 开始停止服务，用于修改部署模式..."
+            )
         self.backend.stop_services()
 
     def _rollback_pending_instance(self):
@@ -2130,7 +2286,9 @@ class MainWindow(QMainWindow):
         self.btn_deploy_action.setEnabled(not service_active and not blocking)
         self.btn_primary_deploy.setEnabled(not service_active and not blocking)
         if hasattr(self, "btn_new_instance_action"):
-            self.btn_new_instance_action.setEnabled(not blocking and not self._napcat_network_config_in_progress)
+            self.btn_new_instance_action.setEnabled(
+                not blocking and not self._napcat_network_config_in_progress
+            )
         can_update = (
             bool(self.config.get("deploy_mode"))
             and running
@@ -2138,11 +2296,17 @@ class MainWindow(QMainWindow):
             and not self._napcat_network_config_in_progress
         )
         if hasattr(self, "btn_stop_action"):
-            self.btn_stop_action.setEnabled(service_active and not blocking and not self._napcat_network_config_in_progress)
+            self.btn_stop_action.setEnabled(
+                service_active
+                and not blocking
+                and not self._napcat_network_config_in_progress
+            )
         self.btn_update_action.setEnabled(can_update)
         self.btn_primary_update.setEnabled(can_update)
         if hasattr(self, "btn_uninstall_action"):
-            self.btn_uninstall_action.setEnabled(not self._napcat_network_config_in_progress and not blocking)
+            self.btn_uninstall_action.setEnabled(
+                not self._napcat_network_config_in_progress and not blocking
+            )
         if hasattr(self, "btn_primary_preview"):
             self.btn_primary_preview.setEnabled(
                 self._advanced_features_enabled()
@@ -2159,9 +2323,14 @@ class MainWindow(QMainWindow):
             self.btn_primary_update.setText("升级 Nekro Agent")
             if not was_running:
                 self._schedule_next_image_update_check(delay_ms=5000)
-            if self._active_update_kind in {"remote", "preview", "restore"} and self._pending_remote_update_message:
+            if (
+                self._active_update_kind in {"remote", "preview", "restore"}
+                and self._pending_remote_update_message
+            ):
                 success_title, _failure_title = self._active_update_result_titles()
-                self._finish_update_session(True, success_title, self._pending_remote_update_message)
+                self._finish_update_session(
+                    True, success_title, self._pending_remote_update_message
+                )
             if hasattr(self, "_is_first_deploy") and self._is_first_deploy:
                 self._is_first_deploy = False
                 self._pending_inst_data = None
@@ -2177,16 +2346,26 @@ class MainWindow(QMainWindow):
             if hasattr(self, "_auto_image_check_timer"):
                 self._auto_image_check_timer.stop()
             self.btn_log_nekro.setVisible(service_active)
-            self.btn_log_napcat.setVisible(service_active and self.config.get("deploy_mode") == "napcat")
-            self.btn_primary_deploy.setText("服务仍在运行" if service_active else "开始部署")
-            self.btn_primary_update.setText("升级 Nekro Agent" if not updating else "升级中...")
+            self.btn_log_napcat.setVisible(
+                service_active and self.config.get("deploy_mode") == "napcat"
+            )
+            self.btn_primary_deploy.setText(
+                "服务仍在运行" if service_active else "开始部署"
+            )
+            self.btn_primary_update.setText(
+                "升级 Nekro Agent" if not updating else "升级中..."
+            )
             update_recovery_failed = (
                 self._active_update_kind in {"remote", "preview", "restore"}
                 and status in {"启动失败", "更新失败", "启动超时", "已停止"}
                 and (not service_active or status == "启动超时")
             )
             if update_recovery_failed:
-                action_text = "恢复正式版后服务" if self._active_update_kind == "restore" else "升级后服务"
+                action_text = (
+                    "恢复正式版后服务"
+                    if self._active_update_kind == "restore"
+                    else "升级后服务"
+                )
                 failure_message = (
                     f"{self._pending_remote_update_message}\n\n最终状态：{status}"
                     if self._pending_remote_update_message
@@ -2194,7 +2373,10 @@ class MainWindow(QMainWindow):
                 )
                 _success_title, failure_title = self._active_update_result_titles()
                 self._finish_update_session(False, failure_title, failure_message)
-            if status == "启动失败" and getattr(self, "_prev_active_instance", None) is not None:
+            if (
+                status == "启动失败"
+                and getattr(self, "_prev_active_instance", None) is not None
+            ):
                 self._rollback_pending_instance()
 
             if self._quit_after_stop and status in {"已停止", "已卸载"}:
@@ -2203,9 +2385,17 @@ class MainWindow(QMainWindow):
                 QApplication.quit()
             if self._quit_after_stop and status == "停止失败":
                 self._quit_after_stop = False
-                self._show_notice_dialog("关闭失败", "服务停止失败，启动器将继续保持打开。", danger=True)
-            if self._current_webview() is not None and was_running and not service_active:
-                self._set_browser_target(self.current_browser_target, force_reload=False)
+                self._show_notice_dialog(
+                    "关闭失败", "服务停止失败，启动器将继续保持打开。", danger=True
+                )
+            if (
+                self._current_webview() is not None
+                and was_running
+                and not service_active
+            ):
+                self._set_browser_target(
+                    self.current_browser_target, force_reload=False
+                )
             if status in {"启动失败", "更新失败", "启动超时", "已停止", "已卸载"}:
                 self._clear_pull_progress()
 
@@ -2218,7 +2408,9 @@ class MainWindow(QMainWindow):
             self._uninstall_in_progress = False
 
         if hasattr(self, "btn_browser_napcat"):
-            self.btn_browser_napcat.setVisible(self.config.get("deploy_mode") == "napcat")
+            self.btn_browser_napcat.setVisible(
+                self.config.get("deploy_mode") == "napcat"
+            )
         self._refresh_browser_nav_buttons()
 
     def _on_update_optional_confirm(self, step_label, prompt):
@@ -2266,13 +2458,16 @@ class MainWindow(QMainWindow):
 
     def _rebuild_image_rows(self):
         from ui.pages.images_page import rebuild_image_rows
+
         rebuild_image_rows(self)
 
     def _rebuild_image_rows_impl(self):
         self._rebuild_image_rows()
 
     def _tick_img_spinner(self):
-        self._img_spinner_idx = (self._img_spinner_idx + 1) % len(self._img_spinner_frames)
+        self._img_spinner_idx = (self._img_spinner_idx + 1) % len(
+            self._img_spinner_frames
+        )
         frame = self._img_spinner_frames[self._img_spinner_idx]
         if self._img_checking_ref is None:
             self.btn_check_images.setText(f"{frame} 检测中...")
@@ -2292,7 +2487,9 @@ class MainWindow(QMainWindow):
 
     def _image_update_check_interval_hours(self):
         try:
-            return max(0, int(self.config.get("image_update_check_interval_hours") or 0))
+            return max(
+                0, int(self.config.get("image_update_check_interval_hours") or 0)
+            )
         except (TypeError, ValueError):
             return 24
 
@@ -2321,7 +2518,11 @@ class MainWindow(QMainWindow):
 
         self._auto_image_check_timer.stop()
         interval_hours = self._image_update_check_interval_hours()
-        if interval_hours <= 0 or not self.config.get("deploy_mode") or self._last_status != "运行中":
+        if (
+            interval_hours <= 0
+            or not self.config.get("deploy_mode")
+            or self._last_status != "运行中"
+        ):
             self._refresh_image_update_check_hint()
             return
 
@@ -2426,11 +2627,19 @@ class MainWindow(QMainWindow):
 
         if action == "update":
             if image_ref == self._agent_image_ref():
-                widgets["btn"].clicked.connect(lambda checked=False: self._show_remote_update_dialog())
+                widgets["btn"].clicked.connect(
+                    lambda checked=False: self._show_remote_update_dialog()
+                )
             else:
-                widgets["btn"].clicked.connect(lambda checked=False, ref=image_ref: self._show_image_update_dialog(ref))
+                widgets["btn"].clicked.connect(
+                    lambda checked=False, ref=image_ref: self._show_image_update_dialog(
+                        ref
+                    )
+                )
         else:
-            widgets["btn"].clicked.connect(lambda checked=False, ref=image_ref: self._check_single_image(ref))
+            widgets["btn"].clicked.connect(
+                lambda checked=False, ref=image_ref: self._check_single_image(ref)
+            )
 
     def _apply_image_status_entry(self, entry):
         image_ref = entry.get("image")
@@ -2453,8 +2662,12 @@ class MainWindow(QMainWindow):
             widgets["remote"].setText(entry.get("remote") or "—")
             widgets["status"].setText("<span style='color:#d29922;'>未拉取</span>")
             widgets["status"].setTextFormat(Qt.TextFormat.RichText)
-            widgets["btn"].setText("检查更新")
-            self._set_image_row_action(image_ref, "check")
+            if self._is_cc_sandbox_image(image_ref):
+                widgets["btn"].setText("按需下载")
+                self._set_image_row_action(image_ref, "update")
+            else:
+                widgets["btn"].setText("检查更新")
+                self._set_image_row_action(image_ref, "check")
             return
 
         widgets["local"].setText(entry.get("local") or "—")
@@ -2552,25 +2765,35 @@ class MainWindow(QMainWindow):
                 widgets["btn"].clicked.disconnect()
             except Exception:
                 pass
-            widgets["btn"].clicked.connect(lambda checked, ref=image_ref: self._check_single_image(ref))
+            widgets["btn"].clicked.connect(
+                lambda checked, ref=image_ref: self._check_single_image(ref)
+            )
             widgets["status"].setText("<span style='color:#3fb950;'>已更新</span>")
             widgets["status"].setTextFormat(Qt.TextFormat.RichText)
             cached = dict(self._cached_image_status_map())
             cached_entry = dict(cached.get(image_ref) or {})
-            cached_entry.update({
-                "image": image_ref,
-                "has_update": False,
-                "error": None,
-                "checked_at": int(time.time()),
-            })
+            cached_entry.update(
+                {
+                    "image": image_ref,
+                    "has_update": False,
+                    "error": None,
+                    "checked_at": int(time.time()),
+                }
+            )
             if cached_entry.get("remote"):
                 cached_entry["local"] = cached_entry["remote"]
             cached[image_ref] = cached_entry
             self.config.set("image_status_cache", cached)
-            remaining_updates = self._update_available_image_entries(list(cached.values()))
+            remaining_updates = self._update_available_image_entries(
+                list(cached.values())
+            )
             self.config.set(
                 "image_update_last_alert_signature",
-                self._image_update_alert_signature(remaining_updates) if remaining_updates else "",
+                (
+                    self._image_update_alert_signature(remaining_updates)
+                    if remaining_updates
+                    else ""
+                ),
             )
             detail_text = ""
             if image_ref == "kromiose/nekro-cc-sandbox":
@@ -2653,14 +2876,19 @@ class MainWindow(QMainWindow):
             if getattr(self.backend, "is_running", False):
                 if hasattr(self, "browser_url_label"):
                     self._sync_browser_url_label()
-                self._show_notice_dialog("保存成功", "端口设置已保存，重新部署服务后生效。当前运行中的服务仍使用旧端口。")
+                self._show_notice_dialog(
+                    "保存成功",
+                    "端口设置已保存，重新部署服务后生效。当前运行中的服务仍使用旧端口。",
+                )
             else:
                 target_url = self._target_url(self.current_browser_target)
                 if hasattr(self, "browser_url_label"):
                     self._sync_browser_url_label(target_url)
                 if current_view is not None:
                     current_view.load_url(target_url)
-                self._show_notice_dialog("保存成功", "端口设置已保存，重新部署服务后生效。")
+                self._show_notice_dialog(
+                    "保存成功", "端口设置已保存，重新部署服务后生效。"
+                )
         except ValueError:
             self._show_notice_dialog("提示", "请输入有效的端口号（1-65535）。")
 
@@ -2670,7 +2898,9 @@ class MainWindow(QMainWindow):
         if sample_path:
             self.datadir_hint.setText(f"宿主机可访问路径: {sample_path}")
         else:
-            self.datadir_hint.setText(f"当前后端 {self.backend.display_name} 暂未提供宿主机侧直接打开路径。")
+            self.datadir_hint.setText(
+                f"当前后端 {self.backend.display_name} 暂未提供宿主机侧直接打开路径。"
+            )
         if hasattr(self, "datadir_edit"):
             self.datadir_edit.setText(data_dir)
 
@@ -2678,18 +2908,27 @@ class MainWindow(QMainWindow):
         try:
             os.startfile(path)
         except Exception as error:
-            self._show_notice_dialog("提示", f"无法打开目录。\n\n路径: {path}\n错误: {error}", danger=True)
+            self._show_notice_dialog(
+                "提示", f"无法打开目录。\n\n路径: {path}\n错误: {error}", danger=True
+            )
 
     def _open_datadir_in_explorer(self):
         data_dir = self.config.get_active_data_dir()
         win_path = self.backend.get_host_access_path(data_dir)
         if not win_path:
-            self._show_notice_dialog("提示", f"当前后端 {self.backend.display_name} 暂不支持直接打开宿主机路径。")
+            self._show_notice_dialog(
+                "提示",
+                f"当前后端 {self.backend.display_name} 暂不支持直接打开宿主机路径。",
+            )
             return
         try:
             os.startfile(win_path)
         except Exception as error:
-            self._show_notice_dialog("提示", f"无法打开目录，请确认服务已启动且目录已创建。\n\n路径: {win_path}\n错误: {error}", danger=True)
+            self._show_notice_dialog(
+                "提示",
+                f"无法打开目录，请确认服务已启动且目录已创建。\n\n路径: {win_path}\n错误: {error}",
+                danger=True,
+            )
 
     def _update_services(self):
         self._show_remote_update_dialog()
@@ -2729,7 +2968,6 @@ class MainWindow(QMainWindow):
         desc.setWordWrap(True)
         layout.addWidget(desc)
 
-        from ui.widgets import StyledComboBox
         combo = StyledComboBox()
         combo.setMinimumWidth(360)
         for inst_id, inst_data in instances:
@@ -2755,9 +2993,11 @@ class MainWindow(QMainWindow):
         btn_remove.setProperty("role", "danger")
         btn_remove.setFixedHeight(36)
         btn_remove.setCursor(Qt.CursorShape.PointingHandCursor)
+
         def _on_remove():
             selected_id[0] = combo.currentData()
             dialog.accept()
+
         btn_remove.clicked.connect(_on_remove)
         btn_row.addWidget(btn_remove)
 
@@ -2785,7 +3025,7 @@ class MainWindow(QMainWindow):
         if not reply:
             return
 
-        is_active = (inst_id == self.config.get_active_instance_id())
+        is_active = inst_id == self.config.get_active_instance_id()
         self.switch_tab(2)
         self.log_viewer_app.append(
             f"<span style='color:#7ce0a3;'>[INFO]</span> 开始移除实例「{name}」..."
@@ -2810,17 +3050,26 @@ class MainWindow(QMainWindow):
             self.refresh_dashboard()
             self._show_notice_dialog("移除完成", "实例已移除。")
         else:
-            self._show_notice_dialog("移除失败", "移除实例时发生错误，请查看日志。", danger=True)
+            self._show_notice_dialog(
+                "移除失败", "移除实例时发生错误，请查看日志。", danger=True
+            )
 
     def _open_wsl_path(self, wsl_path):
         win_path = self.backend.get_host_access_path(wsl_path)
         if not win_path:
-            self._show_notice_dialog("提示", f"当前后端 {self.backend.display_name} 暂不支持直接打开宿主机路径。")
+            self._show_notice_dialog(
+                "提示",
+                f"当前后端 {self.backend.display_name} 暂不支持直接打开宿主机路径。",
+            )
             return
         try:
             os.startfile(win_path)
         except Exception as error:
-            self._show_notice_dialog("提示", f"无法打开目录，请确认服务已启动且目录已创建。\n\n路径: {win_path}\n错误: {error}", danger=True)
+            self._show_notice_dialog(
+                "提示",
+                f"无法打开目录，请确认服务已启动且目录已创建。\n\n路径: {win_path}\n错误: {error}",
+                danger=True,
+            )
 
     def _ask_close_action(self):
         """返回 1=最小化到托盘, 2=停止服务并退出, 其他=取消"""
@@ -2880,7 +3129,12 @@ class MainWindow(QMainWindow):
             if result == 1:
                 self.hide()
                 self.tray_icon.show()
-                self.tray_icon.showMessage("Nekro Agent", "已最小化到托盘，服务继续运行", QSystemTrayIcon.MessageIcon.Information, 2000)
+                self.tray_icon.showMessage(
+                    "Nekro Agent",
+                    "已最小化到托盘，服务继续运行",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    2000,
+                )
                 event.ignore()
             elif result == 2:
                 self._quit_after_stop = True
@@ -2922,7 +3176,9 @@ class MainWindow(QMainWindow):
         dialog.setWindowModality(Qt.WindowModality.WindowModal)
         dialog.setStyleSheet(STYLESHEET)
         # 禁止点 X 关闭
-        dialog.setWindowFlags(dialog.windowFlags() & ~Qt.WindowType.WindowCloseButtonHint)
+        dialog.setWindowFlags(
+            dialog.windowFlags() & ~Qt.WindowType.WindowCloseButtonHint
+        )
 
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(26, 24, 26, 24)
@@ -2955,7 +3211,9 @@ class MainWindow(QMainWindow):
                 f"<b>登录 Token:</b> {napcat_token}"
             )
             napcat_info.setProperty("role", "info_block")
-            napcat_info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            napcat_info.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+            )
             napcat_info.setWordWrap(True)
             layout.addWidget(napcat_info)
 
@@ -2984,7 +3242,12 @@ class MainWindow(QMainWindow):
                 f"登录 Token: {info.get('napcat_token', '') or '(等待捕获)'}"
             )
 
-        btn_copy.clicked.connect(lambda: (QApplication.clipboard().setText(copy_text), btn_copy.setText("已复制")))
+        btn_copy.clicked.connect(
+            lambda: (
+                QApplication.clipboard().setText(copy_text),
+                btn_copy.setText("已复制"),
+            )
+        )
         btn_close.clicked.connect(dialog.accept)
 
         button_row.addWidget(btn_copy)
@@ -3003,7 +3266,9 @@ class MainWindow(QMainWindow):
             layout.insertLayout(layout.count() - 1, boot_row)
 
             def _update_boot_text():
-                boot_status.setText("<span style='color:#58a6ff;'>等待服务启动...</span>")
+                boot_status.setText(
+                    "<span style='color:#58a6ff;'>等待服务启动...</span>"
+                )
 
             def _cleanup_boot_signals():
                 if _signal_cleaned[0]:
@@ -3024,14 +3289,18 @@ class MainWindow(QMainWindow):
 
             def _on_boot_finished():
                 _spinner.set_finished(True)
-                boot_status.setText("<span style='color:#3fb950;'>✓ 服务已就绪，可以开始使用</span>")
+                boot_status.setText(
+                    "<span style='color:#3fb950;'>✓ 服务已就绪，可以开始使用</span>"
+                )
                 btn_close.setEnabled(True)
                 _cleanup_boot_signals()
 
             def _on_timeout(status):
                 if status in {"启动超时", "启动失败"}:
                     _spinner.set_finished(False)
-                    boot_status.setText(f"<span style='color:#f26f82;'>✗ {status}，请检查日志</span>")
+                    boot_status.setText(
+                        f"<span style='color:#f26f82;'>✗ {status}，请检查日志</span>"
+                    )
                     btn_close.setEnabled(True)
                     _cleanup_boot_signals()
 

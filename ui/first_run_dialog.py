@@ -1,7 +1,7 @@
 import os
 import re
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QTimer, Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QDialog,
     QFileDialog,
@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
 
 from core.port_utils import validate_port_bindings
 from ui.styles import STYLESHEET
-from ui.widgets import StepIndicator, create_install_progress_bar, show_notice_dialog
+from ui.widgets import PullProgressView, StepIndicator, create_install_progress_bar, show_notice_dialog
 
 
 class CheckStepThread(QThread):
@@ -71,7 +71,7 @@ class FirstRunDialog(QDialog):
         layout.setSpacing(0)
 
         self._step_indicator = StepIndicator(
-            ["检测环境", "创建运行环境", "选择版本", "配置端口"],
+            ["检测环境", "创建运行环境", "选择版本", "配置实例", "部署服务"],
             current=0,
         )
         layout.addWidget(self._step_indicator)
@@ -86,9 +86,12 @@ class FirstRunDialog(QDialog):
         self._init_create_page()
         self._init_select_page()
         self._init_datadir_page()
+        self._init_deploy_page()
 
         self.backend.progress_updated.connect(self._on_progress)
         self.backend.install_error.connect(self._on_install_error)
+        if hasattr(self.backend, "deploy_optional_confirm"):
+            self.backend.deploy_optional_confirm.connect(self._show_deploy_optional_confirm)
 
         self._goto_page("env_check")
         self._start_check()
@@ -111,6 +114,15 @@ class FirstRunDialog(QDialog):
             self.backend.install_error.disconnect(self._on_install_error)
         except (TypeError, RuntimeError):
             pass
+        try:
+            if hasattr(self.backend, "deploy_optional_confirm"):
+                self.backend.deploy_optional_confirm.disconnect(self._show_deploy_optional_confirm)
+        except (TypeError, RuntimeError):
+            pass
+        try:
+            self.backend.status_changed.disconnect(self._on_deploy_status_changed)
+        except (TypeError, RuntimeError):
+            pass
         super().reject()
 
     def _add_page(self, page: QWidget, name: str):
@@ -119,7 +131,7 @@ class FirstRunDialog(QDialog):
 
     def _goto_page(self, name: str):
         self.stack.setCurrentIndex(self._page_index[name])
-        step_map = {"env_check": 0, "create_runtime": 1, "select_mode": 2, "data_dir": 3}
+        step_map = {"env_check": 0, "create_runtime": 1, "select_mode": 2, "data_dir": 3, "deploy": 4}
         step = step_map.get(name, 0)
         self._step_indicator.set_step(step)
 
@@ -561,6 +573,7 @@ class FirstRunDialog(QDialog):
         self.instance_name_edit = QLineEdit("")
         self.instance_name_edit.setPlaceholderText("留空为默认实例，多实例时建议填写如 bot1_")
         self.instance_name_edit.setFixedWidth(300)
+        self.instance_name_edit.textChanged.connect(self._clear_instance_name_error)
         self.instance_name_edit.textChanged.connect(self._on_instance_name_changed)
         layout.addWidget(self.instance_name_edit)
 
@@ -632,6 +645,101 @@ class FirstRunDialog(QDialog):
         layout.addLayout(btn_box)
         self._add_page(page, "data_dir")
 
+    def _init_deploy_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(18)
+
+        title = QLabel("部署服务")
+        title.setObjectName("WizardTitle")
+        title.setWordWrap(True)
+        layout.addWidget(title)
+
+        desc = QLabel("正在准备镜像、写入配置并启动 Nekro Agent。请保持此窗口打开。")
+        desc.setObjectName("WizardDesc")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        self.deploy_progress = create_install_progress_bar(0, 100, height=8, radius=4)
+        self.deploy_progress.setValue(0)
+        layout.addWidget(self.deploy_progress)
+
+        self.deploy_status_label = QLabel("准备开始部署...")
+        self.deploy_status_label.setObjectName("WizardDesc")
+        self.deploy_status_label.setWordWrap(True)
+        layout.addWidget(self.deploy_status_label)
+
+        self.deploy_detail_label = QLabel("")
+        self.deploy_detail_label.setObjectName("WizardHint")
+        self.deploy_detail_label.setWordWrap(True)
+        self.deploy_detail_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.deploy_detail_label)
+
+        self.deploy_pull_view = PullProgressView(self)
+        layout.addWidget(self.deploy_pull_view)
+
+        self.deploy_step_order = ["config", "docker", "images", "optional", "cc_sandbox", "compose", "health"]
+        self.deploy_steps = {
+            "config": self._create_deploy_step_label("写入部署配置"),
+            "docker": self._create_deploy_step_label("检查 Docker 服务"),
+            "images": self._create_deploy_step_label("检查并拉取必需镜像"),
+            "optional": self._create_deploy_step_label("确认可选组件"),
+            "cc_sandbox": self._create_deploy_step_label("按需下载 Claude Code 沙盒"),
+            "compose": self._create_deploy_step_label("启动 Compose 服务"),
+            "health": self._create_deploy_step_label("等待服务就绪"),
+        }
+        for label in self.deploy_steps.values():
+            layout.addWidget(label)
+
+        layout.addStretch()
+
+        btn_box = QHBoxLayout()
+        btn_box.addStretch()
+        self.btn_deploy_done = QPushButton("部署中...")
+        self.btn_deploy_done.setObjectName("WizardPrimary")
+        self.btn_deploy_done.setFixedHeight(38)
+        self.btn_deploy_done.setFixedWidth(120)
+        self.btn_deploy_done.setEnabled(False)
+        self.btn_deploy_done.clicked.connect(self.accept)
+        btn_box.addWidget(self.btn_deploy_done)
+        layout.addLayout(btn_box)
+
+        self._add_page(page, "deploy")
+
+    def _create_deploy_step_label(self, text):
+        label = QLabel(f"⏳  {text}")
+        label.setObjectName("WizardCheckItem")
+        label.setProperty("state", "pending")
+        label.setProperty("check_name", text)
+        label.setWordWrap(True)
+        return label
+
+    def _set_deploy_step(self, key, state, detail=""):
+        label = self.deploy_steps.get(key)
+        if not label:
+            return
+        name = label.property("check_name")
+        icon = {"pending": "⏳", "running": "⏳", "done": "✅", "fail": "❌"}.get(state, "⏳")
+        label.setText(f"{icon}  {name}" + (f"  —  {detail}" if detail else ""))
+        label.setProperty("state", "pass" if state == "done" else "fail" if state == "fail" else "pending")
+        label.style().unpolish(label)
+        label.style().polish(label)
+
+    def _clear_pull_progress(self):
+        self.deploy_pull_view.reset()
+
+    def _clear_instance_name_error(self):
+        self.instance_name_edit.setProperty("invalid", False)
+        self.instance_name_edit.style().unpolish(self.instance_name_edit)
+        self.instance_name_edit.style().polish(self.instance_name_edit)
+
+    def _mark_instance_name_error(self):
+        self.instance_name_edit.setProperty("invalid", True)
+        self.instance_name_edit.style().unpolish(self.instance_name_edit)
+        self.instance_name_edit.style().polish(self.instance_name_edit)
+        self.instance_name_edit.setFocus()
+        self.instance_name_edit.selectAll()
+
     def _on_instance_name_changed(self, text):
         name = text.strip()
         if name and not name.endswith("_"):
@@ -675,7 +783,12 @@ class FirstRunDialog(QDialog):
                 button_text="我知道了",
             )
 
-        instance_name = self.instance_name_edit.text().strip()
+        raw_instance_name = self.instance_name_edit.text().strip()
+        if raw_instance_name and not re.fullmatch(r"[A-Za-z0-9_-]+", raw_instance_name):
+            self._mark_instance_name_error()
+            self._show_notice_dialog("实例名称无效", "实例名称仅支持英文字母、数字、下划线和短横线，不能包含中文、空格或其它特殊字符。\n\n请修改后再部署。")
+            return
+        instance_name = raw_instance_name
         if instance_name and not instance_name.endswith("_"):
             instance_name += "_"
 
@@ -703,8 +816,109 @@ class FirstRunDialog(QDialog):
             "napcat_port": napcat_port,
             "release_channel": self.config.get("release_channel") or "stable",
         }
+        self._start_deploy_progress()
         self.deploy_requested.emit(mode, inst_data)
-        self.accept()
+
+    def _start_deploy_progress(self):
+        self._goto_page("deploy")
+        self.deploy_progress.setRange(0, 100)
+        self.deploy_progress.setValue(0)
+        self.deploy_status_label.setText("正在启动部署流程...")
+        self.deploy_detail_label.clear()
+        self._clear_pull_progress()
+        for key in self.deploy_step_order:
+            self._set_deploy_step(key, "pending")
+        self.btn_deploy_done.setText("部署中...")
+        self.btn_deploy_done.setEnabled(False)
+        try:
+            self.backend.status_changed.disconnect(self._on_deploy_status_changed)
+        except (TypeError, RuntimeError):
+            pass
+        self.backend.status_changed.connect(self._on_deploy_status_changed)
+
+    def _show_deploy_optional_confirm(self, title, prompt):
+        confirmed = self._show_notice_confirm(title, prompt, confirm_text="下载", cancel_text="跳过")
+        if hasattr(self.backend, "reply_deploy_optional"):
+            self.backend.reply_deploy_optional(confirmed)
+        if confirmed:
+            self._set_deploy_step("optional", "done", "已选择下载")
+        else:
+            self._set_deploy_step("optional", "done", "已跳过")
+            self._set_deploy_step("cc_sandbox", "done", "已跳过")
+
+    def _show_notice_confirm(self, title, text, confirm_text="确认", cancel_text="取消"):
+        from PyQt6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.setMinimumWidth(380)
+        dialog.setMaximumWidth(500)
+        dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        dialog.setStyleSheet(STYLESHEET)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(14)
+
+        title_label = QLabel(title)
+        title_label.setProperty("role", "dialog_title")
+        title_label.setWordWrap(True)
+        layout.addWidget(title_label)
+
+        desc_label = QLabel(text)
+        desc_label.setProperty("role", "dialog_desc")
+        desc_label.setWordWrap(True)
+        desc_label.setOpenExternalLinks(True)
+        desc_label.setTextFormat(Qt.TextFormat.RichText)
+        desc_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        layout.addWidget(desc_label)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+        cancel_button = QPushButton(cancel_text)
+        cancel_button.clicked.connect(dialog.reject)
+        button_row.addWidget(cancel_button)
+        confirm_button = QPushButton(confirm_text)
+        confirm_button.setProperty("role", "primary")
+        confirm_button.clicked.connect(dialog.accept)
+        button_row.addWidget(confirm_button)
+        layout.addLayout(button_row)
+
+        return dialog.exec() == int(QDialog.DialogCode.Accepted)
+
+    def _set_deploy_stage(self, key, message=""):
+        if key in self.deploy_step_order:
+            index = self.deploy_step_order.index(key)
+            for done_key in self.deploy_step_order[:index]:
+                self._set_deploy_step(done_key, "done")
+            self._set_deploy_step(key, "running", message)
+            self.deploy_progress.setValue(min(95, index * 20 + 8))
+        if message:
+            self.deploy_status_label.setText(message)
+
+    def _on_deploy_status_changed(self, status):
+        if self._current_page_name() != "deploy":
+            return
+        if status == "运行中":
+            for key in self.deploy_step_order:
+                self._set_deploy_step(key, "done")
+            self.deploy_progress.setValue(100)
+            self.deploy_status_label.setText("部署完成，服务已就绪。")
+            self.deploy_detail_label.setText("可以开始使用 Nekro Agent。")
+            self.btn_deploy_done.setText("完成")
+            self.btn_deploy_done.setEnabled(True)
+            QTimer.singleShot(800, self.accept)
+        elif status == "启动失败":
+            self.deploy_progress.setValue(max(1, self.deploy_progress.value()))
+            self.deploy_status_label.setText("部署失败，请查看日志详情后重试。")
+            self.deploy_detail_label.setText("详细错误仍会记录到主窗口日志页。")
+            for key in reversed(self.deploy_step_order):
+                label = self.deploy_steps.get(key)
+                if label and label.property("state") == "pending" and "—" in label.text():
+                    self._set_deploy_step(key, "fail")
+                    break
+            self.btn_deploy_done.setText("关闭")
+            self.btn_deploy_done.setEnabled(True)
 
     # ------------------------------------------------------------------ #
     #  信号处理
@@ -712,6 +926,47 @@ class FirstRunDialog(QDialog):
 
     def _on_progress(self, text):
         current_page = self._current_page_name()
+
+        if text.startswith("__pull_progress__|"):
+            parts = text.split("|", 2)
+            if len(parts) < 3:
+                return
+            _, phase, message = parts
+            if current_page == "deploy":
+                if phase == "start":
+                    self.deploy_pull_view.start(message)
+                    self._set_deploy_stage("images", message)
+                elif phase == "stage":
+                    self.deploy_pull_view.begin_stage(message)
+                    self._set_deploy_stage("images", message)
+                elif phase == "update":
+                    self.deploy_pull_view.update(detail=message)
+                elif phase == "done":
+                    self.deploy_pull_view.finish(message)
+                    self._set_deploy_step("images", "done")
+                    self.deploy_progress.setValue(max(self.deploy_progress.value(), 60))
+                elif phase == "error":
+                    self._set_deploy_step("images", "fail", "镜像拉取失败")
+                    self.deploy_pull_view.fail("镜像拉取失败，请查看主窗口日志。")
+            return
+
+        if text.startswith("__deploy_progress__|"):
+            parts = text.split("|", 2)
+            if len(parts) < 3:
+                return
+            _, stage, message = parts
+            if current_page == "deploy":
+                if stage == "done":
+                    for key in self.deploy_step_order:
+                        if key == "cc_sandbox" and self.deploy_steps[key].property("state") == "pending":
+                            self._set_deploy_step(key, "done", "已跳过")
+                        else:
+                            self._set_deploy_step(key, "done")
+                    self.deploy_progress.setValue(100)
+                    self.deploy_status_label.setText(message)
+                else:
+                    self._set_deploy_stage(stage, message)
+            return
 
         if current_page == "create_runtime":
             self.lbl_progress.setText(text)
