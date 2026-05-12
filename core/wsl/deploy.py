@@ -5,7 +5,7 @@ import subprocess
 import threading
 import time
 
-from core.wsl.constants import DISTRO_NAME, STABLE_IMAGE
+from core.wsl.constants import CC_SANDBOX_IMAGE, DISTRO_NAME, STABLE_IMAGE
 
 
 class WSLDeployMixin:
@@ -29,19 +29,38 @@ class WSLDeployMixin:
         if target_id:
             self.config.update_instance(target_id, deploy_info=info)
 
-    def _start_instance_sync(self, inst_id, inst, attach_logs=True, attach_health=True, emit_status=True):
+    def _wait_deploy_optional_reply(self, label, prompt, timeout=300):
+        self._deploy_optional_reply = None
+        self.deploy_optional_confirm.emit(label, prompt)
+        deadline = time.time() + timeout
+        while self._deploy_optional_reply is None and time.time() < deadline:
+            time.sleep(0.1)
+        return self._deploy_optional_reply
+
+    def reply_deploy_optional(self, confirmed: bool):
+        self._deploy_optional_reply = confirmed
+
+    def _start_instance_sync(
+        self, inst_id, inst, attach_logs=True, attach_health=True, emit_status=True
+    ):
         distro = DISTRO_NAME
         deploy_mode = inst.get("deploy_mode") or "lite"
         deploy_dir = inst.get("deploy_dir", "/root/nekro_agent")
         data_dir = inst.get("data_dir", "/root/nekro_agent_data")
         inst_name = inst.get("instance_name", "")
         inst_display = inst_name.rstrip("_") or inst_id
-        log_prefix = f"[{inst_display}] " if inst_display and inst_display != "default" else ""
+        log_prefix = (
+            f"[{inst_display}] " if inst_display and inst_display != "default" else ""
+        )
 
         def _log(msg, level="info"):
             self.log_received.emit(f"{log_prefix}{msg}", level)
 
-        compose_file = "docker-compose_with_napcat.yml" if deploy_mode == "napcat" else "docker-compose_withnot_napcat.yml"
+        compose_file = (
+            "docker-compose_with_napcat.yml"
+            if deploy_mode == "napcat"
+            else "docker-compose_withnot_napcat.yml"
+        )
         compose_src = os.path.join(self.base_path, "data", compose_file)
         env_src = os.path.join(self.base_path, "data", "env")
         if not os.path.exists(compose_src):
@@ -51,13 +70,26 @@ class WSLDeployMixin:
         compose_dest = f"{deploy_dir}/docker-compose.yml"
         env_dest = f"{deploy_dir}/.env"
 
+        self.progress_updated.emit("__deploy_progress__|config|准备部署目录和配置文件")
         self._wsl_exec(distro, f"mkdir -p {shlex.quote(deploy_dir)}")
         self._wsl_exec(distro, f"mkdir -p {shlex.quote(data_dir)}")
 
-        env_exists = self._wsl_exec(distro, f"test -f {shlex.quote(env_dest)} && echo yes").strip()
-        compose_exists = self._wsl_exec(distro, f"test -f {shlex.quote(compose_dest)} && echo yes").strip()
-        existing_env_content = self._wsl_exec(distro, f"cat {shlex.quote(env_dest)}") if env_exists == "yes" else ""
-        existing_compose_content = self._wsl_exec(distro, f"cat {shlex.quote(compose_dest)}") if compose_exists == "yes" else ""
+        env_exists = self._wsl_exec(
+            distro, f"test -f {shlex.quote(env_dest)} && echo yes"
+        ).strip()
+        compose_exists = self._wsl_exec(
+            distro, f"test -f {shlex.quote(compose_dest)} && echo yes"
+        ).strip()
+        existing_env_content = (
+            self._wsl_exec(distro, f"cat {shlex.quote(env_dest)}")
+            if env_exists == "yes"
+            else ""
+        )
+        existing_compose_content = (
+            self._wsl_exec(distro, f"cat {shlex.quote(compose_dest)}")
+            if compose_exists == "yes"
+            else ""
+        )
 
         if env_exists == "yes":
             _log("检测到已有部署配置，将保留旧凭据并按当前设置重写部署文件")
@@ -92,6 +124,7 @@ class WSLDeployMixin:
         _log(f"部署目录内容:\n{ls_output}", "debug")
         _log("配置文件已部署到 WSL")
 
+        self.progress_updated.emit("__deploy_progress__|docker|确保 Docker 服务启动")
         _log("确保 Docker 服务启动...")
         self._wsl_exec(distro, "systemctl start docker", timeout=30)
 
@@ -101,6 +134,7 @@ class WSLDeployMixin:
         compose_version = self._wsl_exec(distro, "docker compose version")
         _log(f"Docker Compose 版本: {compose_version}", "debug")
 
+        self.progress_updated.emit("__deploy_progress__|images|检查必需镜像")
         missing = self._get_missing_images(distro, deploy_mode)
         if missing:
             _log(f"检测到 {len(missing)} 个镜像需要拉取...")
@@ -112,14 +146,52 @@ class WSLDeployMixin:
         else:
             _log("所有镜像已就绪")
 
+        if is_first_deploy := (env_exists != "yes"):
+            doc_url = "https://doc.nekro.ai/docs/03_workspace/claude_code_sandbox.html"
+            prompt = (
+                "Claude Code 沙盒属于工作区进阶功能。<br><br>"
+                "如需在工作区中使用 Claude Code 沙盒，请先阅读文档确认：<br>"
+                f"<a href=\"{doc_url}\">打开 Claude Code 沙盒文档</a><br><br>"
+                "是否现在下载 Claude Code 沙盒镜像？"
+            )
+            self.progress_updated.emit(
+                "__deploy_progress__|optional|确认是否下载 Claude Code 沙盒"
+            )
+            reply = self._wait_deploy_optional_reply(
+                "可选下载 Claude Code 沙盒", prompt
+            )
+            if reply:
+                self.progress_updated.emit(
+                    "__deploy_progress__|cc_sandbox|下载 Claude Code 沙盒"
+                )
+                if not self._pull_images(distro, [CC_SANDBOX_IMAGE]):
+                    if emit_status:
+                        self.status_changed.emit("启动失败")
+                    return False
+            elif reply is None:
+                _log("Claude Code 沙盒下载确认超时，已跳过", "warn")
+            else:
+                _log("已跳过 Claude Code 沙盒下载", "info")
+
         _log("启动 Docker Compose 服务...")
         if emit_status:
+            self.progress_updated.emit(
+                "__deploy_progress__|compose|启动 Docker Compose 服务"
+            )
             self.progress_updated.emit("启动 Compose 服务...")
         compose_cmd = "docker compose -f docker-compose.yml --env-file .env up -d --remove-orphans"
         if not reuse_existing_runtime:
             compose_cmd = f"{compose_cmd} --force-recreate"
         proc = subprocess.run(
-            ["wsl", "-d", distro, "--", "bash", "-c", f"cd {shlex.quote(deploy_dir)} && {compose_cmd}"],
+            [
+                "wsl",
+                "-d",
+                distro,
+                "--",
+                "bash",
+                "-c",
+                f"cd {shlex.quote(deploy_dir)} && {compose_cmd}",
+            ],
             capture_output=True,
             timeout=120,
             creationflags=self._creation_flags(),
@@ -135,8 +207,8 @@ class WSLDeployMixin:
             return False
 
         self.is_running = True
+        self.progress_updated.emit("__deploy_progress__|health|等待服务就绪")
         _log("Compose 服务已启动，等待就绪...")
-        is_first_deploy = env_exists != "yes"
         deploy_info = self._parse_deploy_info(env_content, deploy_mode)
         self.config.update_instance(inst_id, deploy_info=deploy_info)
 
@@ -160,10 +232,16 @@ class WSLDeployMixin:
                 except Exception:
                     pass
                 self._log_process = None
-            threading.Thread(target=self._log_reader, args=(distro, deploy_dir, log_prefix, inst_id), daemon=True).start()
+            threading.Thread(
+                target=self._log_reader,
+                args=(distro, deploy_dir, log_prefix, inst_id),
+                daemon=True,
+            ).start()
         if attach_health:
             nekro_port = int(deploy_info.get("port") or inst.get("nekro_port") or 8021)
-            threading.Thread(target=self._health_check, args=(nekro_port,), daemon=True).start()
+            threading.Thread(
+                target=self._health_check, args=(nekro_port,), daemon=True
+            ).start()
         return True
 
     def start_services(self, deploy_mode, force_new_instance=False):
@@ -212,7 +290,13 @@ class WSLDeployMixin:
 
         def _deploy():
             try:
-                self._start_instance_sync(inst_id, inst, attach_logs=True, attach_health=True, emit_status=True)
+                self._start_instance_sync(
+                    inst_id,
+                    inst,
+                    attach_logs=True,
+                    attach_health=True,
+                    emit_status=True,
+                )
             except Exception as e:
                 self.log_received.emit(f"部署失败: {e}", "error")
                 self.status_changed.emit("启动失败")
@@ -227,7 +311,9 @@ class WSLDeployMixin:
             return True
         instances = self.config.list_instances() if self.config else []
         if not instances:
-            return self.start_services(self.config.get("deploy_mode") if self.config else "lite")
+            return self.start_services(
+                self.config.get("deploy_mode") if self.config else "lite"
+            )
         if not self._distro_exists():
             self.log_received.emit("NekroAgent 发行版不存在", "error")
             return False
@@ -249,10 +335,18 @@ class WSLDeployMixin:
                         self.config.set("deploy_mode", inst.get("deploy_mode", ""))
                         self.config.set("nekro_port", inst.get("nekro_port", 8021))
                         self.config.set("napcat_port", inst.get("napcat_port", 6099))
-                        self.config.set("release_channel", inst.get("release_channel", "stable"))
+                        self.config.set(
+                            "release_channel", inst.get("release_channel", "stable")
+                        )
                         self.config.set("deploy_info", inst.get("deploy_info"))
                     try:
-                        ok = self._start_instance_sync(inst_id, inst, attach_logs=attach, attach_health=attach, emit_status=attach)
+                        ok = self._start_instance_sync(
+                            inst_id,
+                            inst,
+                            attach_logs=attach,
+                            attach_health=attach,
+                            emit_status=attach,
+                        )
                         if not ok:
                             failures.append(inst_id)
                     except Exception as e:
@@ -264,16 +358,27 @@ class WSLDeployMixin:
                     default_inst = self.config.get_instance(default_id)
                     if default_inst:
                         self.config.set("active_instance", default_id)
-                        self.config.set("deploy_mode", default_inst.get("deploy_mode", ""))
-                        self.config.set("nekro_port", default_inst.get("nekro_port", 8021))
-                        self.config.set("napcat_port", default_inst.get("napcat_port", 6099))
-                        self.config.set("release_channel", default_inst.get("release_channel", "stable"))
+                        self.config.set(
+                            "deploy_mode", default_inst.get("deploy_mode", "")
+                        )
+                        self.config.set(
+                            "nekro_port", default_inst.get("nekro_port", 8021)
+                        )
+                        self.config.set(
+                            "napcat_port", default_inst.get("napcat_port", 6099)
+                        )
+                        self.config.set(
+                            "release_channel",
+                            default_inst.get("release_channel", "stable"),
+                        )
                         self.config.set("deploy_info", default_inst.get("deploy_info"))
 
                 if failures and default_id in failures:
                     self.status_changed.emit("启动失败")
                 elif failures:
-                    self.log_received.emit("部分实例启动失败，其余实例已继续启动", "warn")
+                    self.log_received.emit(
+                        "部分实例启动失败，其余实例已继续启动", "warn"
+                    )
                 self.log_received.emit("所有实例启动流程已完成", "info")
             finally:
                 self._deploying = False
@@ -315,24 +420,43 @@ class WSLDeployMixin:
                 self.is_running = True
                 self._stop_event.clear()
                 if self._log_process is None or self._log_process.poll() is not None:
-                    threading.Thread(target=self._log_reader, args=(distro, deploy_dir, log_prefix, inst_id), daemon=True).start()
+                    threading.Thread(
+                        target=self._log_reader,
+                        args=(distro, deploy_dir, log_prefix, inst_id),
+                        daemon=True,
+                    ).start()
 
             try:
-                compose_check = f"test -f {shlex.quote(deploy_dir)}/docker-compose.yml && echo yes"
+                compose_check = (
+                    f"test -f {shlex.quote(deploy_dir)}/docker-compose.yml && echo yes"
+                )
                 has_compose = False
                 try:
                     check_result = subprocess.run(
                         ["wsl", "-d", distro, "--", "bash", "-c", compose_check],
-                        capture_output=True, timeout=10,
+                        capture_output=True,
+                        timeout=10,
                         creationflags=self._creation_flags(),
                     )
-                    has_compose = "yes" in (check_result.stdout.decode(errors="replace") if isinstance(check_result.stdout, bytes) else check_result.stdout)
+                    has_compose = "yes" in (
+                        check_result.stdout.decode(errors="replace")
+                        if isinstance(check_result.stdout, bytes)
+                        else check_result.stdout
+                    )
                 except Exception:
                     pass
 
                 if has_compose:
                     stop_proc = subprocess.run(
-                        ["wsl", "-d", distro, "--", "bash", "-c", f"cd {shlex.quote(deploy_dir)} && docker compose -f docker-compose.yml stop"],
+                        [
+                            "wsl",
+                            "-d",
+                            distro,
+                            "--",
+                            "bash",
+                            "-c",
+                            f"cd {shlex.quote(deploy_dir)} && docker compose -f docker-compose.yml stop",
+                        ],
                         capture_output=True,
                         timeout=60,
                         creationflags=self._creation_flags(),
@@ -340,13 +464,22 @@ class WSLDeployMixin:
                     if stop_proc.returncode != 0:
                         stderr_text = self._clean_stderr(stop_proc.stderr, 0)
                         stdout_text = self._clean_command_output(stop_proc.stdout, 0)
-                        detail = stderr_text or stdout_text or f"返回码: {stop_proc.returncode}"
-                        self.log_received.emit(f"{log_prefix}停止 Compose 服务失败: {detail}", "error")
+                        detail = (
+                            stderr_text
+                            or stdout_text
+                            or f"返回码: {stop_proc.returncode}"
+                        )
+                        self.log_received.emit(
+                            f"{log_prefix}停止 Compose 服务失败: {detail}", "error"
+                        )
                         _restore_runtime_state()
                         self.status_changed.emit("停止失败")
                         return
                 else:
-                    self.log_received.emit(f"{log_prefix}当前实例无 Compose 部署文件，跳过 docker compose stop", "warn")
+                    self.log_received.emit(
+                        f"{log_prefix}当前实例无 Compose 部署文件，跳过 docker compose stop",
+                        "warn",
+                    )
 
                 self.is_running = False
                 self.log_received.emit(f"{log_prefix}服务已停止", "info")
@@ -398,18 +531,32 @@ class WSLDeployMixin:
                             timeout=10,
                             creationflags=self._creation_flags(),
                         )
-                        stdout = check_result.stdout.decode(errors="replace") if isinstance(check_result.stdout, bytes) else check_result.stdout
+                        stdout = (
+                            check_result.stdout.decode(errors="replace")
+                            if isinstance(check_result.stdout, bytes)
+                            else check_result.stdout
+                        )
                         has_compose = "yes" in stdout
                     except Exception:
                         pass
 
                     if not has_compose:
-                        self.log_received.emit(f"{prefix}无 Compose 部署文件，跳过", "warn")
+                        self.log_received.emit(
+                            f"{prefix}无 Compose 部署文件，跳过", "warn"
+                        )
                         continue
 
                     self.log_received.emit(f"{prefix}正在停止 Compose 服务...", "info")
                     stop_proc = subprocess.run(
-                        ["wsl", "-d", distro, "--", "bash", "-c", f"cd {shlex.quote(deploy_dir)} && docker compose -f docker-compose.yml stop"],
+                        [
+                            "wsl",
+                            "-d",
+                            distro,
+                            "--",
+                            "bash",
+                            "-c",
+                            f"cd {shlex.quote(deploy_dir)} && docker compose -f docker-compose.yml stop",
+                        ],
                         capture_output=True,
                         timeout=60,
                         creationflags=self._creation_flags(),
@@ -417,14 +564,18 @@ class WSLDeployMixin:
                     if stop_proc.returncode != 0:
                         stderr_text = self._clean_stderr(stop_proc.stderr, 0)
                         stdout_text = self._clean_command_output(stop_proc.stdout, 0)
-                        failed.append(f"{name}: {stderr_text or stdout_text or stop_proc.returncode}")
+                        failed.append(
+                            f"{name}: {stderr_text or stdout_text or stop_proc.returncode}"
+                        )
                     else:
                         self.log_received.emit(f"{prefix}服务已停止", "info")
 
                 if failed:
                     self.is_running = True
                     self._stop_event.clear()
-                    self.log_received.emit("停止部分实例失败: " + "；".join(failed), "error")
+                    self.log_received.emit(
+                        "停止部分实例失败: " + "；".join(failed), "error"
+                    )
                     self.status_changed.emit("停止失败")
                     return
 
@@ -518,10 +669,15 @@ class WSLDeployMixin:
                     compose_check = f"test -f {shlex.quote(deploy_dir)}/docker-compose.yml && echo yes"
                     check_result = subprocess.run(
                         ["wsl", "-d", distro, "--", "bash", "-c", compose_check],
-                        capture_output=True, timeout=10,
+                        capture_output=True,
+                        timeout=10,
                         creationflags=self._creation_flags(),
                     )
-                    has_compose = "yes" in (check_result.stdout.decode(errors="replace") if isinstance(check_result.stdout, bytes) else check_result.stdout)
+                    has_compose = "yes" in (
+                        check_result.stdout.decode(errors="replace")
+                        if isinstance(check_result.stdout, bytes)
+                        else check_result.stdout
+                    )
                 except Exception:
                     has_compose = False
 
@@ -533,11 +689,15 @@ class WSLDeployMixin:
                     )
                     self.log_received.emit(f"[移除 {name}] ✓ 容器已停止并清除", "info")
                 else:
-                    self.log_received.emit(f"[移除 {name}] 无 Compose 文件，跳过容器清理", "warn")
+                    self.log_received.emit(
+                        f"[移除 {name}] 无 Compose 文件，跳过容器清理", "warn"
+                    )
 
                 self.log_received.emit(f"[移除 {name}] 2/2 清理部署目录...", "info")
                 if deploy_dir:
-                    self._wsl_exec(distro, f"rm -rf {shlex.quote(deploy_dir)}", timeout=30)
+                    self._wsl_exec(
+                        distro, f"rm -rf {shlex.quote(deploy_dir)}", timeout=30
+                    )
                 self.log_received.emit(f"[移除 {name}] ✓ 实例已移除", "info")
             except Exception as e:
                 self.log_received.emit(f"[移除 {name}] 异常: {e}", "error")
@@ -552,7 +712,9 @@ class WSLDeployMixin:
         self._save_deploy_info(info, inst_id=inst_id)
 
         self.log_received.emit("=== 部署完成！===", "info")
-        self.log_received.emit(f"管理员账号: admin | 密码: {info['admin_password']}", "info")
+        self.log_received.emit(
+            f"管理员账号: admin | 密码: {info['admin_password']}", "info"
+        )
         self.log_received.emit(f"Web 访问地址: http://127.0.0.1:{info['port']}", "info")
 
         self.deploy_info_ready.emit(info)
@@ -642,14 +804,23 @@ class WSLDeployMixin:
             elif key == "NAPCAT_EXPOSE_PORT":
                 new_lines.append(f"NAPCAT_EXPOSE_PORT={napcat_port}")
             elif key == "QDRANT_API_KEY":
-                new_lines.append(f"QDRANT_API_KEY={existing_value or self._random_token(32)}")
+                new_lines.append(
+                    f"QDRANT_API_KEY={existing_value or self._random_token(32)}"
+                )
             elif key == "ONEBOT_ACCESS_TOKEN":
-                new_lines.append(f"ONEBOT_ACCESS_TOKEN={existing_value or self._random_token(32)}")
+                new_lines.append(
+                    f"ONEBOT_ACCESS_TOKEN={existing_value or self._random_token(32)}"
+                )
             elif key == "NEKRO_ADMIN_PASSWORD":
-                new_lines.append(f"NEKRO_ADMIN_PASSWORD={existing_value or self._random_token(16)}")
+                new_lines.append(
+                    f"NEKRO_ADMIN_PASSWORD={existing_value or self._random_token(16)}"
+                )
             elif key == "INSTANCE_NAME":
                 new_lines.append(f"{key}={existing_value or instance_name}")
-            elif key in {"POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DATABASE"} and existing_value:
+            elif (
+                key in {"POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DATABASE"}
+                and existing_value
+            ):
                 new_lines.append(f"{key}={existing_value}")
             else:
                 new_lines.append(line)
@@ -677,7 +848,9 @@ class WSLDeployMixin:
             return
 
         def _emit(status, message, **extra):
-            self.napcat_network_config_finished.emit({"status": status, "message": message, **extra})
+            self.napcat_network_config_finished.emit(
+                {"status": status, "message": message, **extra}
+            )
 
         def _configure():
             distro = DISTRO_NAME
@@ -701,32 +874,50 @@ class WSLDeployMixin:
                     f'[ -d "{config_dir}" ] && printf yes || printf no',
                 ).strip()
                 if config_exists != "yes":
-                    _emit("config_missing", "未找到 NapCat 配置目录，请先完成 NapCat 部署。")
+                    _emit(
+                        "config_missing",
+                        "未找到 NapCat 配置目录，请先完成 NapCat 部署。",
+                    )
                     return
 
                 files_output = self._wsl_exec_checked(
                     distro,
                     f'find "{config_dir}" -maxdepth 1 -type f -name \'onebot11_*.json\' | sort',
                 )
-                onebot_paths = [line.strip() for line in self._clean_command_output(files_output).splitlines() if line.strip()]
+                onebot_paths = [
+                    line.strip()
+                    for line in self._clean_command_output(files_output).splitlines()
+                    if line.strip()
+                ]
                 if not onebot_paths:
-                    _emit("login_required", "尚未检测到 NapCat 账号配置，请先登录一次 QQ。")
+                    _emit(
+                        "login_required",
+                        "尚未检测到 NapCat 账号配置，请先登录一次 QQ。",
+                    )
                     return
 
-                backup_dir = f"{config_dir}/_launcher_backup_{time.strftime('%Y%m%d-%H%M%S')}"
+                backup_dir = (
+                    f"{config_dir}/_launcher_backup_{time.strftime('%Y%m%d-%H%M%S')}"
+                )
                 self._wsl_exec_checked(distro, f'mkdir -p "{backup_dir}"')
 
                 configured_accounts = []
                 for path in onebot_paths:
                     content = self._wsl_exec_checked(distro, f'cat "{path}"')
                     if not content.strip():
-                        _emit("config_read_failed", f"读取 NapCat 配置失败: {os.path.basename(path)}")
+                        _emit(
+                            "config_read_failed",
+                            f"读取 NapCat 配置失败: {os.path.basename(path)}",
+                        )
                         return
 
                     try:
                         data = json.loads(content)
                     except json.JSONDecodeError:
-                        _emit("config_invalid", f"NapCat 配置文件格式异常: {os.path.basename(path)}")
+                        _emit(
+                            "config_invalid",
+                            f"NapCat 配置文件格式异常: {os.path.basename(path)}",
+                        )
                         return
 
                     self._wsl_exec_checked(distro, f'cp "{path}" "{backup_dir}/"')
@@ -743,7 +934,10 @@ class WSLDeployMixin:
                             updated_clients.append(client)
                             continue
 
-                        if client.get("name") == desired_client["name"] or client.get("url") == desired_client["url"]:
+                        if (
+                            client.get("name") == desired_client["name"]
+                            or client.get("url") == desired_client["url"]
+                        ):
                             if not replaced:
                                 merged = dict(client)
                                 merged.update(desired_client)
@@ -757,10 +951,14 @@ class WSLDeployMixin:
                         updated_clients.append(desired_client)
 
                     network["websocketClients"] = updated_clients
-                    self._write_to_wsl(distro, json.dumps(data, ensure_ascii=False, indent=2) + "\n", path)
+                    self._write_to_wsl(
+                        distro,
+                        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                        path,
+                    )
 
                     filename = os.path.basename(path)
-                    account = filename[len("onebot11_"):-len(".json")]
+                    account = filename[len("onebot11_") : -len(".json")]
                     if account:
                         configured_accounts.append(account)
 
@@ -782,7 +980,9 @@ class WSLDeployMixin:
 
                 if proc.returncode != 0:
                     stderr_text = self._clean_stderr(proc.stderr, 0)
-                    self.log_received.emit("NapCat 配置文件已写入，但重启 NapCat 失败", "warn")
+                    self.log_received.emit(
+                        "NapCat 配置文件已写入，但重启 NapCat 失败", "warn"
+                    )
                     if stderr_text:
                         self.log_received.emit(stderr_text, "debug")
                     _emit(
@@ -792,7 +992,9 @@ class WSLDeployMixin:
                     )
                     return
 
-                self.log_received.emit("NapCat 配置文件已更新，并已重启 NapCat 服务", "info")
+                self.log_received.emit(
+                    "NapCat 配置文件已更新，并已重启 NapCat 服务", "info"
+                )
                 message = "NapCat 配置已写入并重启生效。"
                 _emit(
                     "saved",

@@ -1,4 +1,5 @@
 DISTRO_NAME = "NekroAgent"
+CC_SANDBOX_IMAGE = "kromiose/nekro-cc-sandbox"
 
 REQUIRED_IMAGES_BASE = {
     "napcat": [
@@ -7,21 +8,19 @@ REQUIRED_IMAGES_BASE = {
         "kromiose/nekro-agent:latest",
         "mlikiowa/napcat-docker",
         "kromiose/nekro-agent-sandbox",
-        "kromiose/nekro-cc-sandbox",
     ],
     "lite": [
         "postgres:14",
         "qdrant/qdrant:v1.17.1",
         "kromiose/nekro-agent:latest",
         "kromiose/nekro-agent-sandbox",
-        "kromiose/nekro-cc-sandbox",
     ],
 }
 
 MANAGED_IMAGES_BASE = [
     ("kromiose/nekro-agent:latest", "Nekro Agent 本体", "NA 核心服务镜像", ["napcat", "lite"]),
     ("kromiose/nekro-agent-sandbox", "NA 沙盒", "代码执行沙盒环境", ["napcat", "lite"]),
-    ("kromiose/nekro-cc-sandbox", "NA CC 沙盒", "CC 扩展沙盒环境", ["napcat", "lite"]),
+    (CC_SANDBOX_IMAGE, "Claude Code 沙盒", "Claude Code 工作区沙盒环境，进阶功能，可按需下载", ["napcat", "lite"]),
 ]
 
 ROOTFS_URLS = [
@@ -43,6 +42,7 @@ NA_BACKUP_TARGETS = [
 ]
 
 __all__ = [
+    "CC_SANDBOX_IMAGE",
     "DISTRO_NAME",
     "MANAGED_IMAGES_BASE",
     "NA_BACKUP_TARGETS",

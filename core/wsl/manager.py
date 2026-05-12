@@ -45,3 +45,4 @@ class WSLManager(
         self._stop_event = threading.Event()
         self._pending_deploy_info = None
         self._update_optional_reply = None
+        self._deploy_optional_reply = None

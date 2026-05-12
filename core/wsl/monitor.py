@@ -77,6 +77,7 @@ class WSLMonitorMixin:
                         return
                     elapsed = time.time() - start
                     self.log_received.emit(f"服务已就绪！(耗时 {elapsed:.1f}s)", "info")
+                    self.progress_updated.emit("__deploy_progress__|done|服务已就绪")
                     self.boot_finished.emit()
                     self.status_changed.emit("运行中")
                     return
