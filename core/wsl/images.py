@@ -114,7 +114,7 @@ class WSLImageMixin:
         """逐个拉取镜像列表，带进度反馈。返回 True 全部成功，False 有失败"""
         total = len(images)
         for idx, image in enumerate(images, 1):
-            self._emit_pull_progress("stage", f"拉取镜像 ({idx}/{total}): {image}")
+            self._emit_pull_progress("stage", f"{idx}/{total}|拉取镜像 ({idx}/{total}): {image}")
             self.log_received.emit(f"拉取镜像 ({idx}/{total}): {image}", "info")
 
             ok, last_lines = self._pull_image_once(distro, image)
@@ -123,7 +123,7 @@ class WSLImageMixin:
                 if hub_image != image:
                     retry_msg = f"镜像站拉取失败，尝试使用官方 Docker Hub 重试: {hub_image}"
                     self.log_received.emit(retry_msg, "warning")
-                    self._emit_pull_progress("stage", f"官方 Hub 重试 ({idx}/{total}): {image}")
+                    self._emit_pull_progress("stage", f"{idx}/{total}|官方 Hub 重试 ({idx}/{total}): {image}")
                     ok, retry_lines = self._pull_image_once(distro, hub_image)
                     if ok:
                         self.log_received.emit(f"✓ {image} 已通过官方 Docker Hub 拉取完成", "info")

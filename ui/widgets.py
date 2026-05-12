@@ -107,21 +107,28 @@ class PullProgressView(QFrame):
         self._summary_text = ""
         self._layers = OrderedDict()
         self._layer_order = []
+        self._image_index = 0
+        self._image_total = 0
 
         self.setObjectName("SectionCard")
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(8)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(6)
 
         self.status_label = QLabel("")
         self.status_label.setObjectName("SectionDesc")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
-        bar_row = QHBoxLayout()
-        bar_row.setSpacing(10)
+        self.summary_label = QLabel("")
+        self.summary_label.setObjectName("SectionDesc")
+        self.summary_label.setWordWrap(True)
+        layout.addWidget(self.summary_label)
+
+        self.bar_row = QHBoxLayout()
+        self.bar_row.setSpacing(10)
         self.spinner_label = SpinnerLabel(self)
-        bar_row.addWidget(self.spinner_label)
+        self.bar_row.addWidget(self.spinner_label)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
@@ -138,8 +145,9 @@ class PullProgressView(QFrame):
                 "QProgressBar { border: none; background: #e8e9eb; border-radius: 4px; }"
                 "QProgressBar::chunk { background: #0969da; border-radius: 4px; }"
             )
-        bar_row.addWidget(self.progress_bar)
-        layout.addLayout(bar_row)
+        self.bar_row.addWidget(self.progress_bar)
+        layout.addLayout(self.bar_row)
+        self._set_bar_visible(False)
         self.setVisible(False)
 
     @property
@@ -158,9 +166,15 @@ class PullProgressView(QFrame):
     def value(self):
         return self.progress_bar.value()
 
-    def set_active(self, active):
+    def _set_bar_visible(self, visible):
+        self.spinner_label.setVisible(visible)
+        self.progress_bar.setVisible(visible)
+
+    def set_active(self, active, show_bar=None):
         self.setVisible(active)
-        if active:
+        if show_bar is not None:
+            self._set_bar_visible(show_bar)
+        if active and self.progress_bar.isVisible():
             self.spinner_label.start(80)
         else:
             self.spinner_label.stop()
@@ -170,41 +184,50 @@ class PullProgressView(QFrame):
         self._summary_text = ""
         self._layers.clear()
         self._layer_order.clear()
+        self._image_index = 0
+        self._image_total = 0
         self.status_label.setText("")
+        self.summary_label.setText("")
+        self.summary_label.setVisible(False)
         self.progress_bar.setValue(0)
         self.set_active(False)
 
     def start(self, header):
         self.reset()
-        self.update(header=header)
+        self.update(header=header, show_bar=False)
 
-    def begin_stage(self, header):
+    def begin_stage(self, header, current=0, total=0):
         self._stage_header = header
         self._summary_text = ""
         self._layers.clear()
         self._layer_order.clear()
+        self._image_index = current
+        self._image_total = total
         self.progress_bar.setValue(0)
-        self.update(header=header)
+        self.update(header=header, show_bar=False)
 
     def finish(self, header):
         self.progress_bar.setValue(100)
-        self.update(header=header)
+        self.update(header=header, show_bar=bool(self._layer_order))
 
     def fail(self, header):
-        self.update(header=header)
+        self.update(header=header, show_bar=False)
 
-    def update(self, header="", detail=""):
+    def update(self, header="", detail="", show_bar=None):
         if header:
             self._stage_header = header
+        parsed_layer = False
         if detail:
-            self._update_layer(detail)
+            parsed_layer = self._update_layer(detail)
+        if parsed_layer:
+            show_bar = True
         self._refresh_status_label()
-        self.set_active(True)
+        self.set_active(True, show_bar=show_bar)
 
     def _update_layer(self, detail):
         layer_match = re.match(r"^([a-f0-9]{6,64}):\s*(.+)$", detail, re.IGNORECASE)
         if not layer_match:
-            return
+            return False
         layer_id, status = layer_match.groups()
         short_id = layer_id[:12]
         if short_id not in self._layers:
@@ -219,6 +242,7 @@ class PullProgressView(QFrame):
         if total > 0:
             self.progress_bar.setValue(int(done * 100 / total))
         self._summary_text = self._summarize_layers()
+        return True
 
     def _summarize_layers(self):
         total = len(self._layer_order)
@@ -255,8 +279,12 @@ class PullProgressView(QFrame):
         return "，".join(parts)
 
     def _refresh_status_label(self):
-        text_parts = [part for part in [self._stage_header, self._summary_text] if part]
-        self.status_label.setText("\n".join(text_parts))
+        self.status_label.setText(self._stage_header)
+        summary = self._summary_text
+        if not summary and self._image_index and self._image_total:
+            summary = f"正在拉取第 {self._image_index}/{self._image_total} 个镜像，等待 Docker 返回下载进度"
+        self.summary_label.setText(summary)
+        self.summary_label.setVisible(bool(summary))
 
 
 class UpdateProgressDialog(QDialog):
