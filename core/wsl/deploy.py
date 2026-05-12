@@ -299,6 +299,87 @@ class WSLDeployMixin:
 
         threading.Thread(target=_do_stop, daemon=True).start()
 
+    def stop_all_services(self):
+        """退出启动器时停止所有已登记实例的 Compose 服务。"""
+        self._stop_event.set()
+        if self._log_process and self._log_process.poll() is None:
+            try:
+                self._log_process.terminate()
+            except Exception:
+                pass
+            self._log_process = None
+
+        distro = DISTRO_NAME
+        instances = self.config.list_instances() if self.config else []
+        if not instances:
+            self.stop_services()
+            return
+
+        self.status_changed.emit("停止中...")
+        self.log_received.emit("正在停止所有实例服务...", "info")
+
+        def _do_stop_all():
+            failed = []
+            try:
+                for inst_id, inst in instances:
+                    deploy_dir = inst.get("deploy_dir", "/root/nekro_agent")
+                    name = inst.get("instance_name", "").rstrip("_") or inst_id
+                    prefix = f"[{name}] " if name and name != "default" else ""
+                    compose_check = f"test -f {shlex.quote(deploy_dir)}/docker-compose.yml && echo yes"
+                    has_compose = False
+                    try:
+                        check_result = subprocess.run(
+                            ["wsl", "-d", distro, "--", "bash", "-c", compose_check],
+                            capture_output=True,
+                            timeout=10,
+                            creationflags=self._creation_flags(),
+                        )
+                        stdout = check_result.stdout.decode(errors="replace") if isinstance(check_result.stdout, bytes) else check_result.stdout
+                        has_compose = "yes" in stdout
+                    except Exception:
+                        pass
+
+                    if not has_compose:
+                        self.log_received.emit(f"{prefix}无 Compose 部署文件，跳过", "warn")
+                        continue
+
+                    self.log_received.emit(f"{prefix}正在停止 Compose 服务...", "info")
+                    stop_proc = subprocess.run(
+                        ["wsl", "-d", distro, "--", "bash", "-c", f"cd {shlex.quote(deploy_dir)} && docker compose -f docker-compose.yml stop"],
+                        capture_output=True,
+                        timeout=60,
+                        creationflags=self._creation_flags(),
+                    )
+                    if stop_proc.returncode != 0:
+                        stderr_text = self._clean_stderr(stop_proc.stderr, 0)
+                        stdout_text = self._clean_command_output(stop_proc.stdout, 0)
+                        failed.append(f"{name}: {stderr_text or stdout_text or stop_proc.returncode}")
+                    else:
+                        self.log_received.emit(f"{prefix}服务已停止", "info")
+
+                if failed:
+                    self.is_running = True
+                    self._stop_event.clear()
+                    self.log_received.emit("停止部分实例失败: " + "；".join(failed), "error")
+                    self.status_changed.emit("停止失败")
+                    return
+
+                self.is_running = False
+                self.log_received.emit("所有实例服务已停止", "info")
+                self.status_changed.emit("已停止")
+            except subprocess.TimeoutExpired:
+                self.is_running = True
+                self._stop_event.clear()
+                self.log_received.emit("停止所有实例超时", "error")
+                self.status_changed.emit("停止失败")
+            except Exception as e:
+                self.is_running = True
+                self._stop_event.clear()
+                self.log_received.emit(f"停止所有实例异常: {e}", "error")
+                self.status_changed.emit("停止失败")
+
+        threading.Thread(target=_do_stop_all, daemon=True).start()
+
     def uninstall_environment(self):
         """卸载：停止服务 → 删除容器/镜像 → 删除 WSL 发行版"""
         distro = DISTRO_NAME

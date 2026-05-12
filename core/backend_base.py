@@ -56,6 +56,10 @@ class BackendBase(QObject):
         raise NotImplementedError
 
     @abstractmethod
+    def stop_all_services(self):
+        raise NotImplementedError
+
+    @abstractmethod
     def uninstall_environment(self):
         raise NotImplementedError
 

@@ -2855,7 +2855,7 @@ class MainWindow(QMainWindow):
         if not self._guard_blocking_status_idle("退出启动器"):
             event.ignore()
             return
-        if self.backend.is_running:
+        if self.config.list_instances():
             result = self._ask_close_action()
             if result == 1:
                 self.hide()
@@ -2864,7 +2864,7 @@ class MainWindow(QMainWindow):
                 event.ignore()
             elif result == 2:
                 self._quit_after_stop = True
-                self.backend.stop_services()
+                self.backend.stop_all_services()
                 event.ignore()
             else:
                 event.ignore()
@@ -2881,16 +2881,16 @@ class MainWindow(QMainWindow):
             return
         if not self._guard_blocking_status_idle("退出启动器"):
             return
-        if self.backend.is_running:
+        if self.config.list_instances():
             reply = self._show_confirm_dialog(
                 "确认退出",
-                "服务正在运行，退出将停止所有容器。确定要退出吗？",
+                "退出将停止所有实例的容器。确定要退出吗？",
                 confirm_text="确认退出",
                 danger=True,
             )
             if reply:
                 self._quit_after_stop = True
-                self.backend.stop_services()
+                self.backend.stop_all_services()
         else:
             QApplication.quit()
 
