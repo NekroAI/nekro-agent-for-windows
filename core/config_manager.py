@@ -203,6 +203,9 @@ class ConfigManager:
             "napcat_port": self.config.get("napcat_port", 6099),
             "release_channel": self.config.get("release_channel", "stable"),
             "deploy_info": self.config.get("deploy_info"),
+            "preview_backup_available": bool(
+                self.config.get("preview_backup_available", False)
+            ),
         }
         with self._lock:
             self.config["instances"] = instances
@@ -228,6 +231,47 @@ class ConfigManager:
         if inst_id not in instances:
             return False
         return self.set("default_instance", inst_id)
+
+    def get_instance_value(self, inst_id, key, default=None):
+        inst = self.get_instance(inst_id)
+        if not inst:
+            return default
+        return inst.get(key, default)
+
+    def get_active_instance_value(self, key, default=None):
+        inst = self.get_instance()
+        if not inst:
+            return default
+        return inst.get(key, default)
+
+    def get_active_preview_backup_available(self) -> bool:
+        inst = self.get_instance()
+        if inst is not None and "preview_backup_available" in inst:
+            return bool(inst.get("preview_backup_available"))
+        return bool(self.config.get("preview_backup_available", False))
+
+    def set_active_preview_backup_available(self, available: bool):
+        inst_id = self.get_active_instance_id()
+        if inst_id:
+            return self.update_instance(
+                inst_id,
+                preview_backup_available=bool(available),
+            )
+        return self.set("preview_backup_available", bool(available))
+
+    def clear_runtime_state(self, keep_first_run=False):
+        with self._lock:
+            self.config["active_instance"] = ""
+            self.config["default_instance"] = ""
+            self.config["deploy_mode"] = ""
+            self.config["release_channel"] = "stable"
+            self.config["preview_backup_available"] = False
+            self.config["deploy_info"] = None
+            self.config["nekro_port"] = self.default_config["nekro_port"]
+            self.config["napcat_port"] = self.default_config["napcat_port"]
+            if keep_first_run:
+                self.config["first_run"] = True
+        return self.save_config()
 
     def get_instance(self, inst_id=None):
         """返回指定实例的配置 dict；不传 inst_id 时返回当前活跃实例。"""

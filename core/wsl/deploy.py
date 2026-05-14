@@ -282,6 +282,7 @@ class WSLDeployMixin:
                 "nekro_port": self.config.get("nekro_port") or 8021,
                 "napcat_port": self.config.get("napcat_port") or 6099,
                 "release_channel": self.config.get("release_channel") or "stable",
+                "preview_backup_available": False,
             }
             self.config.set_instance(inst_id, inst)
             if not self.config.get_default_instance_id():
@@ -634,18 +635,13 @@ class WSLDeployMixin:
                 self.log_received.emit("[卸载] ✓ 环境卸载完成", "info")
 
                 if self.config:
-                    self.config.set("first_run", True)
-                    self.config.set("deploy_mode", "")
                     self.config.set("wsl_distro", "")
                     self.config.set("wsl_install_dir", "")
-                    self.config.set("release_channel", "stable")
-                    self.config.set("preview_backup_available", False)
                     self.config.set("image_status_cache", {})
                     self.config.set("image_update_last_alert_signature", "")
                     self.config.set("last_image_update_check_ts", 0)
-                    self.config.set("deploy_info", None)
                     self.config.set("instances", {})
-                    self.config.set("active_instance", "")
+                    self.config.clear_runtime_state(keep_first_run=True)
 
                 self.status_changed.emit("已卸载")
             except Exception as e:

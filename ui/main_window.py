@@ -946,7 +946,7 @@ class MainWindow(QMainWindow):
                     "提示", f"当前后端 {self.backend.display_name} 暂不支持恢复正式版。"
                 )
                 return
-            if not self.config.get("preview_backup_available"):
+            if not self.config.get_active_preview_backup_available():
                 self._show_notice_dialog(
                     "提示", "当前预览版是在未备份的情况下切换的，无法恢复到正式版。"
                 )
@@ -962,7 +962,7 @@ class MainWindow(QMainWindow):
 
             dialog = self._create_update_dialog(
                 "确认恢复正式版",
-                "将从 /root/na_preview_backup.tar.gz 恢复正式版所需的数据与配置，然后把 Nekro Agent 主容器切回稳定版镜像。\n\n"
+                f"将从 {self.backend._preview_backup_archive_path()} 恢复正式版所需的数据与配置，然后把 Nekro Agent 主容器切回稳定版镜像。\n\n"
                 "警告：预览版期间产生的数据库与相关持久化数据会全部丢失。\n"
                 "当前恢复流程会直接回滚 PostgreSQL、Qdrant 和 /root/nekro_agent_data 到切换预览版前的备份状态；由于数据库不兼容，预览版期间写入的数据不会保留。\n\n"
                 "恢复过程中会短暂停止相关服务。",
@@ -1914,6 +1914,10 @@ class MainWindow(QMainWindow):
         self.config.set("nekro_port", inst.get("nekro_port", 8021))
         self.config.set("napcat_port", inst.get("napcat_port", 6099))
         self.config.set("release_channel", inst.get("release_channel", "stable"))
+        self.config.set(
+            "preview_backup_available",
+            bool(inst.get("preview_backup_available", False)),
+        )
         self.config.set("deploy_info", inst.get("deploy_info"))
         return inst
 
@@ -2153,6 +2157,7 @@ class MainWindow(QMainWindow):
         self._prev_deploy_mode = self.config.get("deploy_mode")
         inst_id = pending["inst_id"]
         inst_save = {k: v for k, v in pending.items() if k != "inst_id"}
+        inst_save.setdefault("preview_backup_available", False)
         self.config.set_instance(inst_id, inst_save)
         if not self.config.get_default_instance_id():
             self.config.set_default_instance_id(inst_id)
@@ -2245,10 +2250,17 @@ class MainWindow(QMainWindow):
         if prev_inst:
             self.config.set("nekro_port", prev_inst.get("nekro_port", 8021))
             self.config.set("napcat_port", prev_inst.get("napcat_port", 6099))
+            self.config.set(
+                "release_channel", prev_inst.get("release_channel", "stable")
+            )
+            self.config.set("deploy_info", prev_inst.get("deploy_info"))
+        elif not self.config.list_instances():
+            self.config.clear_runtime_state(keep_first_run=True)
 
         self._pending_inst_data = None
         self._prev_active_instance = None
         self._prev_deploy_mode = None
+        self._sync_browser_to_active_instance(force_reload=False)
         self.refresh_dashboard()
 
     def update_status_ui(self, status):
@@ -2374,7 +2386,7 @@ class MainWindow(QMainWindow):
                 _success_title, failure_title = self._active_update_result_titles()
                 self._finish_update_session(False, failure_title, failure_message)
             if (
-                status == "启动失败"
+                status in {"启动失败", "启动超时"}
                 and getattr(self, "_prev_active_instance", None) is not None
             ):
                 self._rollback_pending_instance()
@@ -3044,9 +3056,8 @@ class MainWindow(QMainWindow):
                     self._sync_browser_to_active_instance(force_reload=True)
                     self._refresh_log_tabs_for_active_instance()
                 else:
-                    self.config.set("active_instance", "")
-                    self.config.set("deploy_mode", "")
-                    self.config.set("first_run", True)
+                    self.config.clear_runtime_state(keep_first_run=True)
+                    self._sync_browser_to_active_instance(force_reload=False)
             self.refresh_dashboard()
             self._show_notice_dialog("移除完成", "实例已移除。")
         else:

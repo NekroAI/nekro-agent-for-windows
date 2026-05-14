@@ -606,7 +606,10 @@ class WSLDiscoveryMixin:
 
         self.config.set("deploy_info", deploy_info)
 
-        inst_id = instance_name or self.config.next_instance_id()
+        inst_id = instance_name or "default"
+        existing = self.config.get_instance(inst_id)
+        if existing and existing.get("deploy_dir") != deploy_dir:
+            inst_id = self.config.next_instance_id()
         inst_data = {
             "instance_name": instance_name,
             "deploy_dir": deploy_dir,
@@ -616,6 +619,9 @@ class WSLDiscoveryMixin:
             "napcat_port": napcat_port,
             "release_channel": release_channel,
             "deploy_info": deploy_info,
+            "preview_backup_available": bool(
+                existing.get("preview_backup_available", False) if existing else False
+            ),
         }
         self.config.set_instance(inst_id, inst_data)
         if not self.config.get_default_instance_id():

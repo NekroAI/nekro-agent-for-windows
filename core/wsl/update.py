@@ -15,6 +15,16 @@ from core.wsl.constants import (
 
 
 class WSLUpdateMixin:
+    def _preview_backup_archive_path(self, inst_id=None):
+        inst = self.config.get_instance(inst_id) if self.config and inst_id else None
+        if inst is None and self.config:
+            inst = self.config.get_instance()
+        instance_name = (inst or {}).get("instance_name", "").strip()
+        if instance_name:
+            archive_name = f"{instance_name.rstrip('_')}_preview_backup.tar.gz"
+            return f"/root/{archive_name}"
+        return PREVIEW_BACKUP_ARCHIVE_PATH
+
     def _backup_target_candidates(self, distro):
         deploy_dir, data_dir, _ = self._get_active_deploy_paths()
         env_path = f"{deploy_dir}/.env"
@@ -58,9 +68,13 @@ class WSLUpdateMixin:
         size = self._wsl_exec(distro, cmd, timeout=60).strip()
         return size or "未知"
 
-    def preview_backup_exists(self):
+    def preview_backup_exists(self, inst_id=None):
         distro = DISTRO_NAME
-        return self._wsl_exec(distro, f"test -f {shlex.quote(PREVIEW_BACKUP_ARCHIVE_PATH)} && echo yes").strip() == "yes"
+        archive_path = self._preview_backup_archive_path(inst_id=inst_id)
+        return self._wsl_exec(
+            distro,
+            f"test -f {shlex.quote(archive_path)} && echo yes",
+        ).strip() == "yes"
 
     def run_remote_update(self):
         """执行内置升级流程，optional 步骤通过信号询问用户确认。"""
@@ -232,7 +246,11 @@ class WSLUpdateMixin:
             try:
                 if create_backup:
                     self._emit_pull_progress("stage", "备份数据与配置")
-                    ok, backup_message = self._backup_nekro_archive(distro, PREVIEW_BACKUP_ARCHIVE_PATH)
+                    archive_path = self._preview_backup_archive_path()
+                    ok, backup_message = self._backup_nekro_archive(
+                        distro,
+                        archive_path,
+                    )
                     if not ok:
                         self.status_changed.emit("更新失败")
                         self.update_finished.emit(False, backup_message)
@@ -267,9 +285,13 @@ class WSLUpdateMixin:
                 nekro_port = int(self.config.get("nekro_port") or 8021) if self.config else 8021
                 if self.config:
                     self.config.set("release_channel", "preview")
-                    self.config.set("preview_backup_available", bool(create_backup))
+                    self.config.set_active_preview_backup_available(bool(create_backup))
                     if inst_id:
-                        self.config.update_instance(inst_id, release_channel="preview")
+                        self.config.update_instance(
+                            inst_id,
+                            release_channel="preview",
+                            preview_backup_available=bool(create_backup),
+                        )
                 if self._log_process is None or self._log_process.poll() is not None:
                     threading.Thread(target=self._log_reader, args=(distro, deploy_dir, log_prefix, inst_id), daemon=True).start()
                 threading.Thread(target=self._health_check, args=(nekro_port,), daemon=True).start()
@@ -317,14 +339,16 @@ class WSLUpdateMixin:
             self.status_changed.emit("更新中...")
             self.log_received.emit("[恢复正式版] 开始从预览版备份恢复正式版", "info")
 
-            if self.config and not self.config.get("preview_backup_available"):
+            archive_path = self._preview_backup_archive_path()
+
+            if self.config and not self.config.get_active_preview_backup_available():
                 self.status_changed.emit("更新失败")
                 self.update_finished.emit(False, "当前预览版是在未备份的情况下切换的，无法恢复到正式版。")
                 return
 
             if not self.preview_backup_exists():
                 self.status_changed.emit("更新失败")
-                self.update_finished.emit(False, f"未找到备份文件：{PREVIEW_BACKUP_ARCHIVE_PATH}")
+                self.update_finished.emit(False, f"未找到备份文件：{archive_path}")
                 return
 
             try:
@@ -337,7 +361,10 @@ class WSLUpdateMixin:
                     self.log_received.emit(out, "info")
 
                 self._emit_pull_progress("stage", "恢复备份数据")
-                rc, out = _exec(f"tar -xzf {shlex.quote(PREVIEW_BACKUP_ARCHIVE_PATH)} -C /", timeout=600)
+                rc, out = _exec(
+                    f"tar -xzf {shlex.quote(archive_path)} -C /",
+                    timeout=600,
+                )
                 if rc != 0:
                     self.status_changed.emit("更新失败")
                     self.update_finished.emit(False, f"恢复备份失败\n{out}" if out else "恢复备份失败")
@@ -370,9 +397,13 @@ class WSLUpdateMixin:
                 nekro_port = int(self.config.get("nekro_port") or 8021) if self.config else 8021
                 if self.config:
                     self.config.set("release_channel", "stable")
-                    self.config.set("preview_backup_available", False)
+                    self.config.set_active_preview_backup_available(False)
                     if inst_id:
-                        self.config.update_instance(inst_id, release_channel="stable")
+                        self.config.update_instance(
+                            inst_id,
+                            release_channel="stable",
+                            preview_backup_available=False,
+                        )
                 if self._log_process is None or self._log_process.poll() is not None:
                     threading.Thread(target=self._log_reader, args=(distro, deploy_dir, log_prefix, inst_id), daemon=True).start()
                 threading.Thread(target=self._health_check, args=(nekro_port,), daemon=True).start()

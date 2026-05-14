@@ -104,7 +104,6 @@ class SettingsPage(QWidget):
         if not inst_id:
             return
         if self.w.config.set_default_instance_id(inst_id):
-            self.w._switch_active_instance(inst_id)
             self._refresh_instance_info()
 
     def _save_instance_remark(self):
