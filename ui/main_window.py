@@ -2165,6 +2165,12 @@ class MainWindow(QMainWindow):
         self.config.set("nekro_port", pending["nekro_port"])
         self.config.set("napcat_port", pending["napcat_port"])
         self.config.set("deploy_mode", pending["deploy_mode"])
+        self.config.set("release_channel", pending.get("release_channel", "stable"))
+        self.config.set(
+            "preview_backup_available",
+            bool(pending.get("preview_backup_available", False)),
+        )
+        self.config.set("deploy_info", pending.get("deploy_info"))
         self.config.set("first_run", False)
         self.refresh_dashboard()
 
@@ -2252,6 +2258,10 @@ class MainWindow(QMainWindow):
             self.config.set("napcat_port", prev_inst.get("napcat_port", 6099))
             self.config.set(
                 "release_channel", prev_inst.get("release_channel", "stable")
+            )
+            self.config.set(
+                "preview_backup_available",
+                bool(prev_inst.get("preview_backup_available", False)),
             )
             self.config.set("deploy_info", prev_inst.get("deploy_info"))
         elif not self.config.list_instances():

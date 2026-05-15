@@ -9,6 +9,10 @@ from core.wsl.constants import CC_SANDBOX_IMAGE, DISTRO_NAME, STABLE_IMAGE
 
 
 class WSLDeployMixin:
+    @staticmethod
+    def _instance_release_channel(inst):
+        return (inst or {}).get("release_channel", "stable") or "stable"
+
     def _get_active_deploy_paths(self):
         """从当前活跃实例配置中获取部署路径，兼容无多实例配置的情况。"""
         if self.config:
@@ -96,7 +100,7 @@ class WSLDeployMixin:
         else:
             _log("首次部署，写入配置文件")
 
-        compose_content = self._prepare_compose_content(compose_src)
+        compose_content = self._prepare_compose_content(compose_src, inst=inst)
         env_content = self._prepare_env(
             env_src,
             data_dir,
@@ -135,7 +139,11 @@ class WSLDeployMixin:
         _log(f"Docker Compose 版本: {compose_version}", "debug")
 
         self.progress_updated.emit("__deploy_progress__|images|检查必需镜像")
-        missing = self._get_missing_images(distro, deploy_mode)
+        missing = self._get_missing_images(
+            distro,
+            deploy_mode,
+            release_channel=self._instance_release_channel(inst),
+        )
         if missing:
             _log(f"检测到 {len(missing)} 个镜像需要拉取...")
             self._emit_pull_progress("start", f"准备拉取 {len(missing)} 个镜像")
@@ -339,6 +347,10 @@ class WSLDeployMixin:
                         self.config.set(
                             "release_channel", inst.get("release_channel", "stable")
                         )
+                        self.config.set(
+                            "preview_backup_available",
+                            bool(inst.get("preview_backup_available", False)),
+                        )
                         self.config.set("deploy_info", inst.get("deploy_info"))
                     try:
                         ok = self._start_instance_sync(
@@ -371,6 +383,10 @@ class WSLDeployMixin:
                         self.config.set(
                             "release_channel",
                             default_inst.get("release_channel", "stable"),
+                        )
+                        self.config.set(
+                            "preview_backup_available",
+                            bool(default_inst.get("preview_backup_available", False)),
                         )
                         self.config.set("deploy_info", default_inst.get("deploy_info"))
 
@@ -747,13 +763,15 @@ class WSLDeployMixin:
                 env_vars[key.strip()] = value.strip()
         return env_vars
 
-    def _prepare_compose_content(self, compose_template_path):
+    def _prepare_compose_content(self, compose_template_path, inst=None):
         content = ""
         if os.path.exists(compose_template_path):
             with open(compose_template_path, "r", encoding="utf-8") as f:
                 content = f.read()
 
-        agent_image = self.get_agent_image_ref(self.config)
+        agent_image = self.get_agent_image_ref(
+            release_channel=self._instance_release_channel(inst)
+        )
         if agent_image != STABLE_IMAGE:
             content = content.replace(
                 f"image: {STABLE_IMAGE}",

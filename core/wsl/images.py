@@ -8,9 +8,11 @@ from core.wsl.constants import DISTRO_NAME, MANAGED_IMAGES_BASE, PREVIEW_IMAGE, 
 
 class WSLImageMixin:
     @staticmethod
-    def get_agent_image_ref(config=None):
+    def get_agent_image_ref(config=None, release_channel=None):
         channel = "stable"
-        if config is not None:
+        if release_channel is not None:
+            channel = release_channel or "stable"
+        elif config is not None:
             try:
                 channel = config.get("release_channel") or "stable"
             except Exception:
@@ -18,8 +20,11 @@ class WSLImageMixin:
         return PREVIEW_IMAGE if channel == "preview" else STABLE_IMAGE
 
     @classmethod
-    def get_required_images(cls, deploy_mode, config=None):
-        agent_ref = cls.get_agent_image_ref(config)
+    def get_required_images(cls, deploy_mode, config=None, release_channel=None):
+        agent_ref = cls.get_agent_image_ref(
+            config=config,
+            release_channel=release_channel,
+        )
         base_images = REQUIRED_IMAGES_BASE.get(deploy_mode, REQUIRED_IMAGES_BASE["lite"])
         return [agent_ref if image == STABLE_IMAGE else image for image in base_images]
 
@@ -48,9 +53,13 @@ class WSLImageMixin:
         except Exception:
             return set()
 
-    def _get_missing_images(self, distro, deploy_mode):
+    def _get_missing_images(self, distro, deploy_mode, release_channel=None):
         """对比镜像清单，返回本地缺失的镜像列表"""
-        required = self.get_required_images(deploy_mode, self.config)
+        required = self.get_required_images(
+            deploy_mode,
+            self.config,
+            release_channel=release_channel,
+        )
         local = self._get_local_images(distro)
 
         missing = []

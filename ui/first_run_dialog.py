@@ -812,7 +812,7 @@ class FirstRunDialog(QDialog):
             "deploy_mode": mode,
             "nekro_port": nekro_port,
             "napcat_port": napcat_port,
-            "release_channel": self.config.get("release_channel") or "stable",
+            "release_channel": "stable",
         }
         self._start_deploy_progress()
         self.deploy_requested.emit(mode, inst_data)
