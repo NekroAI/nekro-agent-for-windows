@@ -28,13 +28,18 @@ class ScanInstancesThread(QThread):
         self.backend = backend
 
     def run(self):
-        instances = self.backend.scan_existing_instances(on_step=self.scan_step.emit)
+        try:
+            instances = self.backend.scan_existing_instances(on_step=self.scan_step.emit)
+        except Exception as e:
+            self.scan_step.emit(f"扫描失败: {e}")
+            instances = []
         self.scan_done.emit(instances)
 
 
 class TakeoverThread(QThread):
     result_ready = pyqtSignal(bool)
     step_changed = pyqtSignal(int, int, str)
+    error_ready = pyqtSignal(str)
 
     def __init__(self, backend, instance):
         super().__init__()
@@ -42,7 +47,11 @@ class TakeoverThread(QThread):
         self.instance = instance
 
     def run(self):
-        ok = self.backend.takeover_instance(self.instance, on_step=self._on_step)
+        try:
+            ok = self.backend.takeover_instance(self.instance, on_step=self._on_step)
+        except Exception as e:
+            self.error_ready.emit(str(e))
+            ok = False
         self.result_ready.emit(ok)
 
     def _on_step(self, idx, total, desc):
@@ -51,6 +60,7 @@ class TakeoverThread(QThread):
 
 class CreateRuntimeThread(QThread):
     result_ready = pyqtSignal(bool)
+    error_ready = pyqtSignal(str)
 
     def __init__(self, backend, install_dir):
         super().__init__()
@@ -58,7 +68,11 @@ class CreateRuntimeThread(QThread):
         self.install_dir = install_dir
 
     def run(self):
-        ok = self.backend.create_runtime(self.install_dir)
+        try:
+            ok = self.backend.create_runtime(self.install_dir)
+        except Exception as e:
+            self.error_ready.emit(str(e))
+            ok = False
         self.result_ready.emit(ok)
 
 
@@ -390,6 +404,7 @@ class MigrationDialog(QDialog):
 
         install_dir = self.backend.get_default_install_dir()
         self._create_thread = CreateRuntimeThread(self.backend, install_dir)
+        self._create_thread.error_ready.connect(self._on_install_error)
         self._create_thread.result_ready.connect(self._on_create_done)
         self._track_thread(self._create_thread)
         self._create_thread.start()
@@ -490,6 +505,7 @@ class MigrationDialog(QDialog):
 
         self._takeover_thread = TakeoverThread(self.backend, instance)
         self._takeover_thread.step_changed.connect(self._on_takeover_step)
+        self._takeover_thread.error_ready.connect(self._migrate_status.setText)
         self._takeover_thread.result_ready.connect(self._on_takeover_done)
         self._track_thread(self._takeover_thread)
         self._takeover_thread.start()

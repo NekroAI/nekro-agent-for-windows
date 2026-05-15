@@ -1,3 +1,4 @@
+# Runtime dependencies are managed primarily in pyproject.toml for uv.
 PyQt6>=6.6.0
 qtwebview2>=0.4.0
 requests>=2.31.0

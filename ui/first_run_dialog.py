@@ -30,12 +30,16 @@ class CheckStepThread(QThread):
         self._step = step_index
 
     def run(self):
-        passed, detail = self._func()
+        try:
+            passed, detail = self._func()
+        except Exception as e:
+            passed, detail = False, str(e)
         self.step_done.emit(self._step, passed, detail)
 
 
 class CreateRuntimeThread(QThread):
     result_ready = pyqtSignal(bool)
+    error_ready = pyqtSignal(str)
 
     def __init__(self, backend, install_dir):
         super().__init__()
@@ -43,7 +47,11 @@ class CreateRuntimeThread(QThread):
         self.install_dir = install_dir
 
     def run(self):
-        ok = self.backend.create_runtime(self.install_dir)
+        try:
+            ok = self.backend.create_runtime(self.install_dir)
+        except Exception as e:
+            self.error_ready.emit(str(e))
+            ok = False
         self.result_ready.emit(ok)
 
 
@@ -443,6 +451,7 @@ class FirstRunDialog(QDialog):
         self.lbl_error.setVisible(False)
 
         self._create_thread = CreateRuntimeThread(self.backend, install_dir)
+        self._create_thread.error_ready.connect(self._on_install_error)
         self._create_thread.result_ready.connect(self._on_create_done)
         self._track_thread(self._create_thread)
         self._create_thread.start()

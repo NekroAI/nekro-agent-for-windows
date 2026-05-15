@@ -55,7 +55,7 @@ def get_app_data_dir() -> str:
 
 class ConfigManager:
     def __init__(self, config_path=None):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         # 确定基础路径
         if getattr(sys, 'frozen', False):
             self.base_path = os.path.dirname(sys.executable)
@@ -159,17 +159,31 @@ class ConfigManager:
                 return self.default_config.copy()
         return self.default_config.copy()
 
+    def _save_config_locked(self):
+        tmp_path = ""
+        try:
+            config_dir = os.path.dirname(os.path.abspath(self.config_path))
+            os.makedirs(config_dir, exist_ok=True)
+            tmp_path = os.path.join(config_dir, f".{os.path.basename(self.config_path)}.{os.getpid()}.tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(self.config, f, indent=4, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.config_path)
+            self.last_save_error = ""
+            return True
+        except Exception as e:
+            self.last_save_error = str(e)
+            if tmp_path:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            return False
+
     def save_config(self):
         with self._lock:
-            try:
-                os.makedirs(os.path.dirname(os.path.abspath(self.config_path)), exist_ok=True)
-                with open(self.config_path, "w", encoding="utf-8") as f:
-                    json.dump(self.config, f, indent=4, ensure_ascii=False)
-                self.last_save_error = ""
-                return True
-            except Exception as e:
-                self.last_save_error = str(e)
-                return False
+            return self._save_config_locked()
 
     def get(self, key):
         return self.config.get(key, self.default_config.get(key))
@@ -177,7 +191,7 @@ class ConfigManager:
     def set(self, key, value):
         with self._lock:
             self.config[key] = value
-        return self.save_config()
+            return self._save_config_locked()
 
     # ------------------------------------------------------------------ #
     # 多实例管理
@@ -211,7 +225,7 @@ class ConfigManager:
             self.config["instances"] = instances
             self.config["active_instance"] = inst_id
             self.config["default_instance"] = inst_id
-        self.save_config()
+            self._save_config_locked()
 
     def get_active_instance_id(self):
         return self.config.get("active_instance", "")
@@ -271,7 +285,7 @@ class ConfigManager:
             self.config["napcat_port"] = self.default_config["napcat_port"]
             if keep_first_run:
                 self.config["first_run"] = True
-        return self.save_config()
+            return self._save_config_locked()
 
     def get_instance(self, inst_id=None):
         """返回指定实例的配置 dict；不传 inst_id 时返回当前活跃实例。"""
@@ -285,7 +299,7 @@ class ConfigManager:
         with self._lock:
             instances = self.config.setdefault("instances", {})
             instances[inst_id] = data
-        return self.save_config()
+            return self._save_config_locked()
 
     def update_instance(self, inst_id, **kwargs):
         """增量更新一个实例的部分字段。"""
@@ -293,7 +307,7 @@ class ConfigManager:
             instances = self.config.setdefault("instances", {})
             inst = instances.setdefault(inst_id, {})
             inst.update(kwargs)
-        return self.save_config()
+            return self._save_config_locked()
 
     def remove_instance(self, inst_id):
         with self._lock:
@@ -304,7 +318,7 @@ class ConfigManager:
                 self.config["active_instance"] = fallback
             if self.config.get("default_instance") == inst_id:
                 self.config["default_instance"] = self.config.get("active_instance") or fallback
-        return self.save_config()
+            return self._save_config_locked()
 
     def list_instances(self):
         """返回 [(inst_id, inst_data), ...] 列表。"""

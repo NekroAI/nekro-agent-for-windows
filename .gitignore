@@ -22,6 +22,9 @@ browser_profile/
 debug.log
 *.log
 
+# 本地人工测试记录
+MANUAL_TEST_CHECKLIST.md
+
 # ISO 镜像
 *.iso
 

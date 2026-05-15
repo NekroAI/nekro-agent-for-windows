@@ -9,25 +9,22 @@ echo   版本号: %APP_VERSION%
 echo ========================================
 echo.
 
-echo [1/5] 检查并安装依赖...
-pip install -r requirements.txt
+echo [1/5] 检查 uv...
+where uv >nul 2>&1
 if errorlevel 1 (
-    echo 错误: 依赖安装失败！
+    echo 错误: 未检测到 uv，请先安装 uv 后重试。
+    echo 安装说明: https://docs.astral.sh/uv/getting-started/installation/
     pause
     exit /b 1
 )
 
 echo.
-echo [2/5] 检查打包工具...
-python -m PyInstaller --version >nul 2>&1
+echo [2/5] 同步依赖...
+uv sync --group dev
 if errorlevel 1 (
-    echo PyInstaller 未安装，正在安装...
-    pip install pyinstaller
-    if errorlevel 1 (
-        echo 错误: PyInstaller 安装失败！
-        pause
-        exit /b 1
-    )
+    echo 错误: 依赖同步失败！
+    pause
+    exit /b 1
 )
 
 echo.
@@ -39,7 +36,7 @@ echo 清理完成
 
 echo.
 echo [4/5] 打包为 EXE...
-python -m PyInstaller build.spec
+uv run python -m PyInstaller build.spec
 if errorlevel 1 (
     echo 错误: 打包失败！
     pause
@@ -49,11 +46,14 @@ if errorlevel 1 (
 echo.
 echo [5/5] 制作安装包...
 
-set "ISCC="
-if exist "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" (
+set "ISCC=D:\Inno Setup 7\ISCC.exe"
+if not exist "%ISCC%" (
+    set "ISCC="
+)
+if not defined ISCC if exist "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" (
     set "ISCC=C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
 )
-if exist "C:\Program Files\Inno Setup 6\ISCC.exe" (
+if not defined ISCC if exist "C:\Program Files\Inno Setup 6\ISCC.exe" (
     set "ISCC=C:\Program Files\Inno Setup 6\ISCC.exe"
 )
 

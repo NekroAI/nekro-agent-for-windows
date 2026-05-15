@@ -1,11 +1,6 @@
-import sys
-import os
 import argparse
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QPalette, QColor, QIcon
-from PyQt6.QtWidgets import QApplication
-from ui.main_window import MainWindow, get_resource_path
-from ui.splash import SplashScreen
+import os
+import sys
 
 # 全局 debug 标志
 DEBUG_MODE = False
@@ -57,17 +52,50 @@ class LogRedirector:
             pass
 
 
-def main():
+def _run_backend_check():
+    from core.backend_factory import BackendFactory
+    from core.config_manager import ConfigManager
+
+    config = ConfigManager()
+    backend = BackendFactory.create(config)
+    checks = backend.get_check_funcs()
+    labels = [
+        "WSL",
+        "Nekro Agent runtime",
+        "Docker",
+        "Docker Compose",
+    ]
+
+    print(f"Backend check: {backend.display_name or backend.backend_key or 'backend'}")
+    all_passed = True
+    for idx, check in enumerate(checks):
+        label = labels[idx] if idx < len(labels) else f"Check {idx + 1}"
+        try:
+            passed, detail = check()
+        except Exception as e:
+            passed = False
+            detail = str(e)
+        status = "PASS" if passed else "FAIL"
+        suffix = f": {detail}" if detail else ""
+        print(f"[{status}] {label}{suffix}")
+        if not passed:
+            all_passed = False
+
+    print(f"Result: {'PASS' if all_passed else 'FAIL'}")
+    return 0 if all_passed else 1
+
+
+def _run_gui(args):
     global DEBUG_MODE
 
-    # 解析命令行参数
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--debug', action='store_true', help='启用 debug 日志')
-    args = parser.parse_args()
-    DEBUG_MODE = args.debug
+    from PyQt6.QtCore import QTimer
+    from PyQt6.QtGui import QPalette, QColor, QIcon
+    from PyQt6.QtWidgets import QApplication
 
-    if sys.platform == 'win32':
-        os.environ['PYTHONIOENCODING'] = 'utf-8'
+    from ui.main_window import MainWindow, get_resource_path
+    from ui.splash import SplashScreen
+
+    DEBUG_MODE = args.debug
 
     from core.config_manager import get_app_data_dir
     log_dir = get_app_data_dir()
@@ -84,7 +112,6 @@ def main():
     if os.path.exists(app_icon_path):
         app.setWindowIcon(QIcon(app_icon_path))
 
-    # 强制使用 Fusion 风格 + 亮色调色板，不跟随系统深色模式
     app.setStyle("Fusion")
     light_palette = QPalette()
     light_palette.setColor(QPalette.ColorRole.Window, QColor(255, 255, 255))
@@ -114,7 +141,22 @@ def main():
 
     QTimer.singleShot(600, _create_main)
 
-    sys.exit(app.exec())
+    return app.exec()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--debug', action='store_true', help='启用 debug 日志')
+    parser.add_argument('--backend-check', action='store_true', help='运行后端环境检查后退出')
+    args = parser.parse_args()
+
+    if sys.platform == 'win32':
+        os.environ['PYTHONIOENCODING'] = 'utf-8'
+
+    if args.backend_check:
+        sys.exit(_run_backend_check())
+
+    sys.exit(_run_gui(args))
 
 
 if __name__ == "__main__":
