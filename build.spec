@@ -8,7 +8,7 @@ a = Analysis(
     binaries=[],
     datas=[
         ('assets', 'assets'),
-        ('data', 'data'),
+        ('launcher_data', 'launcher_data'),
         ('version.txt', '.'),
     ],
     hiddenimports=[

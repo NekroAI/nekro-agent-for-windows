@@ -26,7 +26,9 @@
       "step": 4,
       "type": "compose_up",
       "label": "重启 Nekro Agent 容器",
-      "services": ["nekro_agent"]
+      "services": [
+        "nekro_agent"
+      ]
     },
     {
       "step": 5,

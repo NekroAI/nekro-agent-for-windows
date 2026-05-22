@@ -126,7 +126,8 @@ main.py                 应用入口与命令行参数
 core/                   配置、更新、后端抽象与 WSL 实现
 core/wsl/               WSL、Docker、Compose、部署、镜像和迁移逻辑
 ui/                     PyQt6 主窗口、向导、页面和通用组件
-data/                   Compose 模板、环境模板和更新配置
+launcher_data/          Compose 模板、环境模板和更新配置
+data/                   本地运行时数据（开发调试时生成，不参与打包）
 assets/                 图标和图片资源
 build.spec              PyInstaller 打包配置
 installer.iss           Inno Setup 安装包脚本

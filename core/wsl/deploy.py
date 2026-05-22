@@ -13,6 +13,9 @@ class WSLDeployMixin:
     def _instance_release_channel(inst):
         return (inst or {}).get("release_channel", "stable") or "stable"
 
+    def _launcher_data_path(self, *parts):
+        return os.path.join(self.base_path, "launcher_data", *parts)
+
     def _get_active_deploy_paths(self):
         """从当前活跃实例配置中获取部署路径，兼容无多实例配置的情况。"""
         if self.config:
@@ -65,8 +68,8 @@ class WSLDeployMixin:
             if deploy_mode == "napcat"
             else "docker-compose_withnot_napcat.yml"
         )
-        compose_src = os.path.join(self.base_path, "data", compose_file)
-        env_src = os.path.join(self.base_path, "data", "env")
+        compose_src = self._launcher_data_path(compose_file)
+        env_src = self._launcher_data_path("env")
         if not os.path.exists(compose_src):
             _log(f"Compose 文件不存在: {compose_src}", "error")
             return False

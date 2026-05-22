@@ -31,6 +31,9 @@ MANUAL_TEST_CHECKLIST.md
 # 共享目录
 shared/
 
+# 本地运行时数据
+data/
+
 # IDE
 .vscode/
 .idea/
@@ -40,4 +43,3 @@ shared/
 .DS_Store
 Thumbs.db
 desktop.ini
-data/
