@@ -98,11 +98,11 @@ class HomePage(QWidget):
         metrics = QGridLayout()
         metrics.setHorizontalSpacing(16)
         metrics.setVerticalSpacing(16)
-        self.w.metric_status = MetricCard("服务状态", "未就绪", "等待部署或启动", "red")
+        self.w.metric_status = MetricCard("服务状态", "未就绪", "", "red")
         self.w.metric_mode = MetricCard(
             "部署版本",
             self.w._format_mode_text(self.w.config.get("deploy_mode")),
-            "运行向导可修改",
+            "",
             "amber",
         )
 
