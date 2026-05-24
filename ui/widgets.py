@@ -100,6 +100,50 @@ def create_install_progress_bar(minimum=0, maximum=0, height=8, radius=4):
     return bar
 
 
+class ScanProgressDialog(QDialog):
+    """扫描本地实例时的进度对话框，避免长时间无响应的视觉假象。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("正在检测本地实例")
+        self.setModal(True)
+        self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
+        self.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
+        self.setFixedWidth(420)
+        self.setStyleSheet(STYLESHEET)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(14)
+
+        title = QLabel("正在扫描本地 Nekro Agent 部署")
+        title.setStyleSheet("font-size: 15px; font-weight: 600; color: #24384a;")
+        layout.addWidget(title)
+
+        desc = QLabel("正在遍历本机所有 WSL 发行版，首次检测可能需要十几秒，请稍候。")
+        desc.setWordWrap(True)
+        desc.setStyleSheet("font-size: 12px; color: #6e8396;")
+        layout.addWidget(desc)
+
+        self._step_label = QLabel("正在准备扫描...")
+        self._step_label.setWordWrap(True)
+        self._step_label.setStyleSheet("font-size: 12px; color: #24384a;")
+        layout.addWidget(self._step_label)
+
+        self._progress = create_install_progress_bar(0, 0, height=8, radius=4)
+        layout.addWidget(self._progress)
+
+    def update_step(self, text: str):
+        if text:
+            self._step_label.setText(text)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            event.ignore()
+            return
+        super().keyPressEvent(event)
+
+
 class PullProgressView(QFrame):
     def __init__(self, parent=None, dark=False):
         super().__init__(parent)

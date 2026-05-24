@@ -1366,15 +1366,20 @@ class MainWindow(QMainWindow):
     def _show_first_run_with_scan(self):
         """首次运行：先快速扫描已有实例，有则弹迁移向导，无则进全新部署向导。"""
         from ui.migration_dialog import ScanInstancesThread
+        from ui.widgets import ScanProgressDialog
 
-        class _QuickScan(ScanInstancesThread):
-            pass
-
-        self._quick_scan = _QuickScan(self.backend)
+        self._quick_scan_dialog = ScanProgressDialog(self)
+        self._quick_scan = ScanInstancesThread(self.backend)
+        self._quick_scan.scan_step.connect(self._quick_scan_dialog.update_step)
         self._quick_scan.scan_done.connect(self._on_quick_scan_done)
         self._quick_scan.start()
+        self._quick_scan_dialog.exec()
 
     def _on_quick_scan_done(self, instances: list):
+        dialog = getattr(self, "_quick_scan_dialog", None)
+        if dialog is not None:
+            dialog.accept()
+            self._quick_scan_dialog = None
         if instances:
             self._show_migration_choice(instances)
         else:
