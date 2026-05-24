@@ -1,6 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
+import qtwebview2
+
 block_cipher = None
+
+# qtwebview2 在运行时通过 get_absolute_path('lib/...') 从 sys._MEIPASS 加载
+# WebView2 的 .NET 程序集和 native loader DLL，必须把这些文件打到打包根目录的 lib/ 下。
+_QTWV2_LIB_DIR = os.path.join(os.path.dirname(qtwebview2.__file__), 'lib')
 
 a = Analysis(
     ['main.py'],
@@ -10,6 +17,7 @@ a = Analysis(
         ('assets', 'assets'),
         ('launcher_data', 'launcher_data'),
         ('version.txt', '.'),
+        (_QTWV2_LIB_DIR, 'lib'),
     ],
     hiddenimports=[
         'qtwebview2',
