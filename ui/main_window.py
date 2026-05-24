@@ -820,8 +820,6 @@ class MainWindow(QMainWindow):
                 and not self._blocking_status_detail()
             )
             self.btn_primary_preview.setText(self._preview_button_label())
-        if hasattr(self, "browser_devtools_btn"):
-            self.browser_devtools_btn.setVisible(enabled)
         if hasattr(self, "_image_rows_layout"):
             self._rebuild_image_rows()
 
@@ -1887,16 +1885,6 @@ class MainWindow(QMainWindow):
         if current_view:
             self._sync_browser_url_label(current_view.get_url())
         self._refresh_browser_nav_buttons()
-
-    def _open_browser_devtools(self):
-        current_url = self._browser_current_navigable_url()
-        self._show_notice_dialog(
-            "开发者工具",
-            "WebView2 不支持内嵌 DevTools。\n\n"
-            "请在 Edge 浏览器中打开 edge://inspect 进行远程调试，\n"
-            f"或在系统浏览器中按 F12 调试页面：\n{current_url}",
-        )
-        webbrowser.open(current_url)
 
     def _instance_display_name(self, inst_id=None, inst=None):
         if inst is None and inst_id:

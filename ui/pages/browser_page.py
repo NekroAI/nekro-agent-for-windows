@@ -79,11 +79,6 @@ class BrowserPage(QWidget):
         self.w.browser_open_external_btn.clicked.connect(self.w._open_current_in_browser)
         action_row.addWidget(self.w.browser_open_external_btn)
 
-        self.w.browser_devtools_btn = QPushButton("开发者工具")
-        self.w.browser_devtools_btn.setObjectName("SegmentBtn")
-        self.w.browser_devtools_btn.clicked.connect(self.w._open_browser_devtools)
-        self.w.browser_devtools_btn.setVisible(self.w._advanced_features_enabled())
-        action_row.addWidget(self.w.browser_devtools_btn)
         action_row.addStretch()
         card_layout.addLayout(action_row)
 
