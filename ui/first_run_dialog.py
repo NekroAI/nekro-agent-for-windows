@@ -69,8 +69,8 @@ class FirstRunDialog(QDialog):
         self._selected_mode = self.config.get("deploy_mode") or "lite"
 
         self.setWindowTitle("Nekro Agent 环境配置向导")
-        self.resize(660, 560)
-        self.setMinimumSize(600, 520)
+        self.resize(680, 640)
+        self.setMinimumSize(620, 600)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint)
         self.setStyleSheet(STYLESHEET)
 
@@ -563,7 +563,7 @@ class FirstRunDialog(QDialog):
     def _init_datadir_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setSpacing(18)
+        layout.setSpacing(10)
 
         title = QLabel("配置实例")
         title.setObjectName("WizardTitle")
@@ -576,7 +576,7 @@ class FirstRunDialog(QDialog):
         layout.addWidget(desc)
 
         lbl_instance = QLabel("实例名称（可选）:")
-        lbl_instance.setStyleSheet("font-size: 14px; font-weight: 600; color: #24384a; margin-top: 10px;")
+        lbl_instance.setStyleSheet("font-size: 14px; font-weight: 600; color: #24384a;")
         layout.addWidget(lbl_instance)
 
         self.instance_name_edit = QLineEdit("")
@@ -592,7 +592,7 @@ class FirstRunDialog(QDialog):
         layout.addWidget(instance_hint)
 
         lbl_winpath = QLabel("Windows 侧数据访问路径:")
-        lbl_winpath.setStyleSheet("font-size: 14px; font-weight: 600; color: #24384a; margin-top: 10px;")
+        lbl_winpath.setStyleSheet("font-size: 14px; font-weight: 600; color: #24384a;")
         layout.addWidget(lbl_winpath)
 
         windows_path = self.backend.get_host_access_path("/root/nekro_agent_data")
@@ -603,7 +603,7 @@ class FirstRunDialog(QDialog):
         layout.addWidget(self.datadir_path_card)
 
         lbl_ports = QLabel("端口配置:")
-        lbl_ports.setStyleSheet("font-size: 14px; font-weight: 600; color: #24384a; margin-top: 10px;")
+        lbl_ports.setStyleSheet("font-size: 14px; font-weight: 600; color: #24384a;")
         layout.addWidget(lbl_ports)
 
         port_row1 = QHBoxLayout()
