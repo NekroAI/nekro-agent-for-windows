@@ -81,7 +81,7 @@ class MigrationDialog(QDialog):
 
     deploy_requested = pyqtSignal(str, dict)
 
-    def __init__(self, backend, config, parent=None):
+    def __init__(self, backend, config, parent=None, preloaded_instances=None):
         super().__init__(parent)
         self.backend = backend
         self.config = config
@@ -115,8 +115,12 @@ class MigrationDialog(QDialog):
         self.backend.progress_updated.connect(self._on_progress)
         self.backend.install_error.connect(self._on_install_error)
 
-        self._goto_page("scan")
-        self._start_scan()
+        if preloaded_instances:
+            self._populate_found_page(preloaded_instances)
+            self._goto_page("found_instances")
+        else:
+            self._goto_page("scan")
+            self._start_scan()
 
     # ------------------------------------------------------------------ #
     # 基础设施
@@ -351,6 +355,18 @@ class MigrationDialog(QDialog):
         btn_takeover.setMinimumWidth(110)
         btn_takeover.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_takeover.setObjectName("WizardAccent")
+        btn_takeover.setStyleSheet(
+            "QPushButton {"
+            "  background: #1b6db4;"
+            "  color: white;"
+            "  border: none;"
+            "  border-radius: 8px;"
+            "  font-size: 13px;"
+            "  font-weight: 600;"
+            "  padding: 0 14px;"
+            "}"
+            "QPushButton:hover { background: #185f9d; }"
+        )
         btn_takeover.clicked.connect(lambda _checked, inst=instance: self._start_takeover(inst))
         inner.addWidget(btn_takeover, 0, Qt.AlignmentFlag.AlignVCenter)
 

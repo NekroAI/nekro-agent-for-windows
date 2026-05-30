@@ -1403,7 +1403,7 @@ class MainWindow(QMainWindow):
         msg.exec()
 
         if msg.clickedButton() == btn_migrate:
-            self._show_migration_dialog()
+            self._show_migration_dialog(preloaded_instances=instances)
         else:
             self._show_first_run_dialog()
 
@@ -1414,10 +1414,15 @@ class MainWindow(QMainWindow):
         dialog.deploy_requested.connect(self._on_deploy_mode_selected)
         dialog.exec()
 
-    def _show_migration_dialog(self):
+    def _show_migration_dialog(self, preloaded_instances=None):
         from ui.migration_dialog import MigrationDialog
 
-        dialog = MigrationDialog(self.backend, self.config, parent=self)
+        dialog = MigrationDialog(
+            self.backend,
+            self.config,
+            parent=self,
+            preloaded_instances=preloaded_instances,
+        )
         dialog.deploy_requested.connect(self._on_deploy_mode_selected)
         dialog.exec()
 

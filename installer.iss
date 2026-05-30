@@ -12,7 +12,7 @@
 #expr FileClose(VersionFile)
 
 [Setup]
-AppId={{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}
+AppId={{0D91D7D8-E468-D87A-BE19-C014DE353315}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
