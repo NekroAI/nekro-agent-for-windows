@@ -14,7 +14,11 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from core.port_utils import normalize_port, validate_port_bindings
+from core.port_utils import (
+    normalize_port,
+    validate_instance_port_conflicts,
+    validate_port_bindings,
+)
 from ui.styles import STYLESHEET
 from ui.widgets import (
     CreateRuntimeThread,
@@ -756,6 +760,14 @@ class FirstRunDialog(WizardDialogBase):
             self._show_notice_dialog("实例名冲突", f"已存在 ID 为「{inst_id}」的实例，请更换实例名称。")
             return
 
+        ok, message = validate_instance_port_conflicts(
+            self.config.list_instances(),
+            port_specs,
+        )
+        if not ok:
+            self._show_notice_dialog("端口冲突", message)
+            return
+
         inst_data = {
             "inst_id": inst_id,
             "instance_name": instance_name,
@@ -831,8 +843,11 @@ class FirstRunDialog(WizardDialogBase):
             self.btn_deploy_done.setText("完成")
             self.btn_deploy_done.setEnabled(True)
             QTimer.singleShot(800, self.accept)
-        elif status == "启动失败":
-            self.deploy_status_label.setText("部署失败，请查看日志详情后重试。")
+        elif status in {"启动失败", "启动超时"}:
+            if status == "启动超时":
+                self.deploy_status_label.setText("服务启动超时，请查看日志详情后重试。")
+            else:
+                self.deploy_status_label.setText("部署失败，请查看日志详情后重试。")
             self.deploy_detail_label.setText("详细错误仍会记录到主窗口日志页。")
             self.deploy_detail_label.setVisible(True)
             for key in reversed(self.deploy_step_order):

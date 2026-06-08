@@ -32,7 +32,11 @@ from core.app_updater import APP_VERSION, UpdateChecker
 from core.autostart import set_autostart_enabled
 from core.backend_factory import BackendFactory
 from core.config_manager import ConfigManager
-from core.port_utils import normalize_port, validate_port_bindings
+from core.port_utils import (
+    normalize_port,
+    validate_instance_port_conflicts,
+    validate_port_bindings,
+)
 from ui.styles import STYLESHEET
 from ui.webview_widget import WebViewWidget
 from ui.widgets import (
@@ -1407,6 +1411,9 @@ class MainWindow(QMainWindow):
         return escape(str(msg)).replace("\n", "<br>")
 
     def append_log(self, msg, level="info"):
+        redact = getattr(self.backend, "_redact_for_log", None)
+        if callable(redact):
+            msg = redact(str(msg))
         if level == "debug" and not getattr(self, "debug_mode", False):
             return
         if msg.startswith("[镜像拉取]") or msg.startswith("[沙盒镜像]"):
@@ -2788,11 +2795,20 @@ class MainWindow(QMainWindow):
                 self._show_notice_dialog("端口冲突", message)
                 return
 
+            active_id = self.config.get_active_instance_id()
+            ok, message = validate_instance_port_conflicts(
+                self.config.list_instances(),
+                port_specs,
+                current_instance_id=active_id,
+            )
+            if not ok:
+                self._show_notice_dialog("端口冲突", message)
+                return
+
             self.config.set("nekro_port", nekro_port)
             if deploy_mode == "napcat":
                 self.config.set("napcat_port", napcat_port)
 
-            active_id = self.config.get_active_instance_id()
             deploy_info = self.config.get("deploy_info")
             if deploy_info:
                 deploy_info["port"] = str(nekro_port)

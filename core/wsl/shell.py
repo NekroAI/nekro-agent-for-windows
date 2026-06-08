@@ -181,6 +181,24 @@ class WSLShellMixin:
 
         if "base64 -d" in result and "printf %s" in result:
             result = re.sub(r"printf %s\s+\S+", "printf %s <base64-content>", result)
+        result = re.sub(
+            r"([?&](?:access_)?token=)([^&\s]+)",
+            r"\1<redacted>",
+            result,
+            flags=re.IGNORECASE,
+        )
+        result = re.sub(
+            r"((?:管理员)?密码\s*[:：]\s*)([^\s,，\n\"']+)",
+            r"\1<redacted>",
+            result,
+            flags=re.IGNORECASE,
+        )
+        result = re.sub(
+            r"((?:登录\s*)?(?:Token|令牌)\s*[:：]\s*)([^\s,，\n\"']+)",
+            r"\1<redacted>",
+            result,
+            flags=re.IGNORECASE,
+        )
         return result
 
     def _command_for_log(self, cmd=None, args=None):

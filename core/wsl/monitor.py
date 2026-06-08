@@ -48,7 +48,7 @@ class WSLMonitorMixin:
                             info["napcat_token"] = token
                             self._save_deploy_info(info, inst_id=inst_id)
                             self.log_received.emit(
-                                f"{log_prefix}[NapCat] 已捕获 WebUI Token: {token}",
+                                f"{log_prefix}[NapCat] 已捕获 WebUI Token，请在部署凭据窗口查看。",
                                 "info",
                             )
                             if self._pending_deploy_info:

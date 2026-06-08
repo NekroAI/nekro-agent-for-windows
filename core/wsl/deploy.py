@@ -5,7 +5,7 @@ import subprocess
 import threading
 import time
 
-from core.port_utils import normalize_port
+from core.port_utils import normalize_port, validate_instance_port_conflicts
 from core.wsl.constants import CC_SANDBOX_IMAGE, DISTRO_NAME, STABLE_IMAGE
 
 
@@ -382,6 +382,11 @@ class WSLDeployMixin:
             return self.start_services(
                 self.config.get("deploy_mode") if self.config else "lite"
             )
+        ports_ok, ports_message = validate_instance_port_conflicts(instances)
+        if not ports_ok:
+            self.log_received.emit(ports_message, "error")
+            self.status_changed.emit("启动失败")
+            return False
         if not self._distro_exists():
             self.log_received.emit("NekroAgent 发行版不存在", "error")
             return False
@@ -864,9 +869,7 @@ class WSLDeployMixin:
         self._save_deploy_info(info, inst_id=inst_id)
 
         self.log_received.emit("=== 部署完成！===", "info")
-        self.log_received.emit(
-            f"管理员账号: admin | 密码: {info['admin_password']}", "info"
-        )
+        self.log_received.emit("管理员凭据已生成，请在部署凭据窗口查看。", "info")
         self.log_received.emit(f"Web 访问地址: http://127.0.0.1:{info['port']}", "info")
 
         self.deploy_info_ready.emit(info)
