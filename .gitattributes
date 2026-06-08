@@ -1,0 +1,16 @@
+# Keep text files in Windows line-ending style in the working tree.
+* text=auto eol=crlf
+*.sh text eol=lf
+
+# Binary assets.
+*.ico binary
+*.png binary
+*.exe binary
+*.dll binary
+*.pyd binary
+*.so binary
+*.zip binary
+*.tar binary
+*.gz binary
+*.7z binary
+*.pdf binary

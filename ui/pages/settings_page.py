@@ -1,11 +1,16 @@
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QCheckBox, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
-    QPushButton, QVBoxLayout, QWidget,
+    QVBoxLayout, QWidget,
 )
 
 from core.app_updater import APP_VERSION
-from ui.widgets import SectionCard, StyledComboBox
+from ui.widgets import (
+    SectionCard,
+    StyledComboBox,
+    make_secondary_button,
+    make_segment_button,
+)
 
 
 class SettingsPage(QWidget):
@@ -61,9 +66,7 @@ class SettingsPage(QWidget):
         self.w.instance_remark_edit = QLineEdit()
         self.w.instance_remark_edit.setPlaceholderText("例如：主号、测试 Bot、群管实例")
         remark_row.addWidget(self.w.instance_remark_edit, 1)
-        btn_save_remark = QPushButton("保存备注")
-        btn_save_remark.setObjectName("HeroSecondary")
-        btn_save_remark.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_save_remark = make_secondary_button("保存备注")
         btn_save_remark.clicked.connect(self._save_instance_remark)
         remark_row.addWidget(btn_save_remark)
         card_layout.addLayout(remark_row)
@@ -195,9 +198,7 @@ class SettingsPage(QWidget):
 
         version_row.addStretch()
 
-        self.w.btn_check_update = QPushButton("检查更新")
-        self.w.btn_check_update.setObjectName("HeroSecondary")
-        self.w.btn_check_update.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.w.btn_check_update = make_secondary_button("检查更新")
         self.w.btn_check_update.clicked.connect(self.w.check_app_update_manual)
         version_row.addWidget(self.w.btn_check_update)
         card_layout.addLayout(version_row)
@@ -215,15 +216,11 @@ class SettingsPage(QWidget):
         link_row = QHBoxLayout()
         link_row.setSpacing(10)
 
-        btn_open_config = QPushButton("打开配置目录")
-        btn_open_config.setObjectName("HeroSecondary")
-        btn_open_config.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_open_config = make_secondary_button("打开配置目录")
         btn_open_config.clicked.connect(lambda: self.w._open_path_in_explorer(self.w.config.app_data_dir))
         link_row.addWidget(btn_open_config)
 
-        btn_open_logs = QPushButton("查看应用日志")
-        btn_open_logs.setObjectName("HeroSecondary")
-        btn_open_logs.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_open_logs = make_secondary_button("查看应用日志")
         btn_open_logs.clicked.connect(lambda: self.w.switch_tab(2))
         link_row.addWidget(btn_open_logs)
         link_row.addStretch()
@@ -238,10 +235,7 @@ class SettingsPage(QWidget):
         advanced_row = QHBoxLayout()
         advanced_row.setSpacing(12)
 
-        self.w.btn_enable_advanced = QPushButton()
-        self.w.btn_enable_advanced.setObjectName("SegmentBtn")
-        self.w.btn_enable_advanced.setCheckable(True)
-        self.w.btn_enable_advanced.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.w.btn_enable_advanced = make_segment_button("", checkable=True)
         self.w.btn_enable_advanced.setFixedWidth(136)
         self.w.btn_enable_advanced.clicked.connect(self.w._toggle_advanced_features)
         advanced_row.addWidget(self.w.btn_enable_advanced, 0, Qt.AlignmentFlag.AlignLeft)
@@ -291,9 +285,7 @@ class SettingsPage(QWidget):
         self.w.napcat_port_setting.setFixedWidth(120)
         form.addWidget(self.w.napcat_port_setting, 2, 1, Qt.AlignmentFlag.AlignLeft)
 
-        btn_save_ports = QPushButton("保存端口设置")
-        btn_save_ports.setObjectName("HeroSecondary")
-        btn_save_ports.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_save_ports = make_secondary_button("保存端口设置")
         btn_save_ports.clicked.connect(self.w._save_ports)
         form.addWidget(btn_save_ports, 1, 2, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
@@ -321,9 +313,7 @@ class SettingsPage(QWidget):
         self.w.datadir_edit.setReadOnly(True)
         datadir_box.addWidget(self.w.datadir_edit)
 
-        btn_open_datadir = QPushButton("打开目录")
-        btn_open_datadir.setObjectName("HeroSecondary")
-        btn_open_datadir.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_open_datadir = make_secondary_button("打开目录")
         btn_open_datadir.clicked.connect(self.w._open_datadir_in_explorer)
         datadir_box.addWidget(btn_open_datadir)
         card_layout.addLayout(datadir_box)

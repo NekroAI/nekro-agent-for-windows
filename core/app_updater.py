@@ -7,6 +7,7 @@
 import os
 import re
 import sys
+from dataclasses import dataclass
 from urllib.parse import urlparse
 
 import requests
@@ -53,6 +54,16 @@ DOWNLOAD_CHUNK_SIZE = 65536
 ASSET_PATTERN = re.compile(r"NekroAgent.*Setup.*\.exe", re.IGNORECASE)
 
 
+@dataclass(frozen=True)
+class UpdateCheckResult:
+    """启动器更新检查结果。"""
+
+    status: str
+    update_info: dict | None = None
+    message: str = ""
+    detail: str = ""
+
+
 def _parse_version(tag: str) -> tuple:
     """将 'v1.2.3' 或 '1.2.3' 解析为可比较的元组。"""
     tag = tag.lstrip("vV")
@@ -71,62 +82,109 @@ def is_newer(remote_tag: str) -> bool:
     return _parse_version(remote_tag) > _parse_version(APP_VERSION)
 
 
-def _try_github_api(url: str) -> dict | None:
+def _short_error(error: Exception) -> str:
+    message = str(error).strip()
+    if not message:
+        return type(error).__name__
+    if len(message) > 120:
+        message = message[:117] + "..."
+    return f"{type(error).__name__}: {message}"
+
+
+def _try_github_api(url: str) -> tuple[dict | None, list[str]]:
     """依次尝试直连和镜像获取 Release JSON。"""
     candidates = [url]
     for prefix in GITHUB_MIRROR_PREFIXES:
         candidates.append(prefix + url)
 
+    failures: list[str] = []
     for candidate in candidates:
+        domain = urlparse(candidate).netloc or candidate
         try:
-            resp = requests.get(
+            with requests.get(
                 candidate,
                 timeout=REQUEST_TIMEOUT,
                 headers={"Accept": "application/vnd.github+json"},
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, dict):
-                    return data
-        except Exception:
+            ) as resp:
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, dict):
+                        return data, failures
+                    failures.append(f"{domain}: 响应格式无效")
+                    continue
+                failures.append(f"{domain}: HTTP {resp.status_code}")
+        except (requests.RequestException, ValueError) as e:
+            failures.append(f"{domain}: {_short_error(e)}")
             continue
-    return None
+    return None, failures
 
 
-def check_update() -> dict | None:
+def _compact_failures(failures: list[str], limit: int = 4) -> str:
+    if not failures:
+        return ""
+    selected = failures[-limit:]
+    return "；".join(selected)
+
+
+def _source_names(urls: list[str]) -> str:
+    names = []
+    for url in urls:
+        domain = urlparse(url).netloc or url
+        if domain not in names:
+            names.append(domain)
+    return "、".join(names)
+
+
+def check_update() -> UpdateCheckResult:
     """检查是否有新版本。
 
-    返回 dict: {tag, name, body, published_at, download_url, file_name, file_size}
-    无新版本或请求失败返回 None。
+    返回 UpdateCheckResult，区分发现更新、已是最新版和检查失败。
     """
-    try:
-        data = _try_github_api(GITHUB_API_URL)
-        if not data:
-            return None
+    data, failures = _try_github_api(GITHUB_API_URL)
+    if not data:
+        detail = _compact_failures(failures) or "GitHub Release API 未返回可用数据"
+        return UpdateCheckResult(
+            status="failed",
+            message="启动器更新检查失败，请检查网络后重试。",
+            detail=detail,
+        )
 
-        tag = str(data.get("tag_name", ""))
-        if not tag or not is_newer(tag):
-            return None
+    tag = str(data.get("tag_name", ""))
+    if not tag:
+        return UpdateCheckResult(
+            status="failed",
+            message="启动器更新信息格式异常，未找到版本号。",
+            detail="GitHub Release 数据缺少 tag_name。",
+        )
 
-        asset_url = ""
-        asset_name = ""
-        asset_size = 0
-        assets = data.get("assets")
-        if isinstance(assets, list):
-            for asset in assets:
-                if not isinstance(asset, dict):
-                    continue
-                name = str(asset.get("name", ""))
-                if ASSET_PATTERN.match(name):
-                    asset_url = str(asset.get("browser_download_url", ""))
-                    asset_name = name
-                    asset_size = asset.get("size", 0)
-                    break
+    if not is_newer(tag):
+        return UpdateCheckResult(status="latest")
 
-        if not asset_url:
-            return None
+    asset_url = ""
+    asset_name = ""
+    asset_size = 0
+    assets = data.get("assets")
+    if isinstance(assets, list):
+        for asset in assets:
+            if not isinstance(asset, dict):
+                continue
+            name = str(asset.get("name", ""))
+            if ASSET_PATTERN.match(name):
+                asset_url = str(asset.get("browser_download_url", ""))
+                asset_name = name
+                asset_size = asset.get("size", 0)
+                break
 
-        return {
+    if not asset_url:
+        return UpdateCheckResult(
+            status="failed",
+            message=f"发现启动器新版本 {tag}，但没有找到 Windows 安装包。",
+            detail="Release 资产中未匹配 NekroAgent*Setup*.exe。",
+        )
+
+    return UpdateCheckResult(
+        status="available",
+        update_info={
             "tag": tag,
             "name": str(data.get("name", tag)),
             "body": str(data.get("body", "")),
@@ -134,9 +192,8 @@ def check_update() -> dict | None:
             "download_url": asset_url,
             "file_name": asset_name,
             "file_size": asset_size,
-        }
-    except Exception:
-        return None
+        },
+    )
 
 
 def _accelerated_download_url(original_url: str) -> list[str]:
@@ -146,6 +203,17 @@ def _accelerated_download_url(original_url: str) -> list[str]:
         urls.append(prefix + original_url)
     urls.append(original_url)
     return urls
+
+
+def format_download_failure(urls: list[str], failures: list[str]) -> str:
+    """生成简洁的启动器安装包下载失败文案。"""
+    sources = _source_names(urls)
+    detail = _compact_failures(failures, limit=6) or "无可用下载源"
+    return (
+        "启动器更新安装包下载失败，请检查网络、DNS 或代理后重试。\n"
+        f"已尝试下载源：{sources}\n"
+        f"详情：{detail}"
+    )
 
 
 class DownloadWorker(QObject):
@@ -170,6 +238,7 @@ class DownloadWorker(QObject):
         dest_dir = os.path.join(get_app_data_dir(), "updates")
         os.makedirs(dest_dir, exist_ok=True)
         dest_path = os.path.join(dest_dir, self._file_name)
+        failures = []
 
         for url in urls:
             if self._cancelled:
@@ -180,32 +249,46 @@ class DownloadWorker(QObject):
                 domain = urlparse(url).netloc
                 self.mirror_info.emit(domain)
 
-                resp = requests.get(url, stream=True, timeout=REQUEST_TIMEOUT)
-                if resp.status_code != 200:
-                    continue
+                with requests.get(url, stream=True, timeout=REQUEST_TIMEOUT) as resp:
+                    if resp.status_code != 200:
+                        failures.append(f"{domain}: HTTP {resp.status_code}")
+                        continue
 
-                total = int(resp.headers.get("content-length", 0))
-                downloaded = 0
+                    total = int(resp.headers.get("content-length", 0))
+                    downloaded = 0
+                    cancelled = False
 
-                with open(dest_path, "wb") as f:
-                    for chunk in resp.iter_content(DOWNLOAD_CHUNK_SIZE):
-                        if self._cancelled:
-                            f.close()
-                            self._safe_remove(dest_path)
-                            self.finished.emit(False, "已取消")
-                            return
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        self.progress.emit(downloaded, total)
+                    with open(dest_path, "wb") as f:
+                        for chunk in resp.iter_content(DOWNLOAD_CHUNK_SIZE):
+                            if self._cancelled:
+                                cancelled = True
+                                break
+                            if not chunk:
+                                continue
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            self.progress.emit(downloaded, total)
+
+                    if cancelled:
+                        self._safe_remove(dest_path)
+                        self.finished.emit(False, "已取消")
+                        return
+
+                    if downloaded <= 0:
+                        self._safe_remove(dest_path)
+                        failures.append(f"{domain}: 未下载到数据")
+                        continue
 
                 self.finished.emit(True, dest_path)
                 return
 
-            except Exception:
+            except (OSError, requests.RequestException) as e:
                 self._safe_remove(dest_path)
+                domain = urlparse(url).netloc or url
+                failures.append(f"{domain}: {_short_error(e)}")
                 continue
 
-        self.finished.emit(False, "所有下载源均失败，请检查网络连接后重试")
+        self.finished.emit(False, format_download_failure(urls, failures))
 
     @staticmethod
     def _safe_remove(path):
@@ -219,6 +302,7 @@ class UpdateChecker(QObject):
     """在后台线程中检查更新，完成后发信号。"""
 
     update_available = pyqtSignal(dict)
+    check_failed = pyqtSignal(str, str)
     check_finished = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -227,9 +311,14 @@ class UpdateChecker(QObject):
     def run(self):
         try:
             result = check_update()
-            if result:
-                self.update_available.emit(result)
-        except Exception:
-            pass
+            if result.status == "available" and result.update_info:
+                self.update_available.emit(result.update_info)
+            elif result.status == "failed":
+                self.check_failed.emit(result.message, result.detail)
+        except Exception as e:
+            self.check_failed.emit(
+                "启动器更新检查失败，请检查网络后重试。",
+                _short_error(e),
+            )
         finally:
             self.check_finished.emit()

@@ -1,10 +1,10 @@
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton,
+    QFrame, QGridLayout, QHBoxLayout, QLabel,
     QSizePolicy, QTextEdit, QVBoxLayout, QWidget,
 )
 
-from ui.widgets import ActionButton, MetricCard, SectionCard
+from ui.widgets import ActionButton, MetricCard, SectionCard, make_button, make_secondary_button
 
 
 class HomePage(QWidget):
@@ -65,21 +65,15 @@ class HomePage(QWidget):
         hero_layout.addLayout(advanced_row)
 
         hero_actions = QHBoxLayout()
-        self.w.btn_primary_deploy = QPushButton("开始部署")
-        self.w.btn_primary_deploy.setObjectName("HeroPrimary")
+        self.w.btn_primary_deploy = make_button("开始部署", object_name="HeroPrimary")
         self.w.btn_primary_deploy.clicked.connect(self.w.start_deploy)
-        self.w.btn_primary_update = QPushButton("升级 Nekro Agent")
-        self.w.btn_primary_update.setObjectName("HeroSecondary")
+        self.w.btn_primary_update = make_secondary_button("升级 Nekro Agent")
         self.w.btn_primary_update.clicked.connect(self.w._update_services)
-        self.w.btn_primary_preview = QPushButton("切换至预览版")
-        self.w.btn_primary_preview.setObjectName("HeroSecondary")
+        self.w.btn_primary_preview = make_secondary_button("切换至预览版")
         self.w.btn_primary_preview.clicked.connect(self.w._switch_to_preview_build)
-        self.w.btn_primary_creds = QPushButton("查看部署凭据")
-        self.w.btn_primary_creds.setObjectName("HeroSecondary")
+        self.w.btn_primary_creds = make_secondary_button("查看部署凭据")
         self.w.btn_primary_creds.clicked.connect(self.w._show_saved_credentials)
-        self.w.btn_instance_switch = QPushButton("切换实例")
-        self.w.btn_instance_switch.setObjectName("HeroSecondary")
-        self.w.btn_instance_switch.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.w.btn_instance_switch = make_secondary_button("切换实例")
         self.w.btn_instance_switch.clicked.connect(self.w._show_instance_switch_dialog)
         self.w.btn_instance_switch.setVisible(False)
 

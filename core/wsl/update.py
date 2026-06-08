@@ -1,8 +1,7 @@
-import os
 import shlex
-import subprocess
 import threading
 
+from core.port_utils import normalize_port
 from core.wsl.constants import (
     DISTRO_NAME,
     NA_BACKUP_TARGETS,
@@ -83,12 +82,13 @@ class WSLUpdateMixin:
         distro = DISTRO_NAME
         deploy_dir, _, _ = self._get_active_deploy_paths()
 
-        def _exec(cmd, timeout=300):
-            proc = subprocess.run(
-                ["wsl", "-d", distro, "--", "bash", "-c", f"cd {shlex.quote(deploy_dir)} && {cmd}"],
-                capture_output=True,
+        def _exec(cmd, timeout=300, action="[更新] 命令执行失败"):
+            proc = self._run_wsl_checked(
+                distro,
+                cmd,
+                action=action,
+                cwd=deploy_dir,
                 timeout=timeout,
-                creationflags=self._creation_flags(),
             )
             out = self._clean_command_output(self._safe_decode(proc.stdout) + self._safe_decode(proc.stderr))
             return proc.returncode, out.strip()
@@ -166,22 +166,18 @@ class WSLUpdateMixin:
                         f"up -d --no-deps --force-recreate {service_args}"
                     ).strip()
                     try:
-                        rc, out = _exec(cmd, timeout=300)
-                    except subprocess.TimeoutExpired:
-                        self.status_changed.emit("更新失败")
-                        self.update_finished.emit(False, f"步骤超时: {label}")
-                        return
+                        _rc, out = _exec(
+                            cmd,
+                            timeout=300,
+                            action=f"[更新] {label}失败",
+                        )
                     except Exception as e:
                         self.status_changed.emit("更新失败")
-                        self.update_finished.emit(False, f"步骤异常: {e}")
+                        self.update_finished.emit(False, str(e))
                         return
 
                     if out:
                         self.log_received.emit(out, "info")
-                    if rc != 0:
-                        self.status_changed.emit("更新失败")
-                        self.update_finished.emit(False, f"步骤失败（返回码 {rc}）: {label}")
-                        return
 
                     self.log_received.emit(f"[更新] ✓ {label}", "info")
                     continue
@@ -193,9 +189,17 @@ class WSLUpdateMixin:
             inst_id = self.config.get_active_instance_id() if self.config else ""
             inst_display = inst_id if inst_id and inst_id != "default" else ""
             log_prefix = f"[{inst_display}] " if inst_display else ""
-            nekro_port = int(self.config.get("nekro_port") or 8021) if self.config else 8021
+            nekro_port = (
+                normalize_port(self.config.get("nekro_port"), 8021)
+                if self.config
+                else 8021
+            )
             if self._log_process is None or self._log_process.poll() is not None:
-                threading.Thread(target=self._log_reader, args=(distro, deploy_dir, log_prefix, inst_id), daemon=True).start()
+                threading.Thread(
+                    target=self._log_reader,
+                    args=(distro, deploy_dir, log_prefix, inst_id),
+                    daemon=True,
+                ).start()
             threading.Thread(target=self._health_check, args=(nekro_port,), daemon=True).start()
             self.update_finished.emit(True, "Nekro Agent 更新完成，正在等待服务重新就绪。")
 
@@ -206,27 +210,34 @@ class WSLUpdateMixin:
         distro = DISTRO_NAME
         deploy_dir, _, _ = self._get_active_deploy_paths()
 
-        def _exec(cmd, timeout=300):
-            proc = subprocess.run(
-                ["wsl", "-d", distro, "--", "bash", "-c", f"cd {shlex.quote(deploy_dir)} && {cmd}"],
-                capture_output=True,
+        def _exec(cmd, timeout=300, action="[预览版] 命令执行失败"):
+            proc = self._run_wsl_checked(
+                distro,
+                cmd,
+                action=action,
+                cwd=deploy_dir,
                 timeout=timeout,
-                creationflags=self._creation_flags(),
             )
             out = self._clean_command_output(self._safe_decode(proc.stdout) + self._safe_decode(proc.stderr))
             return proc.returncode, out.strip()
 
-        def _emit_cmd_failure(prefix, rc, output):
+        def _emit_cmd_failure(prefix, detail):
             self.status_changed.emit("更新失败")
-            message = f"{prefix}（返回码 {rc}）"
-            if output:
-                message += f"\n{output}"
-            self.update_finished.emit(False, message)
+            self.update_finished.emit(False, f"{prefix}\n{detail}" if detail else prefix)
 
         def _rewrite_compose_to_preview():
             compose_path = f"{deploy_dir}/docker-compose.yml"
             self._emit_pull_progress("stage", "写入预览版镜像配置")
-            compose_content = self._wsl_exec(distro, f"cat {shlex.quote(compose_path)}")
+            try:
+                compose_content = self._wsl_exec_checked(
+                    distro,
+                    f"cat {shlex.quote(compose_path)}",
+                    timeout=30,
+                )
+            except RuntimeError as e:
+                self.status_changed.emit("更新失败")
+                self.update_finished.emit(False, f"读取 Compose 文件失败\n{e}")
+                return False
             if PREVIEW_IMAGE in compose_content:
                 return True
             if PREVIEW_COMPOSE_IMAGE not in compose_content:
@@ -235,7 +246,12 @@ class WSLUpdateMixin:
                 return False
 
             updated_content = compose_content.replace(PREVIEW_COMPOSE_IMAGE, PREVIEW_IMAGE)
-            self._write_to_wsl(distro, updated_content, compose_path)
+            try:
+                self._write_to_wsl(distro, updated_content, compose_path)
+            except RuntimeError as e:
+                self.status_changed.emit("更新失败")
+                self.update_finished.emit(False, f"写入预览版 Compose 配置失败\n{e}")
+                return False
             return True
 
         def _do_switch():
@@ -270,9 +286,17 @@ class WSLUpdateMixin:
                     return
 
                 self._emit_pull_progress("stage", "重建 Nekro Agent 主容器")
-                rc, out = _exec("docker compose -f docker-compose.yml --env-file .env up -d --no-deps --force-recreate nekro_agent")
-                if rc != 0:
-                    _emit_cmd_failure("重建 Nekro Agent 主容器失败", rc, out)
+                try:
+                    recreate_cmd = (
+                        "docker compose -f docker-compose.yml --env-file .env up -d "
+                        "--no-deps --force-recreate nekro_agent"
+                    )
+                    _rc, out = _exec(
+                        recreate_cmd,
+                        action="[预览版] 重建 Nekro Agent 主容器失败",
+                    )
+                except Exception as e:
+                    _emit_cmd_failure("重建 Nekro Agent 主容器失败", str(e))
                     return
                 if out:
                     self.log_received.emit(out, "info")
@@ -282,7 +306,11 @@ class WSLUpdateMixin:
                 inst_id = self.config.get_active_instance_id() if self.config else ""
                 inst_display = inst_id if inst_id and inst_id != "default" else ""
                 log_prefix = f"[{inst_display}] " if inst_display else ""
-                nekro_port = int(self.config.get("nekro_port") or 8021) if self.config else 8021
+                nekro_port = (
+                    normalize_port(self.config.get("nekro_port"), 8021)
+                    if self.config
+                    else 8021
+                )
                 if self.config:
                     self.config.set("release_channel", "preview")
                     self.config.set_active_preview_backup_available(bool(create_backup))
@@ -293,15 +321,22 @@ class WSLUpdateMixin:
                             preview_backup_available=bool(create_backup),
                         )
                 if self._log_process is None or self._log_process.poll() is not None:
-                    threading.Thread(target=self._log_reader, args=(distro, deploy_dir, log_prefix, inst_id), daemon=True).start()
+                    threading.Thread(
+                        target=self._log_reader,
+                        args=(distro, deploy_dir, log_prefix, inst_id),
+                        daemon=True,
+                    ).start()
                 threading.Thread(target=self._health_check, args=(nekro_port,), daemon=True).start()
                 self.update_finished.emit(True, "预览版切换完成，正在等待服务重新就绪。")
-            except subprocess.TimeoutExpired:
-                self.status_changed.emit("更新失败")
-                self.update_finished.emit(False, "切换到预览版超时。")
             except Exception as e:
                 self.status_changed.emit("更新失败")
-                self.update_finished.emit(False, f"切换到预览版异常: {e}")
+                self.update_finished.emit(
+                    False,
+                    "切换到预览版异常\n"
+                    f"发行版: {distro}\n"
+                    f"部署目录: {deploy_dir}\n"
+                    f"异常: {type(e).__name__}: {e}",
+                )
 
         threading.Thread(target=_do_switch, daemon=True).start()
 
@@ -310,12 +345,13 @@ class WSLUpdateMixin:
         distro = DISTRO_NAME
         deploy_dir, _, _ = self._get_active_deploy_paths()
 
-        def _exec(cmd, timeout=300):
-            proc = subprocess.run(
-                ["wsl", "-d", distro, "--", "bash", "-c", f"cd {shlex.quote(deploy_dir)} && {cmd}"],
-                capture_output=True,
+        def _exec(cmd, timeout=300, action="[恢复正式版] 命令执行失败"):
+            proc = self._run_wsl_checked(
+                distro,
+                cmd,
+                action=action,
+                cwd=deploy_dir,
                 timeout=timeout,
-                creationflags=self._creation_flags(),
             )
             out = self._clean_command_output(self._safe_decode(proc.stdout) + self._safe_decode(proc.stderr))
             return proc.returncode, out.strip()
@@ -323,7 +359,16 @@ class WSLUpdateMixin:
         def _rewrite_compose_to_stable():
             compose_path = f"{deploy_dir}/docker-compose.yml"
             self._emit_pull_progress("stage", "写回正式版镜像配置")
-            compose_content = self._wsl_exec(distro, f"cat {shlex.quote(compose_path)}")
+            try:
+                compose_content = self._wsl_exec_checked(
+                    distro,
+                    f"cat {shlex.quote(compose_path)}",
+                    timeout=30,
+                )
+            except RuntimeError as e:
+                self.status_changed.emit("更新失败")
+                self.update_finished.emit(False, f"读取 Compose 文件失败\n{e}")
+                return False
             if STABLE_IMAGE in compose_content and PREVIEW_IMAGE not in compose_content:
                 return True
             if PREVIEW_IMAGE not in compose_content:
@@ -331,7 +376,12 @@ class WSLUpdateMixin:
                 self.update_finished.emit(False, "未找到预览版镜像引用，无法恢复正式版。")
                 return False
             updated_content = compose_content.replace(PREVIEW_IMAGE, STABLE_IMAGE)
-            self._write_to_wsl(distro, updated_content, compose_path)
+            try:
+                self._write_to_wsl(distro, updated_content, compose_path)
+            except RuntimeError as e:
+                self.status_changed.emit("更新失败")
+                self.update_finished.emit(False, f"写入正式版 Compose 配置失败\n{e}")
+                return False
             return True
 
         def _do_restore():
@@ -353,22 +403,32 @@ class WSLUpdateMixin:
 
             try:
                 self._emit_pull_progress("stage", "停止相关服务")
-                rc, out = _exec(
-                    "docker compose -f docker-compose.yml stop nekro_agent nekro_postgres nekro_qdrant nekro_napcat 2>/dev/null || true",
+                stop_services_cmd = (
+                    "docker compose -f docker-compose.yml stop "
+                    "nekro_agent nekro_postgres nekro_qdrant nekro_napcat "
+                    "2>/dev/null || true"
+                )
+                _rc, out = _exec(
+                    stop_services_cmd,
                     timeout=120,
+                    action="[恢复正式版] 停止相关服务失败",
                 )
                 if out:
                     self.log_received.emit(out, "info")
 
                 self._emit_pull_progress("stage", "恢复备份数据")
-                rc, out = _exec(
-                    f"tar -xzf {shlex.quote(archive_path)} -C /",
-                    timeout=600,
-                )
-                if rc != 0:
+                try:
+                    _rc, out = _exec(
+                        f"tar -xzf {shlex.quote(archive_path)} -C /",
+                        timeout=600,
+                        action="[恢复正式版] 恢复备份数据失败",
+                    )
+                except Exception as e:
                     self.status_changed.emit("更新失败")
-                    self.update_finished.emit(False, f"恢复备份失败\n{out}" if out else "恢复备份失败")
+                    self.update_finished.emit(False, str(e))
                     return
+                if out:
+                    self.log_received.emit(out, "info")
 
                 self.log_received.emit("[恢复正式版] 拉取正式版镜像", "info")
                 self._emit_pull_progress("stage", "拉取正式版镜像")
@@ -381,10 +441,15 @@ class WSLUpdateMixin:
                     return
 
                 self._emit_pull_progress("stage", "重建并启动服务")
-                rc, out = _exec("docker compose -f docker-compose.yml --env-file .env up -d", timeout=300)
-                if rc != 0:
+                try:
+                    _rc, out = _exec(
+                        "docker compose -f docker-compose.yml --env-file .env up -d",
+                        timeout=300,
+                        action="[恢复正式版] 重建并启动服务失败",
+                    )
+                except Exception as e:
                     self.status_changed.emit("更新失败")
-                    self.update_finished.emit(False, f"恢复正式版失败\n{out}" if out else "恢复正式版失败")
+                    self.update_finished.emit(False, str(e))
                     return
                 if out:
                     self.log_received.emit(out, "info")
@@ -394,7 +459,11 @@ class WSLUpdateMixin:
                 inst_id = self.config.get_active_instance_id() if self.config else ""
                 inst_display = inst_id if inst_id and inst_id != "default" else ""
                 log_prefix = f"[{inst_display}] " if inst_display else ""
-                nekro_port = int(self.config.get("nekro_port") or 8021) if self.config else 8021
+                nekro_port = (
+                    normalize_port(self.config.get("nekro_port"), 8021)
+                    if self.config
+                    else 8021
+                )
                 if self.config:
                     self.config.set("release_channel", "stable")
                     self.config.set_active_preview_backup_available(False)
@@ -405,15 +474,22 @@ class WSLUpdateMixin:
                             preview_backup_available=False,
                         )
                 if self._log_process is None or self._log_process.poll() is not None:
-                    threading.Thread(target=self._log_reader, args=(distro, deploy_dir, log_prefix, inst_id), daemon=True).start()
+                    threading.Thread(
+                        target=self._log_reader,
+                        args=(distro, deploy_dir, log_prefix, inst_id),
+                        daemon=True,
+                    ).start()
                 threading.Thread(target=self._health_check, args=(nekro_port,), daemon=True).start()
                 self.update_finished.emit(True, "正式版恢复完成，正在等待服务重新就绪。")
-            except subprocess.TimeoutExpired:
-                self.status_changed.emit("更新失败")
-                self.update_finished.emit(False, "恢复正式版超时。")
             except Exception as e:
                 self.status_changed.emit("更新失败")
-                self.update_finished.emit(False, f"恢复正式版异常: {e}")
+                self.update_finished.emit(
+                    False,
+                    "恢复正式版异常\n"
+                    f"发行版: {distro}\n"
+                    f"部署目录: {deploy_dir}\n"
+                    f"异常: {type(e).__name__}: {e}",
+                )
 
         threading.Thread(target=_do_restore, daemon=True).start()
 
@@ -436,19 +512,15 @@ class WSLUpdateMixin:
         target_args = " ".join(shlex.quote(target.lstrip("/")) for target in existing_targets)
         cmd = f"rm -f {shlex.quote(archive_path)} && tar -czf {shlex.quote(archive_path)} -C / {target_args}"
         try:
-            rc = subprocess.run(
-                ["wsl", "-d", distro, "--", "bash", "-c", cmd],
-                capture_output=True,
+            self._run_wsl_checked(
+                distro,
+                cmd,
+                action="创建备份归档失败",
                 timeout=600,
-                creationflags=self._creation_flags(),
             )
-        except subprocess.TimeoutExpired:
-            return False, "备份超时（超过 10 分钟），请检查磁盘空间或数据量。"
-        out = self._safe_decode(rc.stdout) + self._safe_decode(rc.stderr)
-        if rc.returncode != 0:
-            message = "备份失败"
-            cleaned = out.strip()
-            if cleaned:
-                message += f"\n{cleaned}"
-            return False, message
+        except Exception as e:
+            return False, (
+                f"备份失败\n备份文件: {archive_path}\n"
+                f"备份目录:\n" + "\n".join(existing_targets) + f"\n{e}"
+            )
         return True, f"已生成备份归档：{archive_path}"

@@ -1,10 +1,9 @@
-from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QHBoxLayout,
-    QPushButton, QTextEdit, QVBoxLayout, QWidget,
+    QTextEdit, QVBoxLayout, QWidget,
 )
 
-from ui.widgets import PullProgressView, SectionCard
+from ui.widgets import PullProgressView, SectionCard, make_segment_button
 
 
 class LogsPage(QWidget):
@@ -30,14 +29,11 @@ class LogsPage(QWidget):
 
     def _build_log_tabs(self, card_layout):
         top = QHBoxLayout()
-        self.w.btn_log_app = QPushButton("应用日志")
-        self.w.btn_log_nekro = QPushButton("Nekro Agent")
-        self.w.btn_log_napcat = QPushButton("NapCat")
+        self.w.btn_log_app = make_segment_button("应用日志", checkable=True)
+        self.w.btn_log_nekro = make_segment_button("Nekro Agent", checkable=True)
+        self.w.btn_log_napcat = make_segment_button("NapCat", checkable=True)
 
         for idx, button in enumerate([self.w.btn_log_app, self.w.btn_log_nekro, self.w.btn_log_napcat]):
-            button.setObjectName("SegmentBtn")
-            button.setCheckable(True)
-            button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.clicked.connect(lambda checked, current=idx: self.w._set_log_tab(current))
             top.addWidget(button)
         self.w.btn_log_nekro.setVisible(False)

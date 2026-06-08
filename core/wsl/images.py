@@ -1,6 +1,7 @@
 import subprocess
 import threading
 import time
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from core.wsl.constants import DISTRO_NAME, MANAGED_IMAGES_BASE, PREVIEW_IMAGE, REQUIRED_IMAGES_BASE, STABLE_IMAGE
@@ -92,20 +93,44 @@ class WSLImageMixin:
     _PULL_TIMEOUT = 1800
 
     def _pull_image_once(self, distro, image_ref):
-        proc = subprocess.Popen(
-            ["wsl", "-d", distro, "--", "docker", "pull", image_ref],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            creationflags=self._creation_flags(),
-        )
+        args = ["wsl", "-d", distro, "--", "docker", "pull", image_ref]
+        try:
+            proc = subprocess.Popen(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                creationflags=self._creation_flags(),
+            )
+        except Exception as e:
+            return False, [
+                self._format_command_failure(
+                    "启动 docker pull 失败",
+                    args=args,
+                    distro=distro,
+                    exception=e,
+                )
+            ]
+
         last_lines = []
         deadline = time.monotonic() + self._PULL_TIMEOUT
         while True:
             if time.monotonic() > deadline:
                 proc.kill()
-                last_lines.append("镜像拉取超时")
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+                last_lines.append(
+                    self._format_command_failure(
+                        "镜像拉取超时",
+                        args=args,
+                        distro=distro,
+                        timeout=self._PULL_TIMEOUT,
+                        stdout="\n".join(last_lines),
+                    )
+                )
                 return False, last_lines
-            line = proc.stdout.readline()
+            line = proc.stdout.readline() if proc.stdout else b""
             if not line and proc.poll() is not None:
                 break
             if line:
@@ -117,10 +142,23 @@ class WSLImageMixin:
                         last_lines.pop(0)
 
         proc.wait()
-        return proc.returncode == 0, last_lines
+        if proc.returncode != 0:
+            last_lines.append(
+                self._format_command_failure(
+                    "镜像拉取失败",
+                    args=args,
+                    distro=distro,
+                    timeout=self._PULL_TIMEOUT,
+                    returncode=proc.returncode,
+                    stdout="\n".join(last_lines),
+                )
+            )
+            return False, last_lines
+        return True, last_lines
 
     def _pull_images(self, distro, images):
         """逐个拉取镜像列表，带进度反馈。返回 True 全部成功，False 有失败"""
+        self._last_pull_error = ""
         total = len(images)
         for idx, image in enumerate(images, 1):
             self._emit_pull_progress("stage", f"{idx}/{total}|拉取镜像 ({idx}/{total}): {image}")
@@ -145,6 +183,7 @@ class WSLImageMixin:
                     err_msg += f"\n已使用官方 Docker Hub 重试: {hub_image}"
                 if detail:
                     err_msg += f"\n{detail}"
+                self._last_pull_error = err_msg
                 self._emit_pull_progress("error", err_msg)
                 self.log_received.emit(err_msg, "error")
                 return False
@@ -209,8 +248,30 @@ class WSLImageMixin:
 
                     if full_remote:
                         entry["has_update"] = full_remote != full_local
+                except HTTPError as e:
+                    entry["error"] = (
+                        "镜像远程状态检查失败\n"
+                        f"镜像: {image_ref}\n"
+                        f"Docker Hub 仓库: {image}\n"
+                        f"标签: {tag}\n"
+                        f"HTTP: {e.code} {e.reason}"
+                    )
+                except URLError as e:
+                    entry["error"] = (
+                        "镜像远程状态检查失败\n"
+                        f"镜像: {image_ref}\n"
+                        f"Docker Hub 仓库: {image}\n"
+                        f"标签: {tag}\n"
+                        f"网络错误: {e.reason}"
+                    )
                 except Exception as e:
-                    entry["error"] = str(e)
+                    entry["error"] = (
+                        "镜像状态检查失败\n"
+                        f"镜像: {image_ref}\n"
+                        f"Docker Hub 仓库: {image}\n"
+                        f"标签: {tag}\n"
+                        f"异常: {type(e).__name__}: {e}"
+                    )
                 results.append(entry)
             self.image_status_result.emit(results)
 
@@ -228,6 +289,10 @@ class WSLImageMixin:
             if ok:
                 self.image_pull_result.emit(image_ref, True, "拉取成功")
             else:
-                self.image_pull_result.emit(image_ref, False, "拉取失败")
+                self.image_pull_result.emit(
+                    image_ref,
+                    False,
+                    getattr(self, "_last_pull_error", "") or "拉取失败",
+                )
 
         threading.Thread(target=_do_pull, daemon=True).start()

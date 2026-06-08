@@ -1,9 +1,9 @@
 import json
 import os
-import re
 import sys
 import time
 import webbrowser
+from html import escape
 
 from PyQt6.QtCore import QRect, QSize, Qt, QThread, QTimer
 from PyQt6.QtGui import QCloseEvent, QColor, QIcon, QPixmap, QTextCursor
@@ -32,13 +32,15 @@ from core.app_updater import APP_VERSION, UpdateChecker
 from core.autostart import set_autostart_enabled
 from core.backend_factory import BackendFactory
 from core.config_manager import ConfigManager
-from core.port_utils import validate_port_bindings
+from core.port_utils import normalize_port, validate_port_bindings
 from ui.styles import STYLESHEET
 from ui.webview_widget import WebViewWidget
 from ui.widgets import (
     SpinnerLabel,
-    StyledComboBox,
     UpdateProgressDialog,
+    show_choice_dialog,
+    show_combo_choice_dialog,
+    show_confirm_dialog,
     show_notice_dialog,
 )
 
@@ -196,8 +198,12 @@ class MainWindow(QMainWindow):
         self._napcat_network_config_in_progress = False
         self._image_status_request_kind = None
         self.browser_urls = {
-            "nekro": f"http://localhost:{self.config.get('nekro_port') or 8021}",
-            "napcat": f"http://localhost:{self.config.get('napcat_port') or 6099}",
+            "nekro": (
+                f"http://localhost:{normalize_port(self.config.get('nekro_port'), 8021)}"
+            ),
+            "napcat": (
+                f"http://localhost:{normalize_port(self.config.get('napcat_port'), 6099)}"
+            ),
         }
         self.current_browser_target = "nekro"
         self._auto_image_check_timer = QTimer(self)
@@ -864,60 +870,21 @@ class MainWindow(QMainWindow):
         self.backend.restore_stable_from_backup()
 
     def _show_preview_switch_dialog(self, backup_size):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("确认切换至预览版")
-        dialog.setMinimumWidth(420)
-        dialog.setMaximumWidth(560)
-        dialog.setWindowModality(Qt.WindowModality.WindowModal)
-        dialog.setStyleSheet(STYLESHEET)
-
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.setSpacing(12)
-
-        title_label = QLabel("确认切换至预览版")
-        title_label.setProperty("role", "dialog_title")
-        title_label.setWordWrap(True)
-        layout.addWidget(title_label)
-
-        desc_label = QLabel(
+        return show_choice_dialog(
+            self,
+            "确认切换至预览版",
             "默认会先备份全量数据，再把 Nekro Agent 主容器切换到预览版镜像。\n\n"
             "备份文件将写入 /root/na_preview_backup.tar.gz。\n"
             f"预计备份占用约 {backup_size} 空间。\n\n"
-            "如果选择不备份，仍可切换到预览版，但将无法切换回正式版。"
+            "如果选择不备份，仍可切换到预览版，但将无法切换回正式版。",
+            [
+                ("取消", None, None),
+                ("不备份直接切换", "skip", "danger"),
+                ("备份并切换", "backup", "primary"),
+            ],
+            minimum_width=420,
+            maximum_width=560,
         )
-        desc_label.setProperty("role", "dialog_desc")
-        desc_label.setWordWrap(True)
-        desc_label.setTextFormat(Qt.TextFormat.PlainText)
-        layout.addWidget(desc_label)
-
-        button_row = QHBoxLayout()
-        button_row.setSpacing(10)
-        button_row.addStretch()
-
-        cancel_button = QPushButton("取消")
-        cancel_button.clicked.connect(dialog.reject)
-        button_row.addWidget(cancel_button)
-
-        skip_backup_button = QPushButton("不备份直接切换")
-        skip_backup_button.setProperty("role", "danger")
-        skip_backup_button.clicked.connect(lambda: dialog.done(2))
-        button_row.addWidget(skip_backup_button)
-
-        confirm_button = QPushButton("备份并切换")
-        confirm_button.setProperty("role", "primary")
-        confirm_button.clicked.connect(lambda: dialog.done(1))
-        button_row.addWidget(confirm_button)
-
-        layout.addLayout(button_row)
-        dialog.adjustSize()
-
-        result = dialog.exec()
-        if result == 1:
-            return "backup"
-        if result == 2:
-            return "skip"
-        return None
 
     def _switch_to_preview_build(self):
         if not self._guard_napcat_network_config_busy("切换预览版"):
@@ -1006,48 +973,14 @@ class MainWindow(QMainWindow):
         danger=False,
         parent=None,
     ):
-        dialog = QDialog(parent or self)
-        dialog.setWindowTitle(title)
-        dialog.setMinimumWidth(360)
-        dialog.setMaximumWidth(460)
-        dialog.setWindowModality(Qt.WindowModality.WindowModal)
-        dialog.setStyleSheet(STYLESHEET)
-
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.setSpacing(12)
-
-        title_label = QLabel(title)
-        title_label.setProperty("role", "dialog_title")
-        title_label.setWordWrap(True)
-        title_label.setAlignment(
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        return show_confirm_dialog(
+            parent or self,
+            title,
+            text,
+            confirm_text=confirm_text,
+            cancel_text=cancel_text,
+            danger=danger,
         )
-        layout.addWidget(title_label)
-
-        desc_label = QLabel(text)
-        desc_label.setProperty("role", "dialog_desc")
-        desc_label.setWordWrap(True)
-        desc_label.setTextFormat(Qt.TextFormat.PlainText)
-        desc_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        layout.addWidget(desc_label)
-
-        button_row = QHBoxLayout()
-        button_row.setSpacing(10)
-        button_row.addStretch()
-
-        cancel_button = QPushButton(cancel_text)
-        cancel_button.clicked.connect(dialog.reject)
-        button_row.addWidget(cancel_button)
-
-        confirm_button = QPushButton(confirm_text)
-        confirm_button.setProperty("role", "danger" if danger else "primary")
-        confirm_button.clicked.connect(dialog.accept)
-        button_row.addWidget(confirm_button)
-
-        layout.addLayout(button_row)
-        dialog.adjustSize()
-        return dialog.exec() == int(QDialog.DialogCode.Accepted)
 
     def _create_update_dialog(self, title, text, on_confirm, confirm_text="开始更新"):
         dialog = UpdateProgressDialog(self, title, text, confirm_text=confirm_text)
@@ -1139,6 +1072,7 @@ class MainWindow(QMainWindow):
         if widgets:
             widgets["btn"].setEnabled(False)
             widgets["btn"].setText(self._img_spinner_frames[0])
+            widgets["status"].setTextFormat(Qt.TextFormat.PlainText)
             widgets["status"].setText("更新中")
         self._begin_update_session(dialog, f"image:{image_ref}")
         self._img_checking_ref = image_ref
@@ -1258,11 +1192,14 @@ class MainWindow(QMainWindow):
 
         self._app_update_silent = silent
         self._app_update_found = False
+        self._app_update_failed_message = ""
+        self._app_update_failed_detail = ""
         checker = UpdateChecker()
         thread = QThread(self)
         checker.moveToThread(thread)
 
         checker.update_available.connect(self._on_app_update_available)
+        checker.check_failed.connect(self._on_app_update_check_failed)
         checker.check_finished.connect(self._on_app_update_check_finished)
         thread.started.connect(checker.run)
         thread.finished.connect(thread.deleteLater)
@@ -1283,6 +1220,10 @@ class MainWindow(QMainWindow):
 
         self._show_app_update_dialog(info)
 
+    def _on_app_update_check_failed(self, message: str, detail: str):
+        self._app_update_failed_message = message
+        self._app_update_failed_detail = detail
+
     def _on_app_update_check_finished(self):
         if self._app_update_thread:
             self._app_update_thread.quit()
@@ -1293,11 +1234,20 @@ class MainWindow(QMainWindow):
         if not getattr(self, "_app_update_silent", True):
             import time
 
-            self.config.set("last_app_update_check_ts", int(time.time()))
+            if not getattr(self, "_app_update_failed_message", ""):
+                self.config.set("last_app_update_check_ts", int(time.time()))
             if not getattr(self, "_app_update_found", False):
-                self._show_notice_dialog(
-                    "检查完成", f"当前已是最新版本 v{APP_VERSION}。"
-                )
+                failed_message = getattr(self, "_app_update_failed_message", "")
+                if failed_message:
+                    failed_detail = getattr(self, "_app_update_failed_detail", "")
+                    text = failed_message
+                    if failed_detail:
+                        text = f"{text}\n{failed_detail}"
+                    self._show_notice_dialog("检查更新失败", text, danger=True)
+                else:
+                    self._show_notice_dialog(
+                        "检查完成", f"当前已是最新版本 v{APP_VERSION}。"
+                    )
 
     def _show_app_update_dialog(self, info: dict):
         from ui.update_dialog import AppUpdateDialog
@@ -1453,6 +1403,9 @@ class MainWindow(QMainWindow):
     _LOG_MAX_BLOCKS = 5000
     _LOG_PREVIEW_MAX_BLOCKS = 500
 
+    def _format_log_message(self, msg):
+        return escape(str(msg)).replace("\n", "<br>")
+
     def append_log(self, msg, level="info"):
         if level == "debug" and not getattr(self, "debug_mode", False):
             return
@@ -1471,10 +1424,11 @@ class MainWindow(QMainWindow):
         if level == "warn":
             level = "warning"
 
+        safe_msg = self._format_log_message(msg)
         if level == "vm":
-            formatted = f"<span style='color:{color};'>{msg}</span>"
+            formatted = f"<span style='color:{color};'>{safe_msg}</span>"
         else:
-            formatted = f"<span style='color:{color};'>[{level.upper()}]</span> {msg}"
+            formatted = f"<span style='color:{color};'>[{level.upper()}]</span> {safe_msg}"
 
         if level == "vm":
             if "napcat" in msg.lower():
@@ -1488,7 +1442,7 @@ class MainWindow(QMainWindow):
             self._trim_log_viewer(self.log_viewer_app)
             if hasattr(self, "log_preview"):
                 self.log_preview.append(
-                    f"<span style='color:{color};'>[{level.upper()}] {msg}</span>"
+                    f"<span style='color:{color};'>[{level.upper()}]</span> {safe_msg}"
                 )
                 self._trim_log_viewer(self.log_preview, self._LOG_PREVIEW_MAX_BLOCKS)
 
@@ -1920,8 +1874,8 @@ class MainWindow(QMainWindow):
         return inst
 
     def _sync_browser_to_active_instance(self, force_reload=True):
-        nekro_port = self.config.get("nekro_port") or 8021
-        napcat_port = self.config.get("napcat_port") or 6099
+        nekro_port = normalize_port(self.config.get("nekro_port"), 8021)
+        napcat_port = normalize_port(self.config.get("napcat_port"), 6099)
         self.browser_urls["nekro"] = f"http://localhost:{nekro_port}"
         self.browser_urls["napcat"] = f"http://localhost:{napcat_port}"
 
@@ -1975,61 +1929,24 @@ class MainWindow(QMainWindow):
         if len(instances) <= 1:
             return
 
-        dialog = QDialog(self)
-        dialog.setWindowTitle("切换实例")
-        dialog.setMinimumWidth(400)
-        dialog.setMaximumWidth(500)
-        dialog.setWindowModality(Qt.WindowModality.WindowModal)
-        dialog.setStyleSheet(STYLESHEET)
-
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.setSpacing(14)
-
-        title = QLabel("选择要切换的实例")
-        title.setProperty("role", "dialog_title")
-        layout.addWidget(title)
-
-        desc = QLabel(
-            "切换后，总览、日志和内置浏览器将指向所选实例；不会自动启动或停止实例服务。"
-        )
-        desc.setProperty("role", "dialog_desc")
-        desc.setWordWrap(True)
-        layout.addWidget(desc)
-
-        combo = StyledComboBox()
-        combo.setMinimumWidth(360)
         active_id = self.config.get_active_instance_id()
-        active_index = 0
-        for index, (item_id, inst_data) in enumerate(instances):
+        items = []
+        for item_id, inst_data in instances:
             name = self._instance_display_name(item_id, inst_data)
             mode = "napcat" if inst_data.get("deploy_mode") == "napcat" else "lite"
             port = inst_data.get("nekro_port", 8021)
-            combo.addItem(f"{name}  ({mode}, 端口：{port})", item_id)
-            if item_id == active_id:
-                active_index = index
-        combo.setCurrentIndex(active_index)
-        layout.addWidget(combo)
+            items.append((f"{name}  ({mode}, 端口：{port})", item_id))
 
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(10)
-
-        btn_cancel = QPushButton("取消")
-        btn_cancel.setFixedHeight(36)
-        btn_cancel.clicked.connect(dialog.reject)
-        btn_row.addWidget(btn_cancel)
-        btn_row.addStretch()
-
-        btn_switch = QPushButton("切换到选中实例")
-        btn_switch.setProperty("role", "primary")
-        btn_switch.setFixedHeight(36)
-        btn_switch.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_switch.clicked.connect(dialog.accept)
-        btn_row.addWidget(btn_switch)
-        layout.addLayout(btn_row)
-
-        if dialog.exec() == int(QDialog.DialogCode.Accepted):
-            self._switch_active_instance(combo.currentData())
+        selected = show_combo_choice_dialog(
+            self,
+            "选择要切换的实例",
+            "切换后，总览、日志和内置浏览器将指向所选实例；不会自动启动或停止实例服务。",
+            items,
+            confirm_text="切换到选中实例",
+            active_data=active_id,
+        )
+        if selected:
+            self._switch_active_instance(selected)
 
     def _switch_log_reader_to_active_instance(self):
         """切换实例时，将日志读取和健康检查指向新的 active 实例。"""
@@ -2049,9 +1966,9 @@ class MainWindow(QMainWindow):
         inst_display = inst_id if inst_id and inst_id != "default" else ""
         log_prefix = f"[{inst_display}] " if inst_display else ""
 
-        nekro_port = self.config.get("nekro_port") or 8021
+        nekro_port = normalize_port(self.config.get("nekro_port"), 8021)
         self.browser_urls["nekro"] = f"http://localhost:{nekro_port}"
-        napcat_port = self.config.get("napcat_port") or 6099
+        napcat_port = normalize_port(self.config.get("napcat_port"), 6099)
         self.browser_urls["napcat"] = f"http://localhost:{napcat_port}"
 
         import threading
@@ -2593,6 +2510,7 @@ class MainWindow(QMainWindow):
         widgets["btn"].setText(self._img_spinner_frames[0])
         widgets["local"].setText("...")
         widgets["remote"].setText("...")
+        widgets["status"].setTextFormat(Qt.TextFormat.PlainText)
         widgets["status"].setText("检测中")
         self._img_spinner_timer.start(100)
         self.backend.check_images_status(only_image=image_ref)
@@ -2608,6 +2526,7 @@ class MainWindow(QMainWindow):
         for widgets in self._image_row_widgets.values():
             widgets["local"].setText("...")
             widgets["remote"].setText("...")
+            widgets["status"].setTextFormat(Qt.TextFormat.PlainText)
             widgets["status"].setText("检测中")
             widgets["btn"].setEnabled(False)
         self._img_spinner_timer.start(100)
@@ -2842,7 +2761,7 @@ class MainWindow(QMainWindow):
             nekro_port = int(self.nekro_port_setting.text().strip())
             if not (1 <= nekro_port <= 65535):
                 raise ValueError
-            napcat_port = int(self.config.get("napcat_port") or 6099)
+            napcat_port = normalize_port(self.config.get("napcat_port"), 6099)
             if deploy_mode == "napcat":
                 napcat_port = int(self.napcat_port_setting.text().strip())
                 if not (1 <= napcat_port <= 65535):
@@ -2850,11 +2769,11 @@ class MainWindow(QMainWindow):
 
             ignore_ports = set()
             if getattr(self.backend, "is_running", False):
-                current_nekro = int(self.config.get("nekro_port") or 8021)
+                current_nekro = normalize_port(self.config.get("nekro_port"), 8021)
                 if nekro_port == current_nekro:
                     ignore_ports.add(nekro_port)
                 if deploy_mode == "napcat":
-                    current_napcat = int(self.config.get("napcat_port") or 6099)
+                    current_napcat = normalize_port(self.config.get("napcat_port"), 6099)
                     if napcat_port == current_napcat:
                         ignore_ports.add(napcat_port)
 
@@ -2968,64 +2887,23 @@ class MainWindow(QMainWindow):
             self._confirm_remove_instance(instances[0][0])
             return
 
-        dialog = QDialog(self)
-        dialog.setWindowTitle("移除实例")
-        dialog.setMinimumWidth(400)
-        dialog.setMaximumWidth(500)
-        dialog.setWindowModality(Qt.WindowModality.WindowModal)
-        dialog.setStyleSheet(STYLESHEET)
-
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.setSpacing(14)
-
-        title = QLabel("选择要移除的实例")
-        title.setProperty("role", "dialog_title")
-        layout.addWidget(title)
-
-        desc = QLabel(f"当前共有 {len(instances)} 个部署实例，请选择要移除的实例：")
-        desc.setProperty("role", "dialog_desc")
-        desc.setWordWrap(True)
-        layout.addWidget(desc)
-
-        combo = StyledComboBox()
-        combo.setMinimumWidth(360)
+        items = []
         for inst_id, inst_data in instances:
             name = inst_data.get("instance_name", "").rstrip("_") or inst_id
             mode = "napcat" if inst_data.get("deploy_mode") == "napcat" else "lite"
             port = inst_data.get("nekro_port", 8021)
-            combo.addItem(f"{name}  ({mode}, 端口：{port})", inst_id)
-        layout.addWidget(combo)
+            items.append((f"{name}  ({mode}, 端口：{port})", inst_id))
 
-        selected_id = [None]
-
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(10)
-
-        btn_cancel = QPushButton("取消")
-        btn_cancel.setFixedHeight(36)
-        btn_cancel.clicked.connect(dialog.reject)
-        btn_row.addWidget(btn_cancel)
-
-        btn_row.addStretch()
-
-        btn_remove = QPushButton("移除选中实例")
-        btn_remove.setProperty("role", "danger")
-        btn_remove.setFixedHeight(36)
-        btn_remove.setCursor(Qt.CursorShape.PointingHandCursor)
-
-        def _on_remove():
-            selected_id[0] = combo.currentData()
-            dialog.accept()
-
-        btn_remove.clicked.connect(_on_remove)
-        btn_row.addWidget(btn_remove)
-
-        layout.addLayout(btn_row)
-        dialog.exec()
-
-        if selected_id[0]:
-            self._confirm_remove_instance(selected_id[0])
+        selected_id = show_combo_choice_dialog(
+            self,
+            "选择要移除的实例",
+            f"当前共有 {len(instances)} 个部署实例，请选择要移除的实例：",
+            items,
+            confirm_text="移除选中实例",
+            danger=True,
+        )
+        if selected_id:
+            self._confirm_remove_instance(selected_id)
 
     def _confirm_remove_instance(self, inst_id):
         """移除单个实例：停止其 compose 服务、删除 deploy_dir、从 config 中移除。"""
@@ -3092,46 +2970,17 @@ class MainWindow(QMainWindow):
 
     def _ask_close_action(self):
         """返回 1=最小化到托盘, 2=停止服务并退出, 其他=取消"""
-        choice = QDialog(self)
-        choice.setWindowTitle("选择操作")
-        choice.setMinimumWidth(360)
-        choice.setMaximumWidth(460)
-        choice.setModal(True)
-        choice.setStyleSheet(STYLESHEET)
-
-        layout = QVBoxLayout(choice)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.setSpacing(12)
-
-        title = QLabel("服务正在运行")
-        title.setProperty("role", "dialog_title")
-        title.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        layout.addWidget(title)
-
-        desc = QLabel("请选择关闭窗口时的处理方式。")
-        desc.setProperty("role", "dialog_desc")
-        desc.setWordWrap(True)
-        desc.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        layout.addWidget(desc)
-
-        button_row = QHBoxLayout()
-        button_row.setSpacing(10)
-        tray_button = QPushButton("最小化到托盘")
-        tray_button.clicked.connect(lambda: choice.done(1))
-        button_row.addWidget(tray_button)
-
-        quit_button = QPushButton("停止服务并退出")
-        quit_button.setProperty("role", "danger")
-        quit_button.clicked.connect(lambda: choice.done(2))
-        button_row.addWidget(quit_button)
-
-        cancel_button = QPushButton("取消")
-        cancel_button.clicked.connect(choice.reject)
-        button_row.addWidget(cancel_button)
-
-        layout.addLayout(button_row)
-        choice.adjustSize()
-        return choice.exec()
+        result = show_choice_dialog(
+            self,
+            "服务正在运行",
+            "请选择关闭窗口时的处理方式。",
+            [
+                ("最小化到托盘", 1, None),
+                ("停止服务并退出", 2, "danger"),
+                ("取消", 0, None),
+            ],
+        )
+        return result or 0
 
     def closeEvent(self, event: QCloseEvent):
         if self._force_quit_after_stop:

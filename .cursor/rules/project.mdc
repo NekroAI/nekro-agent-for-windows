@@ -1,0 +1,16 @@
+---
+description: Nekro Agent for Windows project rules
+globs:
+  - "**/*"
+alwaysApply: true
+---
+
+Follow the repository rules in `AGENTS.md`.
+
+Key constraints:
+- Python 3.11, PyQt6, Windows-first launcher, WSL runtime backend.
+- Default text line endings are CRLF; `*.sh` stays LF.
+- Reuse `ui/widgets.py` shared dialogs, wizard base classes, and button factories before adding local UI variants.
+- Surface actionable WSL/Docker/Compose/download/update errors with command output where available.
+- Validate ports through `core.port_utils.validate_port_bindings`.
+- Verify with `uv run poe lint`; it includes Pyright.

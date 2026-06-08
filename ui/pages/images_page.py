@@ -1,10 +1,10 @@
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QPushButton,
+    QFrame, QHBoxLayout, QLabel,
     QVBoxLayout, QWidget,
 )
 
-from ui.widgets import SectionCard, SpinnerLabel, SPINNER_FRAMES
+from ui.widgets import SectionCard, SPINNER_FRAMES, make_secondary_button
 
 
 class ImagesPage(QWidget):
@@ -37,9 +37,7 @@ class ImagesPage(QWidget):
         self._rebuild_image_rows()
 
         btn_row = QHBoxLayout()
-        self.w.btn_check_images = QPushButton("检查全部更新")
-        self.w.btn_check_images.setObjectName("HeroSecondary")
-        self.w.btn_check_images.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.w.btn_check_images = make_secondary_button("检查全部更新")
         self.w.btn_check_images.clicked.connect(self.w._check_images)
         self.w._img_spinner_frames = SPINNER_FRAMES
         self.w._img_spinner_idx = 0
@@ -83,10 +81,8 @@ def rebuild_image_rows(window):
         remote_lbl.setObjectName("SectionDesc")
         status_lbl = QLabel("未检测")
         status_lbl.setObjectName("SectionDesc")
-        btn_single = QPushButton("检查更新")
-        btn_single.setObjectName("HeroSecondary")
+        btn_single = make_secondary_button("检查更新")
         btn_single.setFixedHeight(32)
-        btn_single.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_single.clicked.connect(lambda checked, ref=image_ref: window._check_single_image(ref))
         row.addWidget(name_lbl, 3)
         row.addWidget(local_lbl, 2)

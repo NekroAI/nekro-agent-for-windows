@@ -12,4 +12,30 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pyinstaller>=6.0.0",
+    "poethepoet>=0.32.0",
+    "pyright>=1.1.390",
 ]
+
+[tool.poe.tasks]
+lint = { cmd = "python scripts/lint.py", help = "Run compile, tests, and project lint checks" }
+
+[tool.pyright]
+include = [
+    "main.py",
+    "core",
+    "ui",
+    "tests",
+    "scripts",
+]
+exclude = [
+    "**/__pycache__",
+    ".venv",
+    "build",
+    "dist",
+]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+reportMissingTypeStubs = "none"
+reportAttributeAccessIssue = "none"
+reportOptionalMemberAccess = "none"
+reportArgumentType = "none"

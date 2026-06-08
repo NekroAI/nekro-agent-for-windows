@@ -24,9 +24,12 @@ MANAGED_IMAGES_BASE = [
 ]
 
 ROOTFS_URLS = [
-    "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cloud-images/wsl/jammy/current/ubuntu-jammy-wsl-amd64-ubuntu22.04lts.rootfs.tar.gz",
-    "https://mirror.sjtu.edu.cn/ubuntu-cloud-images/wsl/jammy/current/ubuntu-jammy-wsl-amd64-ubuntu22.04lts.rootfs.tar.gz",
-    "https://cloud-images.ubuntu.com/wsl/jammy/current/ubuntu-jammy-wsl-amd64-ubuntu22.04lts.rootfs.tar.gz",
+    "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cloud-images/wsl/jammy/current/"
+    "ubuntu-jammy-wsl-amd64-ubuntu22.04lts.rootfs.tar.gz",
+    "https://mirror.sjtu.edu.cn/ubuntu-cloud-images/wsl/jammy/current/"
+    "ubuntu-jammy-wsl-amd64-ubuntu22.04lts.rootfs.tar.gz",
+    "https://cloud-images.ubuntu.com/wsl/jammy/current/"
+    "ubuntu-jammy-wsl-amd64-ubuntu22.04lts.rootfs.tar.gz",
 ]
 
 STABLE_IMAGE = "kromiose/nekro-agent:latest"

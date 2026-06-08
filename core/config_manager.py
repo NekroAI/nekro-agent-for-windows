@@ -35,7 +35,7 @@ def get_app_data_dir() -> str:
         try:
             os.makedirs(candidate, exist_ok=True)
             probe = os.path.join(candidate, f".probe_{os.getpid()}")
-            with open(probe, "w") as f:
+            with open(probe, "w", encoding="utf-8") as f:
                 f.write("ok")
             try:
                 os.remove(probe)

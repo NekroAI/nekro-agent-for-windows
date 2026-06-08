@@ -4,10 +4,13 @@ import threading
 import time
 from urllib.request import urlopen
 
+from core.port_utils import normalize_port
+
 
 class WSLMonitorMixin:
     _health_generation: int = 0
     _health_lock = threading.Lock()
+
     def _log_reader(self, distro, deploy_dir, log_prefix="", inst_id=""):
         """通过 docker compose logs -f 流式读取日志"""
         import shlex
@@ -16,7 +19,15 @@ class WSLMonitorMixin:
         try:
             quoted_dir = shlex.quote(deploy_dir)
             proc = subprocess.Popen(
-                ["wsl", "-d", distro, "--", "bash", "-c", f"cd {quoted_dir} && docker compose -f docker-compose.yml logs -f --tail=50"],
+                [
+                    "wsl",
+                    "-d",
+                    distro,
+                    "--",
+                    "bash",
+                    "-c",
+                    f"cd {quoted_dir} && docker compose -f docker-compose.yml logs -f --tail=50",
+                ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 creationflags=self._creation_flags(),
@@ -36,14 +47,27 @@ class WSLMonitorMixin:
                         if info.get("napcat_token") != token:
                             info["napcat_token"] = token
                             self._save_deploy_info(info, inst_id=inst_id)
-                            self.log_received.emit(f"{log_prefix}[NapCat] 已捕获 WebUI Token: {token}", "info")
+                            self.log_received.emit(
+                                f"{log_prefix}[NapCat] 已捕获 WebUI Token: {token}",
+                                "info",
+                            )
                             if self._pending_deploy_info:
                                 self._pending_deploy_info["napcat_token"] = token
-                                self._show_deploy_info(self._pending_deploy_info, inst_id=inst_id)
+                                self._show_deploy_info(
+                                    self._pending_deploy_info,
+                                    inst_id=inst_id,
+                                )
                                 self._pending_deploy_info = None
         except Exception as e:
             if not self._stop_event.is_set():
-                self.log_received.emit(f"{log_prefix}日志读取异常: {e}", "debug")
+                self.log_received.emit(
+                    f"{log_prefix}日志读取异常\n"
+                    f"发行版: {distro}\n"
+                    f"部署目录: {deploy_dir}\n"
+                    "命令: docker compose -f docker-compose.yml logs -f --tail=50\n"
+                    f"异常: {type(e).__name__}: {e}",
+                    "debug",
+                )
         finally:
             if proc and proc.poll() is None:
                 try:
@@ -63,6 +87,7 @@ class WSLMonitorMixin:
             nekro_port = 8021
             if self.config:
                 nekro_port = self.config.get("nekro_port") or 8021
+        nekro_port = normalize_port(nekro_port, 8021)
         timeout = 300
         start = time.time()
         interval = 2.0
@@ -71,8 +96,9 @@ class WSLMonitorMixin:
             if self._health_generation != my_gen:
                 return
             try:
-                resp = urlopen(f"http://localhost:{nekro_port}", timeout=5)
-                if resp.status == 200:
+                with urlopen(f"http://localhost:{nekro_port}", timeout=5) as resp:
+                    ready = resp.status == 200
+                if ready:
                     if self._health_generation != my_gen:
                         return
                     elapsed = time.time() - start
@@ -88,5 +114,11 @@ class WSLMonitorMixin:
 
         if not self._stop_event.is_set() and self._health_generation == my_gen:
             self.is_running = False
-            self.log_received.emit("服务启动超时，请检查日志", "error")
+            self.log_received.emit(
+                "服务启动超时\n"
+                f"访问地址: http://localhost:{nekro_port}\n"
+                f"等待时长: {timeout}s\n"
+                "建议检查 Docker Compose 日志、端口占用和容器健康状态。",
+                "error",
+            )
             self.status_changed.emit("启动超时")

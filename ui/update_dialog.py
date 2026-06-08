@@ -4,10 +4,11 @@
 显示新版本信息、更新日志，并支持一键下载安装包后自动运行安装程序。
 """
 
+import os
 import re
 import subprocess
 
-from PyQt6.QtCore import Qt, QThread, QTimer
+from PyQt6.QtCore import Qt, QThread
 from PyQt6.QtWidgets import (
     QDialog,
     QFrame,
@@ -21,6 +22,10 @@ from PyQt6.QtWidgets import (
 
 from core.app_updater import APP_VERSION, DownloadWorker
 from ui.styles import STYLESHEET
+
+
+STATUS_INFO_STYLE = "font-size: 12px; color: #7a8d9f;"
+STATUS_ERROR_STYLE = "font-size: 12px; color: #e26050;"
 
 
 def _md_to_html(md: str) -> str:
@@ -127,7 +132,11 @@ def _md_to_html(md: str) -> str:
 def _inline_format(text: str) -> str:
     """处理行内 Markdown 格式。"""
     text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    text = re.sub(r"`([^`]+)`", r'<code style="background:#f0f4f8; padding:1px 5px; border-radius:3px; font-size:12px; font-family:Consolas,monospace;">\1</code>', text)
+    code_style = (
+        "background:#f0f4f8; padding:1px 5px; border-radius:3px; "
+        "font-size:12px; font-family:Consolas,monospace;"
+    )
+    text = re.sub(r"`([^`]+)`", rf'<code style="{code_style}">\1</code>', text)
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
     text = re.sub(r"\*(.+?)\*", r"<i>\1</i>", text)
@@ -253,7 +262,7 @@ class AppUpdateDialog(QDialog):
         self._progress_container.addWidget(self._progress_bar)
 
         self._status_label = QLabel("")
-        self._status_label.setStyleSheet("font-size: 12px; color: #7a8d9f;")
+        self._status_label.setStyleSheet(STATUS_INFO_STYLE)
         self._status_label.setWordWrap(True)
         self._progress_container.addWidget(self._status_label)
 
@@ -312,6 +321,7 @@ class AppUpdateDialog(QDialog):
         self._btn_later.setEnabled(False)
         self._set_progress_visible(True)
         self._progress_bar.setRange(0, 0)
+        self._status_label.setStyleSheet(STATUS_INFO_STYLE)
         self._status_label.setText("正在连接下载源...")
 
         self._download_worker = DownloadWorker(url, name)
@@ -334,10 +344,12 @@ class AppUpdateDialog(QDialog):
             pct = int(downloaded * 100 / total)
             self._progress_bar.setValue(pct)
             self._size_label.setText(f"{_fmt_size(downloaded)} / {_fmt_size(total)}")
+            self._status_label.setStyleSheet(STATUS_INFO_STYLE)
             self._status_label.setText(f"正在下载... {pct}%")
         else:
             self._progress_bar.setRange(0, 0)
             self._size_label.setText(_fmt_size(downloaded))
+            self._status_label.setStyleSheet(STATUS_INFO_STYLE)
             self._status_label.setText("正在下载...")
 
     def _cleanup_download_thread(self):
@@ -356,6 +368,7 @@ class AppUpdateDialog(QDialog):
         if success:
             self._progress_bar.setRange(0, 100)
             self._progress_bar.setValue(100)
+            self._status_label.setStyleSheet(STATUS_INFO_STYLE)
             self._status_label.setText("下载完成！正在启动安装程序...")
             self._btn_download.setText("下载完成")
 
@@ -364,8 +377,8 @@ class AppUpdateDialog(QDialog):
         else:
             self._progress_bar.setRange(0, 100)
             self._progress_bar.setValue(0)
-            self._status_label.setText(f"下载失败: {result}")
-            self._status_label.setStyleSheet("font-size: 12px; color: #e26050;")
+            self._status_label.setText(result)
+            self._status_label.setStyleSheet(STATUS_ERROR_STYLE)
             self._btn_download.setEnabled(True)
             self._btn_download.setText("重新下载")
             self._btn_skip.setEnabled(True)
@@ -383,15 +396,19 @@ class AppUpdateDialog(QDialog):
 
     def _launch_installer(self, installer_path: str):
         try:
+            if not os.path.isfile(installer_path):
+                raise FileNotFoundError(installer_path)
             subprocess.Popen(
                 [installer_path],
                 creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
             )
             from PyQt6.QtWidgets import QApplication
-            QApplication.instance().quit()
+            app = QApplication.instance()
+            if app:
+                app.quit()
         except Exception as e:
-            self._status_label.setText(f"启动安装程序失败: {e}")
-            self._status_label.setStyleSheet("font-size: 12px; color: #e26050;")
+            self._status_label.setText(f"启动启动器更新安装程序失败: {e}")
+            self._status_label.setStyleSheet(STATUS_ERROR_STYLE)
             self._btn_download.setEnabled(True)
             self._btn_download.setText("重新下载")
             self._btn_skip.setEnabled(True)

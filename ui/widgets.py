@@ -1,11 +1,11 @@
 import re
 from collections import OrderedDict
 
-from PyQt6.QtCore import QPoint, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QPoint, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QDialog, QFrame, QHBoxLayout, QLabel, QProgressBar, QPushButton,
-    QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
+    QScrollArea, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from ui.styles import STYLESHEET
@@ -51,41 +51,207 @@ class SpinnerLabel(QLabel):
         return self._timer.isActive()
 
 
+def make_button(
+    text,
+    *,
+    object_name=None,
+    role=None,
+    checkable=False,
+    cursor=True,
+    fixed_height=None,
+    fixed_width=None,
+    minimum_width=None,
+):
+    button = QPushButton(text)
+    if object_name:
+        button.setObjectName(object_name)
+    if role:
+        button.setProperty("role", role)
+    if checkable:
+        button.setCheckable(True)
+    if cursor:
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+    if fixed_height is not None:
+        button.setFixedHeight(fixed_height)
+    if fixed_width is not None:
+        button.setFixedWidth(fixed_width)
+    if minimum_width is not None:
+        button.setMinimumWidth(minimum_width)
+    return button
+
+
+def make_secondary_button(text, **kwargs):
+    return make_button(text, object_name="HeroSecondary", **kwargs)
+
+
+def make_segment_button(text, *, checkable=False, **kwargs):
+    return make_button(text, object_name="SegmentBtn", checkable=checkable, **kwargs)
+
+
+WIZARD_BUTTON_VARIANTS = {
+    "primary": "WizardPrimary",
+    "secondary": "WizardSecondary",
+    "accent": "WizardAccent",
+}
+
+
+def set_wizard_button_variant(button, variant="primary", *, repolish=True):
+    button.setObjectName(WIZARD_BUTTON_VARIANTS.get(variant, WIZARD_BUTTON_VARIANTS["primary"]))
+    if repolish:
+        button.style().unpolish(button)
+        button.style().polish(button)
+    return button
+
+
+def make_wizard_button(text, variant="primary", **kwargs):
+    button = make_button(text, **kwargs)
+    return set_wizard_button_variant(button, variant, repolish=False)
+
+
+class DialogShell(QDialog):
+    """Shared title/body/button shell for small modal dialogs."""
+
+    def __init__(
+        self,
+        parent,
+        title,
+        text="",
+        *,
+        minimum_width=360,
+        maximum_width=460,
+        rich_text=False,
+        modal=True,
+        spacing=12,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(minimum_width)
+        self.setMaximumWidth(maximum_width)
+        if modal:
+            self.setWindowModality(Qt.WindowModality.WindowModal)
+        self.setStyleSheet(STYLESHEET)
+
+        self.content_layout = QVBoxLayout(self)
+        self.content_layout.setContentsMargins(20, 18, 20, 18)
+        self.content_layout.setSpacing(spacing)
+
+        title_label = QLabel(title)
+        title_label.setProperty("role", "dialog_title")
+        title_label.setWordWrap(True)
+        title_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.content_layout.addWidget(title_label)
+
+        self.desc_label = QLabel(text)
+        self.desc_label.setProperty("role", "dialog_desc")
+        self.desc_label.setWordWrap(True)
+        self.desc_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        if rich_text:
+            self.desc_label.setOpenExternalLinks(True)
+            self.desc_label.setTextFormat(Qt.TextFormat.RichText)
+            self.desc_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        else:
+            self.desc_label.setTextFormat(Qt.TextFormat.PlainText)
+        if text:
+            self.content_layout.addWidget(self.desc_label)
+
+    def add_button_row(self, *buttons):
+        button_row = QHBoxLayout()
+        button_row.setSpacing(10)
+        button_row.addStretch()
+        for button in buttons:
+            button_row.addWidget(button)
+        self.content_layout.addLayout(button_row)
+        return button_row
+
+
 def show_notice_dialog(parent, title, text, button_text="确定", danger=False):
-    dialog = QDialog(parent)
-    dialog.setWindowTitle(title)
-    dialog.setMinimumWidth(340)
-    dialog.setMaximumWidth(440)
-    dialog.setWindowModality(Qt.WindowModality.WindowModal)
-    dialog.setStyleSheet(STYLESHEET)
-
-    layout = QVBoxLayout(dialog)
-    layout.setContentsMargins(20, 18, 20, 18)
-    layout.setSpacing(12)
-
-    title_label = QLabel(title)
-    title_label.setProperty("role", "dialog_title")
-    title_label.setWordWrap(True)
-    title_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-    layout.addWidget(title_label)
-
-    desc_label = QLabel(text)
-    desc_label.setProperty("role", "dialog_desc")
-    desc_label.setWordWrap(True)
-    desc_label.setTextFormat(Qt.TextFormat.PlainText)
-    desc_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-    layout.addWidget(desc_label)
-
-    button_row = QHBoxLayout()
-    button_row.addStretch()
-    btn = QPushButton(button_text)
+    dialog = DialogShell(parent, title, text, minimum_width=340, maximum_width=440)
+    btn = make_button(button_text, cursor=True)
     if danger:
         btn.setProperty("role", "danger")
     btn.clicked.connect(dialog.accept)
-    button_row.addWidget(btn)
-    layout.addLayout(button_row)
+    dialog.add_button_row(btn)
     dialog.adjustSize()
     dialog.exec()
+
+
+def show_confirm_dialog(
+    parent,
+    title,
+    text,
+    *,
+    confirm_text="确认",
+    cancel_text="取消",
+    danger=False,
+    rich_text=False,
+    minimum_width=360,
+    maximum_width=460,
+):
+    dialog = DialogShell(
+        parent,
+        title,
+        text,
+        minimum_width=minimum_width,
+        maximum_width=maximum_width,
+        rich_text=rich_text,
+    )
+    cancel_button = make_button(cancel_text)
+    cancel_button.clicked.connect(dialog.reject)
+    confirm_button = make_button(confirm_text, role="danger" if danger else "primary")
+    confirm_button.clicked.connect(dialog.accept)
+    dialog.add_button_row(cancel_button, confirm_button)
+    dialog.adjustSize()
+    return dialog.exec() == int(QDialog.DialogCode.Accepted)
+
+
+def show_choice_dialog(parent, title, text, choices, *, minimum_width=360, maximum_width=460):
+    dialog = DialogShell(parent, title, text, minimum_width=minimum_width, maximum_width=maximum_width)
+    buttons = []
+    selected = {"value": None}
+    for label, value, role in choices:
+        button = make_button(label, role=role or None)
+        button.clicked.connect(lambda _checked=False, v=value: (selected.__setitem__("value", v), dialog.accept()))
+        buttons.append(button)
+    dialog.add_button_row(*buttons)
+    dialog.adjustSize()
+    if dialog.exec() == int(QDialog.DialogCode.Accepted):
+        return selected["value"]
+    return None
+
+
+def show_combo_choice_dialog(
+    parent,
+    title,
+    text,
+    items,
+    *,
+    confirm_text="确认",
+    cancel_text="取消",
+    danger=False,
+    active_data=None,
+    minimum_width=400,
+    maximum_width=500,
+    combo_minimum_width=360,
+):
+    dialog = DialogShell(parent, title, text, minimum_width=minimum_width, maximum_width=maximum_width, spacing=14)
+    combo = StyledComboBox()
+    combo.setMinimumWidth(combo_minimum_width)
+    current_index = 0
+    for index, (label, data) in enumerate(items):
+        combo.addItem(label, data)
+        if active_data is not None and data == active_data:
+            current_index = index
+    combo.setCurrentIndex(current_index)
+    dialog.content_layout.addWidget(combo)
+
+    cancel_button = make_button(cancel_text, cursor=True)
+    cancel_button.clicked.connect(dialog.reject)
+    confirm_button = make_button(confirm_text, role="danger" if danger else "primary", fixed_height=36)
+    confirm_button.clicked.connect(dialog.accept)
+    dialog.add_button_row(cancel_button, confirm_button)
+    if dialog.exec() == int(QDialog.DialogCode.Accepted):
+        return combo.currentData()
+    return None
 
 
 def create_install_progress_bar(minimum=0, maximum=0, height=8, radius=4):
@@ -98,6 +264,100 @@ def create_install_progress_bar(minimum=0, maximum=0, height=8, radius=4):
         f"QProgressBar::chunk {{ background: #0969da; border-radius: {radius}px; }}"
     )
     return bar
+
+
+class CreateRuntimeThread(QThread):
+    result_ready = pyqtSignal(bool)
+    error_ready = pyqtSignal(str)
+
+    def __init__(self, backend, install_dir):
+        super().__init__()
+        self.backend = backend
+        self.install_dir = install_dir
+
+    def run(self):
+        try:
+            ok = self.backend.create_runtime(self.install_dir)
+        except Exception as e:
+            self.error_ready.emit(str(e))
+            ok = False
+        self.result_ready.emit(ok)
+
+
+class WizardDialogBase(QDialog):
+    """Base class for stacked wizard dialogs with tracked background threads."""
+
+    def __init__(
+        self,
+        title,
+        steps,
+        *,
+        parent=None,
+        size=(680, 600),
+        minimum_size=(620, 520),
+        margins=(30, 24, 30, 30),
+    ):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(*size)
+        self.setMinimumSize(*minimum_size)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint)
+        self.setStyleSheet(STYLESHEET)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(*margins)
+        layout.setSpacing(0)
+
+        self._step_indicator = StepIndicator(steps, current=0)
+        layout.addWidget(self._step_indicator)
+
+        self.stack = QStackedWidget()
+        layout.addWidget(self.stack)
+
+        self._page_index = {}
+        self._active_threads: list[QThread] = []
+
+    def _track_thread(self, thread: QThread):
+        self._active_threads.append(thread)
+        thread.finished.connect(
+            lambda _=None, t=thread: self._active_threads.remove(t)
+            if t in self._active_threads
+            else None
+        )
+
+    def _disconnect_dialog_signals(self):
+        pass
+
+    def reject(self):
+        for thread in list(self._active_threads):
+            if thread.isRunning():
+                thread.quit()
+                thread.wait(3000)
+        self._active_threads.clear()
+        self._disconnect_dialog_signals()
+        super().reject()
+
+    def _add_page(self, page: QWidget, name: str):
+        idx = self.stack.addWidget(page)
+        self._page_index[name] = idx
+
+    def _page_step(self, name: str) -> int:
+        return 0
+
+    def _show_step_indicator_for_page(self, name: str) -> bool:
+        return True
+
+    def _goto_page(self, name: str):
+        self.stack.setCurrentIndex(self._page_index[name])
+        self._step_indicator.set_step(self._page_step(name))
+        self._step_indicator.setVisible(self._show_step_indicator_for_page(name))
+
+    def _current_page_name(self) -> str:
+        idx = self.stack.currentIndex()
+        for name, i in self._page_index.items():
+            if i == idx:
+                return name
+        return ""
 
 
 class ScanProgressDialog(QDialog):
@@ -153,6 +413,7 @@ class PullProgressView(QFrame):
         self._layer_order = []
         self._image_index = 0
         self._image_total = 0
+        self._failed = False
 
         self.setObjectName("SectionCard")
         layout = QVBoxLayout(self)
@@ -230,6 +491,9 @@ class PullProgressView(QFrame):
         self._layer_order.clear()
         self._image_index = 0
         self._image_total = 0
+        self._failed = False
+        self.status_label.setStyleSheet("")
+        self.summary_label.setStyleSheet("")
         self.status_label.setText("")
         self.summary_label.setText("")
         self.summary_label.setVisible(False)
@@ -241,6 +505,9 @@ class PullProgressView(QFrame):
         self.update(header=header, show_bar=False)
 
     def begin_stage(self, header, current=0, total=0):
+        self._failed = False
+        self.status_label.setStyleSheet("")
+        self.summary_label.setStyleSheet("")
         self._stage_header = header
         self._summary_text = ""
         self._layers.clear()
@@ -251,10 +518,17 @@ class PullProgressView(QFrame):
         self.update(header=header, show_bar=False)
 
     def finish(self, header):
+        self._failed = False
+        self.status_label.setStyleSheet("")
+        self.summary_label.setStyleSheet("")
         self.progress_bar.setValue(100)
         self.update(header=header, show_bar=bool(self._layer_order))
 
     def fail(self, header):
+        self._failed = True
+        self.status_label.setStyleSheet("color: #f26f82;")
+        self.summary_label.setStyleSheet("")
+        self._summary_text = ""
         self.update(header=header, show_bar=False)
 
     def update(self, header="", detail="", show_bar=None):

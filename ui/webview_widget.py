@@ -2,7 +2,6 @@
 
 import json
 import os
-import sys
 
 from PyQt6.QtCore import QTimer, pyqtSignal
 from PyQt6.QtWidgets import QSizePolicy, QWidget

@@ -1,0 +1,16 @@
+stages:
+  - deploy
+
+pages:
+  stage: deploy
+  image: alpine:3.20
+  script:
+    - test -f public/index.html
+    - test -f public/assets/splash.png
+    - test -f public/assets/NekroAgent.ico
+  pages: true
+  artifacts:
+    paths:
+      - public
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH

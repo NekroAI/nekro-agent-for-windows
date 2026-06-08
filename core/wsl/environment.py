@@ -22,16 +22,32 @@ class WSLEnvironmentMixin:
                 if ok:
                     self.log_received.emit("[环境检测] ✓ WSL2 已安装", "info")
                 else:
-                    self.log_received.emit("[环境检测] ✗ WSL2 未安装，返回码: " + str(proc.returncode), "error")
-                return (ok, "")
+                    detail = self._format_command_failure(
+                        "[环境检测] WSL2 检测失败",
+                        args=["wsl", "--status"],
+                        timeout=10,
+                        returncode=proc.returncode,
+                        stdout=proc.stdout,
+                        stderr=proc.stderr,
+                    )
+                    self.log_received.emit(detail, "error")
+                    return (False, detail)
+                return (True, "")
             except FileNotFoundError:
-                self.log_received.emit("[环境检测] ✗ wsl 命令未找到", "error")
+                detail = "wsl 命令未找到，请确认 Windows 已启用 WSL 功能，或将 wsl.exe 加入 PATH。"
+                self.log_received.emit(f"[环境检测] ✗ {detail}", "error")
                 ctx["wsl"] = False
-                return (False, "")
+                return (False, detail)
             except Exception as e:
-                self.log_received.emit(f"[环境检测] ✗ WSL 检测异常: {e}", "error")
+                detail = self._format_command_failure(
+                    "[环境检测] WSL 检测异常",
+                    args=["wsl", "--status"],
+                    timeout=10,
+                    exception=e,
+                )
+                self.log_received.emit(detail, "error")
                 ctx["wsl"] = False
-                return (False, "")
+                return (False, detail)
 
         def check_distro():
             self.log_received.emit("[环境检测] 2/4 检测 NekroAgent 发行版...", "info")
@@ -41,8 +57,9 @@ class WSLEnvironmentMixin:
                 ctx["distro"] = True
                 self.log_received.emit(f"[环境检测] ✓ {DISTRO_NAME} 发行版已存在", "info")
                 return (True, DISTRO_NAME)
+            detail = getattr(self, "_last_distro_check_error", "") or "未创建"
             self.log_received.emit("[环境检测] ✗ NekroAgent 发行版不存在", "error")
-            return (False, "未创建")
+            return (False, detail)
 
         def check_docker():
             self.log_received.emit("[环境检测] 3/4 检测 Docker...", "info")
@@ -60,13 +77,28 @@ class WSLEnvironmentMixin:
                 if ok:
                     self.log_received.emit("[环境检测] ✓ Docker CLI 已安装", "info")
                 else:
-                    self.log_received.emit("[环境检测] ✗ Docker CLI 检测失败", "error")
-                    self.log_received.emit(f"返回码: {proc.returncode}", "error")
-                    self.log_received.emit(f"STDERR: {self._clean_stderr(proc.stderr, 300)}", "error")
-                return (ok, "")
+                    detail = self._format_command_failure(
+                        "[环境检测] Docker CLI 检测失败",
+                        cmd="docker --version",
+                        distro=DISTRO_NAME,
+                        timeout=10,
+                        returncode=proc.returncode,
+                        stdout=proc.stdout,
+                        stderr=proc.stderr,
+                    )
+                    self.log_received.emit(detail, "error")
+                    return (False, detail)
+                return (True, "")
             except Exception as e:
-                self.log_received.emit(f"[环境检测] ✗ Docker 检测异常: {e}", "error")
-                return (False, "")
+                detail = self._format_command_failure(
+                    "[环境检测] Docker 检测异常",
+                    cmd="docker --version",
+                    distro=DISTRO_NAME,
+                    timeout=10,
+                    exception=e,
+                )
+                self.log_received.emit(detail, "error")
+                return (False, detail)
 
         def check_compose():
             self.log_received.emit("[环境检测] 4/4 检测 Docker Compose...", "info")
@@ -83,10 +115,27 @@ class WSLEnvironmentMixin:
                 if ok:
                     self.log_received.emit("[环境检测] ✓ Docker Compose 可用", "info")
                 else:
-                    self.log_received.emit("[环境检测] ✗ Docker Compose 检测失败", "error")
-                return (ok, "")
+                    detail = self._format_command_failure(
+                        "[环境检测] Docker Compose 检测失败",
+                        cmd="docker compose version",
+                        distro=DISTRO_NAME,
+                        timeout=10,
+                        returncode=proc.returncode,
+                        stdout=proc.stdout,
+                        stderr=proc.stderr,
+                    )
+                    self.log_received.emit(detail, "error")
+                    return (False, detail)
+                return (True, "")
             except Exception as e:
-                self.log_received.emit(f"[环境检测] ✗ Docker Compose 检测异常: {e}", "error")
-                return (False, "")
+                detail = self._format_command_failure(
+                    "[环境检测] Docker Compose 检测异常",
+                    cmd="docker compose version",
+                    distro=DISTRO_NAME,
+                    timeout=10,
+                    exception=e,
+                )
+                self.log_received.emit(detail, "error")
+                return (False, detail)
 
         return [check_wsl, check_distro, check_docker, check_compose]

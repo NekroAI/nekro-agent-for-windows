@@ -3,7 +3,6 @@ import re
 
 from PyQt6.QtCore import QTimer, Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
-    QDialog,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -11,14 +10,21 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSizePolicy,
-    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from core.port_utils import validate_port_bindings
+from core.port_utils import normalize_port, validate_port_bindings
 from ui.styles import STYLESHEET
-from ui.widgets import PullProgressView, StepIndicator, create_install_progress_bar, show_notice_dialog
+from ui.widgets import (
+    CreateRuntimeThread,
+    PullProgressView,
+    WizardDialogBase,
+    create_install_progress_bar,
+    make_wizard_button,
+    show_confirm_dialog,
+    show_notice_dialog,
+)
 
 
 class CheckStepThread(QThread):
@@ -37,58 +43,24 @@ class CheckStepThread(QThread):
         self.step_done.emit(self._step, passed, detail)
 
 
-class CreateRuntimeThread(QThread):
-    result_ready = pyqtSignal(bool)
-    error_ready = pyqtSignal(str)
-
-    def __init__(self, backend, install_dir):
-        super().__init__()
-        self.backend = backend
-        self.install_dir = install_dir
-
-    def run(self):
-        try:
-            ok = self.backend.create_runtime(self.install_dir)
-        except Exception as e:
-            self.error_ready.emit(str(e))
-            ok = False
-        self.result_ready.emit(ok)
-
-
-class FirstRunDialog(QDialog):
+class FirstRunDialog(WizardDialogBase):
     """全新部署向导对话框（不含迁移逻辑，迁移使用 MigrationDialog）。"""
 
     deploy_requested = pyqtSignal(str, dict)
 
     def __init__(self, backend, config, parent=None):
-        super().__init__(parent)
+        super().__init__(
+            "Nekro Agent 环境配置向导",
+            ["检测环境", "创建运行环境", "选择版本", "配置实例", "部署服务"],
+            parent=parent,
+            size=(680, 640),
+            minimum_size=(620, 600),
+        )
         self.backend = backend
         self.config = config
         self.env_result = None
         self._check_in_progress = False
         self._selected_mode = self.config.get("deploy_mode") or "lite"
-
-        self.setWindowTitle("Nekro Agent 环境配置向导")
-        self.resize(680, 640)
-        self.setMinimumSize(620, 600)
-        self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint)
-        self.setStyleSheet(STYLESHEET)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(30, 24, 30, 30)
-        layout.setSpacing(0)
-
-        self._step_indicator = StepIndicator(
-            ["检测环境", "创建运行环境", "选择版本", "配置实例", "部署服务"],
-            current=0,
-        )
-        layout.addWidget(self._step_indicator)
-
-        self.stack = QStackedWidget()
-        layout.addWidget(self.stack)
-
-        self._page_index = {}
-        self._active_threads: list[QThread] = []
 
         self._init_check_page()
         self._init_create_page()
@@ -104,16 +76,7 @@ class FirstRunDialog(QDialog):
         self._goto_page("env_check")
         self._start_check()
 
-    def _track_thread(self, thread: QThread):
-        self._active_threads.append(thread)
-        thread.finished.connect(lambda _=None, t=thread: self._active_threads.remove(t) if t in self._active_threads else None)
-
-    def reject(self):
-        for thread in list(self._active_threads):
-            if thread.isRunning():
-                thread.quit()
-                thread.wait(3000)
-        self._active_threads.clear()
+    def _disconnect_dialog_signals(self):
         try:
             self.backend.progress_updated.disconnect(self._on_progress)
         except (TypeError, RuntimeError):
@@ -131,27 +94,13 @@ class FirstRunDialog(QDialog):
             self.backend.status_changed.disconnect(self._on_deploy_status_changed)
         except (TypeError, RuntimeError):
             pass
-        super().reject()
 
-    def _add_page(self, page: QWidget, name: str):
-        idx = self.stack.addWidget(page)
-        self._page_index[name] = idx
-
-    def _goto_page(self, name: str):
-        self.stack.setCurrentIndex(self._page_index[name])
+    def _page_step(self, name: str) -> int:
         step_map = {"env_check": 0, "create_runtime": 1, "select_mode": 2, "data_dir": 3, "deploy": 4}
-        step = step_map.get(name, 0)
-        self._step_indicator.set_step(step)
+        return step_map.get(name, 0)
 
     def _show_notice_dialog(self, title, text, button_text="确定", danger=False):
         show_notice_dialog(self, title, text, button_text, danger)
-
-    def _current_page_name(self) -> str:
-        idx = self.stack.currentIndex()
-        for name, i in self._page_index.items():
-            if i == idx:
-                return name
-        return ""
 
     # ------------------------------------------------------------------ #
     #  页面 env_check: 环境检测
@@ -193,11 +142,7 @@ class FirstRunDialog(QDialog):
         btn_box = QHBoxLayout()
         btn_box.addStretch()
 
-        self.btn_action = QPushButton("检测中...")
-        self.btn_action.setFixedHeight(38)
-        self.btn_action.setMinimumWidth(120)
-        self.btn_action.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_action.setObjectName("WizardPrimary")
+        self.btn_action = make_wizard_button("检测中...", fixed_height=38, minimum_width=120)
         self.btn_action.setEnabled(False)
         self.btn_action.clicked.connect(self._handle_action)
         btn_box.addWidget(self.btn_action)
@@ -214,13 +159,22 @@ class FirstRunDialog(QDialog):
         lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         return lbl
 
+    def _check_detail_summary(self, detail: str) -> str:
+        if not detail:
+            return ""
+        first_line = next((line.strip() for line in detail.splitlines() if line.strip()), "")
+        if len(first_line) <= 160:
+            return first_line
+        return first_line[:157] + "..."
+
     def _update_check_item(self, label, ok, detail=""):
         name = label.property("check_name")
+        summary = self._check_detail_summary(detail)
         if ok:
-            label.setText(f"✅  {name}" + (f"  —  {detail}" if detail else ""))
+            label.setText(f"✅  {name}" + (f"  —  {summary}" if summary else ""))
             label.setProperty("state", "pass")
         else:
-            label.setText(f"❌  {name}" + (f"  —  {detail}" if detail else ""))
+            label.setText(f"❌  {name}" + (f"  —  {summary}" if summary else ""))
             label.setProperty("state", "fail")
         label.style().unpolish(label)
         label.style().polish(label)
@@ -270,8 +224,16 @@ class FirstRunDialog(QDialog):
 
     def _apply_check_result(self):
         result = self.env_result
-        all_ok = (result["wsl_installed"] and result["distro"]
-                  and result["docker_available"] and result["compose_available"])
+        if result is None:
+            self.btn_action.setEnabled(False)
+            return
+
+        all_ok = (
+            result["wsl_installed"]
+            and result["distro"]
+            and result["docker_available"]
+            and result["compose_available"]
+        )
 
         if all_ok:
             self.check_desc.setText("所有环境组件已就绪！请点击下一步选择部署版本。")
@@ -408,21 +370,13 @@ class FirstRunDialog(QDialog):
 
         btn_box = QHBoxLayout()
 
-        self.btn_back = QPushButton("返回")
-        self.btn_back.setObjectName("WizardSecondary")
-        self.btn_back.setFixedHeight(38)
-        self.btn_back.setFixedWidth(80)
-        self.btn_back.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_back = make_wizard_button("返回", "secondary", fixed_height=38, fixed_width=80)
         self.btn_back.clicked.connect(lambda: self._goto_page("env_check"))
         btn_box.addWidget(self.btn_back)
 
         btn_box.addStretch()
 
-        self.btn_create = QPushButton("开始创建")
-        self.btn_create.setObjectName("WizardPrimary")
-        self.btn_create.setFixedHeight(38)
-        self.btn_create.setFixedWidth(120)
-        self.btn_create.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_create = make_wizard_button("开始创建", fixed_height=38, fixed_width=120)
         self.btn_create.clicked.connect(self._start_create)
         btn_box.addWidget(self.btn_create)
 
@@ -633,21 +587,13 @@ class FirstRunDialog(QDialog):
 
         btn_box = QHBoxLayout()
 
-        btn_back = QPushButton("返回")
-        btn_back.setObjectName("WizardSecondary")
-        btn_back.setFixedHeight(38)
-        btn_back.setFixedWidth(80)
-        btn_back.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_back = make_wizard_button("返回", "secondary", fixed_height=38, fixed_width=80)
         btn_back.clicked.connect(lambda: self._goto_page("select_mode"))
         btn_box.addWidget(btn_back)
 
         btn_box.addStretch()
 
-        btn_deploy = QPushButton("开始部署")
-        btn_deploy.setObjectName("WizardPrimary")
-        btn_deploy.setFixedHeight(38)
-        btn_deploy.setFixedWidth(120)
-        btn_deploy.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_deploy = make_wizard_button("开始部署", fixed_height=38, fixed_width=120)
         btn_deploy.clicked.connect(self._confirm_datadir)
         btn_box.addWidget(btn_deploy)
 
@@ -702,10 +648,7 @@ class FirstRunDialog(QDialog):
 
         btn_box = QHBoxLayout()
         btn_box.addStretch()
-        self.btn_deploy_done = QPushButton("部署中...")
-        self.btn_deploy_done.setObjectName("WizardPrimary")
-        self.btn_deploy_done.setFixedHeight(38)
-        self.btn_deploy_done.setFixedWidth(120)
+        self.btn_deploy_done = make_wizard_button("部署中...", fixed_height=38, fixed_width=120)
         self.btn_deploy_done.setEnabled(False)
         self.btn_deploy_done.clicked.connect(self.accept)
         btn_box.addWidget(self.btn_deploy_done)
@@ -765,7 +708,7 @@ class FirstRunDialog(QDialog):
             nekro_port = int(self.nekro_port_edit.text().strip())
             if not (1 <= nekro_port <= 65535):
                 raise ValueError
-            napcat_port = int(self.config.get("napcat_port") or 6099)
+            napcat_port = normalize_port(self.config.get("napcat_port"), 6099)
             if mode == "napcat":
                 napcat_port = int(self.napcat_port_edit.text().strip())
                 if not (1 <= napcat_port <= 65535):
@@ -853,44 +796,16 @@ class FirstRunDialog(QDialog):
             self._set_deploy_step("cc_sandbox", "done", "已跳过")
 
     def _show_notice_confirm(self, title, text, confirm_text="确认", cancel_text="取消"):
-        from PyQt6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout
-
-        dialog = QDialog(self)
-        dialog.setWindowTitle(title)
-        dialog.setMinimumWidth(380)
-        dialog.setMaximumWidth(500)
-        dialog.setWindowModality(Qt.WindowModality.WindowModal)
-        dialog.setStyleSheet(STYLESHEET)
-
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.setSpacing(14)
-
-        title_label = QLabel(title)
-        title_label.setProperty("role", "dialog_title")
-        title_label.setWordWrap(True)
-        layout.addWidget(title_label)
-
-        desc_label = QLabel(text)
-        desc_label.setProperty("role", "dialog_desc")
-        desc_label.setWordWrap(True)
-        desc_label.setOpenExternalLinks(True)
-        desc_label.setTextFormat(Qt.TextFormat.RichText)
-        desc_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
-        layout.addWidget(desc_label)
-
-        button_row = QHBoxLayout()
-        button_row.addStretch()
-        cancel_button = QPushButton(cancel_text)
-        cancel_button.clicked.connect(dialog.reject)
-        button_row.addWidget(cancel_button)
-        confirm_button = QPushButton(confirm_text)
-        confirm_button.setProperty("role", "primary")
-        confirm_button.clicked.connect(dialog.accept)
-        button_row.addWidget(confirm_button)
-        layout.addLayout(button_row)
-
-        return dialog.exec() == int(QDialog.DialogCode.Accepted)
+        return show_confirm_dialog(
+            self,
+            title,
+            text,
+            confirm_text=confirm_text,
+            cancel_text=cancel_text,
+            rich_text=True,
+            minimum_width=380,
+            maximum_width=500,
+        )
 
     def _set_deploy_stage(self, key, message=""):
         if key in self.deploy_step_order:

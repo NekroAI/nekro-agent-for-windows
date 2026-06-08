@@ -1,22 +1,21 @@
-import os
-
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
-    QDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
-    QProgressBar,
-    QPushButton,
     QScrollArea,
-    QSizePolicy,
-    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from ui.styles import STYLESHEET
-from ui.widgets import SpinnerLabel, StepIndicator, create_install_progress_bar, show_notice_dialog
+from ui.widgets import (
+    CreateRuntimeThread,
+    SpinnerLabel,
+    WizardDialogBase,
+    create_install_progress_bar,
+    make_wizard_button,
+    set_wizard_button_variant,
+)
 
 
 class ScanInstancesThread(QThread):
@@ -58,53 +57,22 @@ class TakeoverThread(QThread):
         self.step_changed.emit(idx, total, desc)
 
 
-class CreateRuntimeThread(QThread):
-    result_ready = pyqtSignal(bool)
-    error_ready = pyqtSignal(str)
-
-    def __init__(self, backend, install_dir):
-        super().__init__()
-        self.backend = backend
-        self.install_dir = install_dir
-
-    def run(self):
-        try:
-            ok = self.backend.create_runtime(self.install_dir)
-        except Exception as e:
-            self.error_ready.emit(str(e))
-            ok = False
-        self.result_ready.emit(ok)
-
-
-class MigrationDialog(QDialog):
+class MigrationDialog(WizardDialogBase):
     """独立的迁移向导对话框，用于发现并接管已有的非启动器部署实例。"""
 
     deploy_requested = pyqtSignal(str, dict)
 
     def __init__(self, backend, config, parent=None, preloaded_instances=None):
-        super().__init__(parent)
+        super().__init__(
+            "Nekro Agent 迁移向导",
+            ["扫描实例", "确认接管", "迁移数据"],
+            parent=parent,
+            size=(700, 580),
+            minimum_size=(640, 520),
+        )
         self.backend = backend
         self.config = config
         self._pending_takeover_instance = None
-
-        self.setWindowTitle("Nekro Agent 迁移向导")
-        self.resize(700, 580)
-        self.setMinimumSize(640, 520)
-        self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint)
-        self.setStyleSheet(STYLESHEET)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(30, 24, 30, 30)
-        layout.setSpacing(0)
-
-        self._step_indicator = StepIndicator(["扫描实例", "确认接管", "迁移数据"], current=0)
-        layout.addWidget(self._step_indicator)
-
-        self.stack = QStackedWidget()
-        layout.addWidget(self.stack)
-
-        self._page_index = {}
-        self._active_threads: list[QThread] = []
 
         self._init_scan_page()
         self._init_found_page()
@@ -126,16 +94,7 @@ class MigrationDialog(QDialog):
     # 基础设施
     # ------------------------------------------------------------------ #
 
-    def _track_thread(self, thread: QThread):
-        self._active_threads.append(thread)
-        thread.finished.connect(lambda _=None, t=thread: self._active_threads.remove(t) if t in self._active_threads else None)
-
-    def reject(self):
-        for thread in list(self._active_threads):
-            if thread.isRunning():
-                thread.quit()
-                thread.wait(3000)
-        self._active_threads.clear()
+    def _disconnect_dialog_signals(self):
         try:
             self.backend.progress_updated.disconnect(self._on_progress)
         except (TypeError, RuntimeError):
@@ -144,25 +103,13 @@ class MigrationDialog(QDialog):
             self.backend.install_error.disconnect(self._on_install_error)
         except (TypeError, RuntimeError):
             pass
-        super().reject()
 
-    def _add_page(self, page: QWidget, name: str):
-        idx = self.stack.addWidget(page)
-        self._page_index[name] = idx
-
-    def _goto_page(self, name: str):
-        self.stack.setCurrentIndex(self._page_index[name])
+    def _page_step(self, name: str) -> int:
         step_map = {"scan": 0, "found_instances": 1, "create_runtime": 1, "progress": 2, "result": 2}
-        step = step_map.get(name, 0)
-        self._step_indicator.set_step(step)
-        self._step_indicator.setVisible(name != "result")
+        return step_map.get(name, 0)
 
-    def _current_page_name(self) -> str:
-        idx = self.stack.currentIndex()
-        for name, i in self._page_index.items():
-            if i == idx:
-                return name
-        return ""
+    def _show_step_indicator_for_page(self, name: str) -> bool:
+        return name != "result"
 
     # ------------------------------------------------------------------ #
     # 页面 1：扫描
@@ -194,11 +141,7 @@ class MigrationDialog(QDialog):
 
         btn_box = QHBoxLayout()
         btn_box.addStretch()
-        self._scan_cancel_btn = QPushButton("取消")
-        self._scan_cancel_btn.setFixedHeight(38)
-        self._scan_cancel_btn.setFixedWidth(100)
-        self._scan_cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._scan_cancel_btn.setObjectName("WizardSecondary")
+        self._scan_cancel_btn = make_wizard_button("取消", "secondary", fixed_height=38, fixed_width=100)
         self._scan_cancel_btn.clicked.connect(self.reject)
         btn_box.addWidget(self._scan_cancel_btn)
         layout.addLayout(btn_box)
@@ -262,19 +205,11 @@ class MigrationDialog(QDialog):
         layout.addWidget(scroll, 1)
 
         btn_box = QHBoxLayout()
-        self._rescan_btn = QPushButton("重新扫描")
-        self._rescan_btn.setFixedHeight(38)
-        self._rescan_btn.setFixedWidth(120)
-        self._rescan_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._rescan_btn.setObjectName("WizardSecondary")
+        self._rescan_btn = make_wizard_button("重新扫描", "secondary", fixed_height=38, fixed_width=120)
         self._rescan_btn.clicked.connect(self._rescan)
         btn_box.addWidget(self._rescan_btn)
         btn_box.addStretch()
-        btn_cancel = QPushButton("取消")
-        btn_cancel.setFixedHeight(38)
-        btn_cancel.setFixedWidth(100)
-        btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_cancel.setObjectName("WizardSecondary")
+        btn_cancel = make_wizard_button("取消", "secondary", fixed_height=38, fixed_width=100)
         btn_cancel.clicked.connect(self.reject)
         btn_box.addWidget(btn_cancel)
         layout.addLayout(btn_box)
@@ -350,23 +285,7 @@ class MigrationDialog(QDialog):
 
         inner.addLayout(info_col, 1)
 
-        btn_takeover = QPushButton("接管此实例")
-        btn_takeover.setFixedHeight(36)
-        btn_takeover.setMinimumWidth(110)
-        btn_takeover.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_takeover.setObjectName("WizardAccent")
-        btn_takeover.setStyleSheet(
-            "QPushButton {"
-            "  background: #1b6db4;"
-            "  color: white;"
-            "  border: none;"
-            "  border-radius: 8px;"
-            "  font-size: 13px;"
-            "  font-weight: 600;"
-            "  padding: 0 14px;"
-            "}"
-            "QPushButton:hover { background: #185f9d; }"
-        )
+        btn_takeover = make_wizard_button("接管此实例", "accent", fixed_height=38, minimum_width=110)
         btn_takeover.clicked.connect(lambda _checked, inst=instance: self._start_takeover(inst))
         inner.addWidget(btn_takeover, 0, Qt.AlignmentFlag.AlignVCenter)
 
@@ -603,20 +522,12 @@ class MigrationDialog(QDialog):
         btn_box = QHBoxLayout()
         btn_box.addStretch()
 
-        self._result_retry_btn = QPushButton("重试")
-        self._result_retry_btn.setFixedHeight(38)
-        self._result_retry_btn.setFixedWidth(100)
-        self._result_retry_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._result_retry_btn.setObjectName("WizardSecondary")
+        self._result_retry_btn = make_wizard_button("重试", "secondary", fixed_height=38, fixed_width=100)
         self._result_retry_btn.clicked.connect(self._retry_takeover)
         self._result_retry_btn.setVisible(False)
         btn_box.addWidget(self._result_retry_btn)
 
-        self._result_action_btn = QPushButton("启动服务")
-        self._result_action_btn.setFixedHeight(38)
-        self._result_action_btn.setFixedWidth(120)
-        self._result_action_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._result_action_btn.setObjectName("WizardPrimary")
+        self._result_action_btn = make_wizard_button("启动服务", fixed_height=38, fixed_width=120)
         self._result_action_btn.clicked.connect(self._on_result_action)
         btn_box.addWidget(self._result_action_btn)
 
@@ -631,15 +542,12 @@ class MigrationDialog(QDialog):
             self._result_icon.setText("✅")
             self._result_retry_btn.setVisible(False)
             self._result_action_btn.setText("启动服务")
-            self._result_action_btn.setObjectName("WizardPrimary")
+            set_wizard_button_variant(self._result_action_btn, "primary")
         else:
             self._result_icon.setText("❌")
             self._result_retry_btn.setVisible(True)
             self._result_action_btn.setText("关闭")
-            self._result_action_btn.setObjectName("WizardSecondary")
-
-        self._result_action_btn.style().unpolish(self._result_action_btn)
-        self._result_action_btn.style().polish(self._result_action_btn)
+            set_wizard_button_variant(self._result_action_btn, "secondary")
 
         self._result_title.setText(title)
         self._result_desc.setText(desc)

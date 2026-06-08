@@ -34,7 +34,13 @@ class WSLRuntimeMixin:
             os.makedirs(install_dir, exist_ok=True)
             self.log_received.emit("[发行版创建] ✓ 安装目录已创建", "info")
         except Exception as e:
-            self.log_received.emit(f"[发行版创建] ✗ 创建目录失败: {e}", "error")
+            detail = (
+                "[发行版创建] 创建安装目录失败\n"
+                f"目录: {install_dir}\n"
+                f"异常: {type(e).__name__}: {e}"
+            )
+            self.log_received.emit(detail, "error")
+            self.install_error.emit(detail)
             return False
 
         self.log_received.emit("[发行版创建] 2/4 下载 Ubuntu rootfs...", "info")
@@ -54,21 +60,44 @@ class WSLRuntimeMixin:
                 creationflags=self._creation_flags(),
             )
             if proc.returncode != 0:
-                stderr_text = self._clean_stderr(proc.stderr, 300)
+                detail = self._format_command_failure(
+                    "[发行版创建] WSL 导入失败",
+                    args=["wsl", "--import", DISTRO_NAME, install_dir, rootfs_path],
+                    timeout=300,
+                    returncode=proc.returncode,
+                    stdout=proc.stdout,
+                    stderr=proc.stderr,
+                )
                 self.progress_updated.emit("导入失败")
-                self.log_received.emit("[发行版创建] ✗ WSL 导入失败", "error")
-                self.log_received.emit(f"返回码: {proc.returncode}", "error")
-                self.log_received.emit(f"STDERR: {stderr_text}", "error")
-                self.install_error.emit(f"WSL 导入失败（返回码 {proc.returncode}）：{stderr_text}")
+                self.log_received.emit(detail, "error")
+                self.install_error.emit(detail)
                 return False
-            self.log_received.emit(f"[发行版创建] ✓ {DISTRO_NAME} 发行版导入完成", "info")
-        except subprocess.TimeoutExpired:
+            self.log_received.emit(
+                f"[发行版创建] ✓ {DISTRO_NAME} 发行版导入完成", "info"
+            )
+        except subprocess.TimeoutExpired as e:
+            detail = self._format_command_failure(
+                "[发行版创建] WSL 导入超时",
+                args=["wsl", "--import", DISTRO_NAME, install_dir, rootfs_path],
+                timeout=300,
+                stdout=e.stdout,
+                stderr=e.stderr,
+                exception=e,
+            )
             self.progress_updated.emit("导入超时")
-            self.log_received.emit("[发行版创建] ✗ 导入超时", "error")
+            self.log_received.emit(detail, "error")
+            self.install_error.emit(detail)
             return False
         except Exception as e:
+            detail = self._format_command_failure(
+                "[发行版创建] WSL 导入异常",
+                args=["wsl", "--import", DISTRO_NAME, install_dir, rootfs_path],
+                timeout=300,
+                exception=e,
+            )
             self.progress_updated.emit(f"导入异常: {e}")
-            self.log_received.emit(f"[发行版创建] ✗ 导入异常: {e}", "error")
+            self.log_received.emit(detail, "error")
+            self.install_error.emit(detail)
             return False
 
         try:
@@ -78,7 +107,9 @@ class WSLRuntimeMixin:
             pass
 
         self.progress_updated.emit("正在配置 WSL 环境...")
-        self.log_received.emit("[发行版创建] 4/4 配置 WSL 环境（隔离 Windows PATH）...", "info")
+        self.log_received.emit(
+            "[发行版创建] 4/4 配置 WSL 环境（隔离 Windows PATH）...", "info"
+        )
         try:
             wsl_conf_content = """[boot]
 systemd = true
@@ -92,7 +123,9 @@ default = root
             self._write_to_wsl(DISTRO_NAME, wsl_conf_content, "/etc/wsl.conf")
             self.log_received.emit("[发行版创建] ✓ WSL 配置完成", "info")
 
-            self.log_received.emit("[发行版创建] 重启 WSL 发行版以启用 systemd...", "info")
+            self.log_received.emit(
+                "[发行版创建] 重启 WSL 发行版以启用 systemd...", "info"
+            )
             subprocess.run(
                 ["wsl", "--terminate", DISTRO_NAME],
                 capture_output=True,
@@ -102,61 +135,86 @@ default = root
             time.sleep(2)
             self.log_received.emit("[发行版创建] ✓ WSL 发行版已重启", "info")
         except Exception as e:
+            detail = (
+                "[发行版创建] 配置 WSL 失败\n"
+                f"发行版: {DISTRO_NAME}\n"
+                f"配置文件: /etc/wsl.conf\n"
+                f"异常: {type(e).__name__}: {e}"
+            )
             self.progress_updated.emit(f"配置 WSL 失败: {e}")
-            self.log_received.emit(f"[发行版创建] ✗ 配置 WSL 失败: {e}", "error")
+            self.log_received.emit(detail, "error")
+            self.install_error.emit(detail)
             return False
 
         if self.config:
-            self.config.set("wsl_distro", DISTRO_NAME)
-            self.config.set("wsl_install_dir", install_dir)
+            if not self.config.set("wsl_distro", DISTRO_NAME):
+                detail = f"[发行版创建] 保存配置失败: {self.config.last_save_error}"
+                self.log_received.emit(detail, "error")
+                self.install_error.emit(detail)
+                return False
+            if not self.config.set("wsl_install_dir", install_dir):
+                detail = f"[发行版创建] 保存安装目录失败: {self.config.last_save_error}"
+                self.log_received.emit(detail, "error")
+                self.install_error.emit(detail)
+                return False
             self.log_received.emit("[发行版创建] ✓ 配置已保存", "info")
 
         self.progress_updated.emit("发行版创建成功！正在安装 Docker...")
-        self.log_received.emit("[发行版创建] ✓ 发行版创建完成！开始安装 Docker...", "info")
+        self.log_received.emit(
+            "[发行版创建] ✓ 发行版创建完成！开始安装 Docker...", "info"
+        )
 
         return self._install_docker_sync()
 
     def _download_rootfs(self, dest_path):
         """下载 Ubuntu rootfs，返回是否成功"""
-        from urllib.error import HTTPError, URLError
         import socket
+        from urllib.error import HTTPError, URLError
 
         last_error = ""
         for url in ROOTFS_URLS:
             try:
                 self.progress_updated.emit("正在下载 Ubuntu rootfs...")
+                self.log_received.emit(f"[发行版创建] 下载 rootfs: {url}", "info")
                 req = Request(url, headers={"User-Agent": "NekroAgent/1.0"})
-                resp = urlopen(req, timeout=60)
+                with urlopen(req, timeout=60) as resp:
 
-                total = resp.headers.get("Content-Length")
-                total = int(total) if total else None
-                downloaded = 0
-                chunk_size = 256 * 1024
+                    total = resp.headers.get("Content-Length")
+                    total = int(total) if total else None
+                    downloaded = 0
+                    chunk_size = 256 * 1024
 
-                with open(dest_path, "wb") as f:
-                    while True:
-                        chunk = resp.read(chunk_size)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if total:
-                            pct = int(downloaded * 100 / total)
-                            mb_done = downloaded / (1024 * 1024)
-                            mb_total = total / (1024 * 1024)
-                            self.progress_updated.emit(f"下载中... {mb_done:.1f} / {mb_total:.1f} MB ({pct}%)")
-                        else:
-                            mb_done = downloaded / (1024 * 1024)
-                            self.progress_updated.emit(f"下载中... {mb_done:.1f} MB")
+                    with open(dest_path, "wb") as f:
+                        while True:
+                            chunk = resp.read(chunk_size)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if total:
+                                pct = int(downloaded * 100 / total)
+                                mb_done = downloaded / (1024 * 1024)
+                                mb_total = total / (1024 * 1024)
+                                self.progress_updated.emit(
+                                    f"下载中... {mb_done:.1f} / {mb_total:.1f} MB ({pct}%)"
+                                )
+                            else:
+                                mb_done = downloaded / (1024 * 1024)
+                                self.progress_updated.emit(f"下载中... {mb_done:.1f} MB")
 
                 self.progress_updated.emit("下载完成")
                 return True
             except HTTPError as e:
                 last_error = f"HTTP {e.code} {e.reason}（{url}）"
-                self.install_error.emit(f"下载源返回错误: {last_error}，尝试下一个源...")
+                self.install_error.emit(
+                    f"下载源返回错误: {last_error}，尝试下一个源..."
+                )
             except URLError as e:
                 reason = str(e.reason)
-                if isinstance(e.reason, socket.timeout) or "timed out" in reason.lower():
+                if (
+                    isinstance(e.reason, socket.timeout)
+                    or "timed out" in reason.lower()
+                ):
                     last_error = f"连接超时（{url}）"
                 elif "Name or service not known" in reason or "getaddrinfo" in reason:
                     last_error = f"DNS 解析失败，请检查网络连接（{url}）"
@@ -166,7 +224,7 @@ default = root
                     last_error = f"网络错误: {reason}（{url}）"
                 self.install_error.emit(f"{last_error}，尝试下一个源...")
             except OSError as e:
-                last_error = f"磁盘写入失败: {e}"
+                last_error = f"磁盘写入失败: {e}；目标文件: {dest_path}"
                 self.install_error.emit(last_error)
                 return False
             except Exception as e:
@@ -174,6 +232,11 @@ default = root
                 self.install_error.emit(f"下载异常: {last_error}，尝试下一个源...")
 
         self.install_error.emit(f"所有下载源均失败，最后错误: {last_error}")
+        try:
+            if os.path.exists(dest_path):
+                os.remove(dest_path)
+        except OSError:
+            pass
         self.progress_updated.emit("所有下载源均失败")
         return False
 
@@ -183,7 +246,7 @@ default = root
         self.progress_updated.emit("正在安装 Docker...")
         self.log_received.emit("[Docker 安装] 开始安装 Docker...", "info")
 
-        def _run_step(cmd, desc, timeout=300):
+        def _run_step(cmd, desc, timeout=300, emit_error=True, log_failure=True):
             try:
                 proc = subprocess.run(
                     ["wsl", "-d", distro, "--", "bash", "-c", cmd],
@@ -191,15 +254,35 @@ default = root
                     timeout=timeout,
                     creationflags=self._creation_flags(),
                 )
-            except subprocess.TimeoutExpired:
-                self.install_error.emit(f"{desc} 超时（>{timeout}s），请检查网络或磁盘")
+            except subprocess.TimeoutExpired as e:
+                detail = self._format_command_failure(
+                    f"[Docker 安装] {desc}超时",
+                    cmd=cmd,
+                    distro=distro,
+                    timeout=timeout,
+                    stdout=e.stdout,
+                    stderr=e.stderr,
+                    exception=e,
+                )
+                if log_failure:
+                    self.log_received.emit(detail, "error")
+                if emit_error:
+                    self.install_error.emit(detail)
                 return False
             if proc.returncode != 0:
-                stderr = self._clean_stderr(proc.stderr)
-                self.log_received.emit(f"[Docker 安装] ✗ {desc}失败", "error")
-                self.log_received.emit(f"[DEBUG] 返回码: {proc.returncode}", "error")
-                self.log_received.emit(f"[DEBUG] STDERR: {stderr}", "error")
-                self.install_error.emit(f"{desc}失败（返回码 {proc.returncode}）: {stderr[:200]}")
+                detail = self._format_command_failure(
+                    f"[Docker 安装] {desc}失败",
+                    cmd=cmd,
+                    distro=distro,
+                    timeout=timeout,
+                    returncode=proc.returncode,
+                    stdout=proc.stdout,
+                    stderr=proc.stderr,
+                )
+                if log_failure:
+                    self.log_received.emit(detail, "error")
+                if emit_error:
+                    self.install_error.emit(detail)
                 return False
             return True
 
@@ -232,6 +315,8 @@ default = root
                     _run_step(
                         "rm -f /etc/apt/sources.list.d/docker.list /etc/apt/keyrings/docker.gpg && apt-get clean",
                         "清理旧源缓存",
+                        emit_error=False,
+                        log_failure=False,
                     )
 
                 add_repo_cmd = (
@@ -242,64 +327,115 @@ default = root
                     f'{docker_mirror}/linux/ubuntu $(lsb_release -cs) stable" '
                     "> /etc/apt/sources.list.d/docker.list"
                 )
-                if not _run_step(add_repo_cmd, "Docker 源配置"):
-                    self.log_received.emit(f"[Docker 安装] ⚠ {mirror_name} 源配置失败，尝试下一个源...", "warn")
+                if not _run_step(add_repo_cmd, "Docker 源配置", emit_error=False):
+                    self.install_error.emit(
+                        f"{mirror_name}源下载失败，正在尝试下一个源..."
+                    )
+                    self.log_received.emit(
+                        f"[Docker 安装] ⚠ {mirror_name} 源配置失败，尝试下一个源...",
+                        "warn",
+                    )
                     continue
-                self.log_received.emit(f"[Docker 安装] ✓ Docker 源配置完成（{mirror_name}）", "info")
+                self.log_received.emit(
+                    f"[Docker 安装] ✓ Docker 源配置完成（{mirror_name}）", "info"
+                )
 
                 self.progress_updated.emit(f"安装 Docker CE ({mirror_name})...")
-                self.log_received.emit("[Docker 安装] 3/5 安装 Docker CE + Compose 插件...", "info")
+                self.log_received.emit(
+                    "[Docker 安装] 3/5 安装 Docker CE + Compose 插件...", "info"
+                )
                 if _run_step(
-                    "apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin",
+                    "apt-get update && apt-get install -y "
+                    "docker-ce docker-ce-cli containerd.io "
+                    "docker-buildx-plugin docker-compose-plugin",
                     "Docker CE 安装",
                     timeout=600,
+                    emit_error=False,
                 ):
                     self.log_received.emit("[Docker 安装] ✓ Docker CE 安装完成", "info")
                     installed = True
                     break
                 else:
-                    self.log_received.emit(f"[Docker 安装] ⚠ {mirror_name} 安装失败，尝试下一个源...", "warn")
+                    self.install_error.emit(
+                        f"{mirror_name}源安装失败，正在尝试下一个源..."
+                    )
+                    self.log_received.emit(
+                        f"[Docker 安装] ⚠ {mirror_name} 安装失败，尝试下一个源...",
+                        "warn",
+                    )
 
             if not installed:
-                self.log_received.emit("[Docker 安装] ✗ 所有镜像源均失败", "error")
+                detail = (
+                    "所有 Docker 软件源均失败。\n"
+                    "已尝试: "
+                    + "、".join(name for name, _url in docker_mirrors)
+                    + "\n请检查网络、DNS、代理或稍后重试。"
+                )
+                self.log_received.emit(detail, "error")
+                self.install_error.emit(detail)
                 return False
 
             self.progress_updated.emit("配置镜像加速器...")
-            self.log_received.emit("[Docker 安装] 4/5 配置 Docker 镜像加速器...", "info")
+            self.log_received.emit(
+                "[Docker 安装] 4/5 配置 Docker 镜像加速器...", "info"
+            )
             daemon_json = (
                 '{"registry-mirrors":['
                 '"https://docker.m.daocloud.io",'
                 '"https://docker.1ms.run",'
-                '"https://ccr.ccs.tencentyun.com"'
+                '"https://ccr.ccs.tencentyun.com",'
+                '"https://docker.jiaxin.site",'
+                '"https://docker.xuanyuan.me",'
+                '"http://kubesre.xyz"'
                 ']}'
             )
             if not _run_step(
                 f"mkdir -p /etc/docker && echo '{daemon_json}' > /etc/docker/daemon.json",
                 "镜像加速器配置",
             ):
-                self.log_received.emit("[Docker 安装] ⚠ 镜像加速器配置失败，将使用默认源", "warn")
+                self.log_received.emit(
+                    "[Docker 安装] ⚠ 镜像加速器配置失败，将使用默认源", "warn"
+                )
             else:
                 self.log_received.emit("[Docker 安装] ✓ 镜像加速器配置完成", "info")
 
             self.progress_updated.emit("启动 Docker 服务...")
             self.log_received.emit("[Docker 安装] 5/5 启动 Docker 服务...", "info")
-            if not _run_step("systemctl daemon-reload && systemctl restart docker", "Docker 服务启动", timeout=60):
+            if not _run_step(
+                "systemctl daemon-reload && systemctl restart docker",
+                "Docker 服务启动",
+                timeout=60,
+            ):
                 return False
             self.log_received.emit("[Docker 安装] ✓ Docker 服务已启动", "info")
 
             self.log_received.emit("[Docker 安装] 等待 Docker daemon 就绪...", "info")
             time.sleep(2)
+            if not _run_step("docker info >/dev/null", "Docker daemon 就绪检查", timeout=30):
+                return False
 
             self.progress_updated.emit("Docker 安装完成！")
             self.log_received.emit("[Docker 安装] ✓ Docker 安装完成！", "info")
             return True
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as e:
+            detail = self._format_command_failure(
+                "[Docker 安装] Docker 安装超时",
+                distro=distro,
+                exception=e,
+            )
             self.progress_updated.emit("Docker 安装超时")
-            self.log_received.emit("[Docker 安装] ✗ Docker 安装超时", "error")
+            self.log_received.emit(detail, "error")
+            self.install_error.emit(detail)
             return False
         except Exception as e:
+            detail = (
+                "[Docker 安装] Docker 安装异常\n"
+                f"发行版: {distro}\n"
+                f"异常: {type(e).__name__}: {e}"
+            )
             self.progress_updated.emit(f"Docker 安装异常: {e}")
-            self.log_received.emit(f"[Docker 安装] ✗ Docker 安装异常: {e}", "error")
+            self.log_received.emit(detail, "error")
+            self.install_error.emit(detail)
             return False
 
     def remove_distro(self):
@@ -312,16 +448,26 @@ default = root
                 creationflags=self._creation_flags(),
             )
             if proc.returncode != 0:
-                stderr_text = self._clean_stderr(proc.stderr, 300)
-                if stderr_text:
-                    self.log_received.emit(f"删除发行版失败: {stderr_text}", "error")
-                else:
-                    self.log_received.emit(f"删除发行版失败，返回码: {proc.returncode}", "error")
+                detail = self._format_command_failure(
+                    "删除 WSL 发行版失败",
+                    args=["wsl", "--unregister", DISTRO_NAME],
+                    timeout=30,
+                    returncode=proc.returncode,
+                    stdout=proc.stdout,
+                    stderr=proc.stderr,
+                )
+                self.log_received.emit(detail, "error")
                 return False
             self.log_received.emit(f"已删除 WSL 发行版 {DISTRO_NAME}", "info")
             return True
         except Exception as e:
-            self.log_received.emit(f"删除发行版失败: {e}", "error")
+            detail = self._format_command_failure(
+                "删除 WSL 发行版异常",
+                args=["wsl", "--unregister", DISTRO_NAME],
+                timeout=30,
+                exception=e,
+            )
+            self.log_received.emit(detail, "error")
             return False
 
     def install_wsl(self):
@@ -338,10 +484,17 @@ default = root
                 None,
                 1,
             )
-            self.log_received.emit("WSL2 安装已启动，安装完成后将在 60 秒后自动重启", "info")
+            self.log_received.emit(
+                "WSL2 安装已启动，安装完成后将在 60 秒后自动重启", "info"
+            )
             return True
         except Exception as e:
-            self.log_received.emit(f"WSL2 安装启动失败: {e}", "error")
+            self.log_received.emit(
+                "WSL2 安装启动失败\n"
+                "动作: 以管理员权限执行 wsl --install --no-distribution\n"
+                f"异常: {type(e).__name__}: {e}",
+                "error",
+            )
             return False
 
     def install_docker(self):
@@ -359,7 +512,9 @@ default = root
                 self.log_received.emit("Docker 安装完成", "info")
             else:
                 self.log_received.emit("Docker 安装失败", "error")
-            self.progress_updated.emit("__docker_done__" if success else "__docker_fail__")
+            self.progress_updated.emit(
+                "__docker_done__" if success else "__docker_fail__"
+            )
 
         threading.Thread(target=_do_install, daemon=True).start()
         return True

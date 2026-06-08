@@ -5,6 +5,7 @@ import subprocess
 import threading
 import time
 
+from core.port_utils import normalize_port
 from core.wsl.constants import CC_SANDBOX_IMAGE, DISTRO_NAME, STABLE_IMAGE
 
 
@@ -71,15 +72,45 @@ class WSLDeployMixin:
         compose_src = self._launcher_data_path(compose_file)
         env_src = self._launcher_data_path("env")
         if not os.path.exists(compose_src):
-            _log(f"Compose 文件不存在: {compose_src}", "error")
+            _log(
+                "Compose 模板文件不存在\n"
+                f"模板: {compose_src}\n"
+                f"部署模式: {deploy_mode}\n"
+                f"实例: {inst_display}",
+                "error",
+            )
+            return False
+        if not os.path.exists(env_src):
+            _log(
+                "环境变量模板文件不存在\n"
+                f"模板: {env_src}\n"
+                f"实例: {inst_display}",
+                "error",
+            )
             return False
 
         compose_dest = f"{deploy_dir}/docker-compose.yml"
         env_dest = f"{deploy_dir}/.env"
 
         self.progress_updated.emit("__deploy_progress__|config|准备部署目录和配置文件")
-        self._wsl_exec(distro, f"mkdir -p {shlex.quote(deploy_dir)}")
-        self._wsl_exec(distro, f"mkdir -p {shlex.quote(data_dir)}")
+        try:
+            self._run_wsl_checked(
+                distro,
+                f"mkdir -p {shlex.quote(deploy_dir)}",
+                action="[部署] 创建部署目录失败",
+                timeout=30,
+            )
+            self._run_wsl_checked(
+                distro,
+                f"mkdir -p {shlex.quote(data_dir)}",
+                action="[部署] 创建数据目录失败",
+                timeout=30,
+            )
+        except RuntimeError as e:
+            _log(str(e), "error")
+            if emit_status:
+                self.status_changed.emit("启动失败")
+            return False
 
         env_exists = self._wsl_exec(
             distro, f"test -f {shlex.quote(env_dest)} && echo yes"
@@ -124,8 +155,14 @@ class WSLDeployMixin:
         elif env_exists == "yes":
             _log("检测到部署配置发生变化，将重建 Compose 服务以应用新配置")
 
-        self._write_to_wsl(distro, compose_content, compose_dest)
-        self._write_to_wsl(distro, env_content, env_dest)
+        try:
+            self._write_to_wsl(distro, compose_content, compose_dest)
+            self._write_to_wsl(distro, env_content, env_dest)
+        except RuntimeError as e:
+            _log(f"[部署] 写入 Compose/.env 失败\n{e}", "error")
+            if emit_status:
+                self.status_changed.emit("启动失败")
+            return False
 
         ls_output = self._wsl_exec(distro, f"ls -la {shlex.quote(deploy_dir)}")
         _log(f"部署目录内容:\n{ls_output}", "debug")
@@ -133,13 +170,36 @@ class WSLDeployMixin:
 
         self.progress_updated.emit("__deploy_progress__|docker|确保 Docker 服务启动")
         _log("确保 Docker 服务启动...")
-        self._wsl_exec(distro, "systemctl start docker", timeout=30)
+        try:
+            self._run_wsl_checked(
+                distro,
+                "systemctl start docker",
+                action="[部署] 启动 Docker 服务失败",
+                timeout=30,
+            )
 
-        docker_version = self._wsl_exec(distro, "docker version")
-        _log(f"Docker 版本:\n{docker_version}", "debug")
+            docker_proc = self._run_wsl_checked(
+                distro,
+                "docker version",
+                action="[部署] Docker 版本检查失败",
+                timeout=30,
+            )
+            docker_version = self._clean_command_output(docker_proc.stdout)
+            _log(f"Docker 版本:\n{docker_version}", "debug")
 
-        compose_version = self._wsl_exec(distro, "docker compose version")
-        _log(f"Docker Compose 版本: {compose_version}", "debug")
+            compose_proc = self._run_wsl_checked(
+                distro,
+                "docker compose version",
+                action="[部署] Docker Compose 版本检查失败",
+                timeout=30,
+            )
+            compose_version = self._clean_command_output(compose_proc.stdout)
+            _log(f"Docker Compose 版本: {compose_version}", "debug")
+        except RuntimeError as e:
+            _log(str(e), "error")
+            if emit_status:
+                self.status_changed.emit("启动失败")
+            return False
 
         self.progress_updated.emit("__deploy_progress__|images|检查必需镜像")
         missing = self._get_missing_images(
@@ -193,26 +253,19 @@ class WSLDeployMixin:
         compose_cmd = "docker compose -f docker-compose.yml --env-file .env up -d --remove-orphans"
         if not reuse_existing_runtime:
             compose_cmd = f"{compose_cmd} --force-recreate"
-        proc = subprocess.run(
-            [
-                "wsl",
-                "-d",
+        try:
+            proc = self._run_wsl_checked(
                 distro,
-                "--",
-                "bash",
-                "-c",
-                f"cd {shlex.quote(deploy_dir)} && {compose_cmd}",
-            ],
-            capture_output=True,
-            timeout=120,
-            creationflags=self._creation_flags(),
-        )
-        if proc.returncode != 0:
-            _log(f"返回码: {proc.returncode}", "error")
-            _log(f"部署目录: {deploy_dir}", "error")
-            _log(f"STDOUT:\n{self._clean_stderr(proc.stdout, 0)}", "error")
-            _log(f"STDERR:\n{self._clean_stderr(proc.stderr, 0)}", "error")
-            _log("Compose 启动失败，详见上方日志", "error")
+                compose_cmd,
+                action="[部署] Docker Compose 启动失败",
+                cwd=deploy_dir,
+                timeout=120,
+            )
+            compose_output = self._clean_command_output(proc.stdout)
+            if compose_output:
+                _log(f"Compose 输出:\n{compose_output}", "debug")
+        except RuntimeError as e:
+            _log(str(e), "error")
             if emit_status:
                 self.status_changed.emit("启动失败")
             return False
@@ -249,7 +302,10 @@ class WSLDeployMixin:
                 daemon=True,
             ).start()
         if attach_health:
-            nekro_port = int(deploy_info.get("port") or inst.get("nekro_port") or 8021)
+            nekro_port = normalize_port(
+                deploy_info.get("port") or inst.get("nekro_port"),
+                8021,
+            )
             threading.Thread(
                 target=self._health_check, args=(nekro_port,), daemon=True
             ).start()
@@ -463,34 +519,45 @@ class WSLDeployMixin:
                         if isinstance(check_result.stdout, bytes)
                         else check_result.stdout
                     )
-                except Exception:
+                    if check_result.returncode != 0:
+                        self.log_received.emit(
+                            self._format_command_failure(
+                                f"{log_prefix}检查 Compose 文件失败",
+                                cmd=compose_check,
+                                distro=distro,
+                                timeout=10,
+                                returncode=check_result.returncode,
+                                stdout=check_result.stdout,
+                                stderr=check_result.stderr,
+                            ),
+                            "debug",
+                        )
+                except Exception as e:
+                    self.log_received.emit(
+                        self._format_command_failure(
+                            f"{log_prefix}检查 Compose 文件异常",
+                            cmd=compose_check,
+                            distro=distro,
+                            timeout=10,
+                            exception=e,
+                        ),
+                        "debug",
+                    )
                     pass
 
                 if has_compose:
-                    stop_proc = subprocess.run(
-                        [
-                            "wsl",
-                            "-d",
+                    try:
+                        self._run_wsl_checked(
                             distro,
-                            "--",
-                            "bash",
-                            "-c",
-                            f"cd {shlex.quote(deploy_dir)} && docker compose -f docker-compose.yml stop",
-                        ],
-                        capture_output=True,
-                        timeout=60,
-                        creationflags=self._creation_flags(),
-                    )
-                    if stop_proc.returncode != 0:
-                        stderr_text = self._clean_stderr(stop_proc.stderr, 0)
-                        stdout_text = self._clean_command_output(stop_proc.stdout, 0)
-                        detail = (
-                            stderr_text
-                            or stdout_text
-                            or f"返回码: {stop_proc.returncode}"
+                            "docker compose -f docker-compose.yml stop",
+                            action=f"{log_prefix}停止 Compose 服务失败",
+                            cwd=deploy_dir,
+                            timeout=60,
                         )
+                    except RuntimeError as e:
                         self.log_received.emit(
-                            f"{log_prefix}停止 Compose 服务失败: {detail}", "error"
+                            str(e),
+                            "error",
                         )
                         _restore_runtime_state()
                         self.status_changed.emit("停止失败")
@@ -505,12 +572,14 @@ class WSLDeployMixin:
                 self.log_received.emit(f"{log_prefix}服务已停止", "info")
 
                 self.status_changed.emit("已停止")
-            except subprocess.TimeoutExpired:
-                self.log_received.emit(f"{log_prefix}停止服务超时", "warn")
-                _restore_runtime_state()
-                self.status_changed.emit("停止失败")
             except Exception as e:
-                self.log_received.emit(f"{log_prefix}停止服务异常: {e}", "error")
+                detail = (
+                    f"{log_prefix}停止服务异常\n"
+                    f"发行版: {distro}\n"
+                    f"部署目录: {deploy_dir}\n"
+                    f"异常: {type(e).__name__}: {e}"
+                )
+                self.log_received.emit(detail, "error")
                 _restore_runtime_state()
                 self.status_changed.emit("停止失败")
 
@@ -557,7 +626,30 @@ class WSLDeployMixin:
                             else check_result.stdout
                         )
                         has_compose = "yes" in stdout
-                    except Exception:
+                        if check_result.returncode != 0:
+                            self.log_received.emit(
+                                self._format_command_failure(
+                                    f"{prefix}检查 Compose 文件失败",
+                                    cmd=compose_check,
+                                    distro=distro,
+                                    timeout=10,
+                                    returncode=check_result.returncode,
+                                    stdout=check_result.stdout,
+                                    stderr=check_result.stderr,
+                                ),
+                                "debug",
+                            )
+                    except Exception as e:
+                        self.log_received.emit(
+                            self._format_command_failure(
+                                f"{prefix}检查 Compose 文件异常",
+                                cmd=compose_check,
+                                distro=distro,
+                                timeout=10,
+                                exception=e,
+                            ),
+                            "debug",
+                        )
                         pass
 
                     if not has_compose:
@@ -567,26 +659,16 @@ class WSLDeployMixin:
                         continue
 
                     self.log_received.emit(f"{prefix}正在停止 Compose 服务...", "info")
-                    stop_proc = subprocess.run(
-                        [
-                            "wsl",
-                            "-d",
+                    try:
+                        self._run_wsl_checked(
                             distro,
-                            "--",
-                            "bash",
-                            "-c",
-                            f"cd {shlex.quote(deploy_dir)} && docker compose -f docker-compose.yml stop",
-                        ],
-                        capture_output=True,
-                        timeout=60,
-                        creationflags=self._creation_flags(),
-                    )
-                    if stop_proc.returncode != 0:
-                        stderr_text = self._clean_stderr(stop_proc.stderr, 0)
-                        stdout_text = self._clean_command_output(stop_proc.stdout, 0)
-                        failed.append(
-                            f"{name}: {stderr_text or stdout_text or stop_proc.returncode}"
+                            "docker compose -f docker-compose.yml stop",
+                            action=f"{prefix}停止 Compose 服务失败",
+                            cwd=deploy_dir,
+                            timeout=60,
                         )
+                    except RuntimeError as e:
+                        failed.append(f"{name}:\n{e}")
                     else:
                         self.log_received.emit(f"{prefix}服务已停止", "info")
 
@@ -602,15 +684,15 @@ class WSLDeployMixin:
                 self.is_running = False
                 self.log_received.emit("所有实例服务已停止", "info")
                 self.status_changed.emit("已停止")
-            except subprocess.TimeoutExpired:
-                self.is_running = True
-                self._stop_event.clear()
-                self.log_received.emit("停止所有实例超时", "error")
-                self.status_changed.emit("停止失败")
             except Exception as e:
                 self.is_running = True
                 self._stop_event.clear()
-                self.log_received.emit(f"停止所有实例异常: {e}", "error")
+                self.log_received.emit(
+                    "停止所有实例异常\n"
+                    f"发行版: {distro}\n"
+                    f"异常: {type(e).__name__}: {e}",
+                    "error",
+                )
                 self.status_changed.emit("停止失败")
 
         threading.Thread(target=_do_stop_all, daemon=True).start()
@@ -635,16 +717,32 @@ class WSLDeployMixin:
                 deploy_dir, _, _ = self._get_active_deploy_paths()
 
                 self.log_received.emit("[卸载] 1/3 停止并删除容器...", "info")
-                self._wsl_exec(
-                    distro,
-                    f"cd {shlex.quote(deploy_dir)} && docker compose -f docker-compose.yml down -v 2>/dev/null; "
-                    "docker system prune -af 2>/dev/null",
-                    timeout=120,
-                )
+                try:
+                    self._run_wsl_checked(
+                        distro,
+                        (
+                            "if [ -f docker-compose.yml ]; then "
+                            "docker compose -f docker-compose.yml down -v; "
+                            "fi; docker system prune -af"
+                        ),
+                        action="[卸载] 停止并删除容器失败",
+                        cwd=deploy_dir,
+                        timeout=120,
+                    )
+                except RuntimeError as e:
+                    self.log_received.emit(
+                        f"[卸载] ⚠ 容器清理失败，将继续删除发行版\n{e}",
+                        "warn",
+                    )
                 self.log_received.emit("[卸载] ✓ 容器已清除", "info")
 
                 self.log_received.emit("[卸载] 2/3 清理部署文件...", "info")
-                self._wsl_exec(distro, f"rm -rf {shlex.quote(deploy_dir)}")
+                self._run_wsl_checked(
+                    distro,
+                    f"rm -rf {shlex.quote(deploy_dir)}",
+                    action="[卸载] 清理部署文件失败",
+                    timeout=30,
+                )
                 self.log_received.emit("[卸载] ✓ 部署文件已清理", "info")
 
                 self.log_received.emit("[卸载] 3/3 删除 WSL 发行版...", "info")
@@ -664,7 +762,12 @@ class WSLDeployMixin:
 
                 self.status_changed.emit("已卸载")
             except Exception as e:
-                self.log_received.emit(f"卸载异常: {e}", "error")
+                self.log_received.emit(
+                    "卸载异常\n"
+                    f"发行版: {distro}\n"
+                    f"异常: {type(e).__name__}: {e}",
+                    "error",
+                )
                 self.status_changed.emit("卸载失败")
 
         threading.Thread(target=_do_uninstall, daemon=True).start()
@@ -693,13 +796,38 @@ class WSLDeployMixin:
                         if isinstance(check_result.stdout, bytes)
                         else check_result.stdout
                     )
-                except Exception:
+                    if check_result.returncode != 0:
+                        self.log_received.emit(
+                            self._format_command_failure(
+                                f"[移除 {name}] 检查 Compose 文件失败",
+                                cmd=compose_check,
+                                distro=distro,
+                                timeout=10,
+                                returncode=check_result.returncode,
+                                stdout=check_result.stdout,
+                                stderr=check_result.stderr,
+                            ),
+                            "debug",
+                        )
+                except Exception as e:
+                    self.log_received.emit(
+                        self._format_command_failure(
+                            f"[移除 {name}] 检查 Compose 文件异常",
+                            cmd=compose_check,
+                            distro=distro,
+                            timeout=10,
+                            exception=e,
+                        ),
+                        "debug",
+                    )
                     has_compose = False
 
                 if has_compose:
-                    self._wsl_exec(
+                    self._run_wsl_checked(
                         distro,
-                        f"cd {shlex.quote(deploy_dir)} && docker compose -f docker-compose.yml down -v 2>/dev/null",
+                        "docker compose -f docker-compose.yml down -v",
+                        action=f"[移除 {name}] 停止并删除容器失败",
+                        cwd=deploy_dir,
                         timeout=60,
                     )
                     self.log_received.emit(f"[移除 {name}] ✓ 容器已停止并清除", "info")
@@ -710,12 +838,21 @@ class WSLDeployMixin:
 
                 self.log_received.emit(f"[移除 {name}] 2/2 清理部署目录...", "info")
                 if deploy_dir:
-                    self._wsl_exec(
-                        distro, f"rm -rf {shlex.quote(deploy_dir)}", timeout=30
+                    self._run_wsl_checked(
+                        distro,
+                        f"rm -rf {shlex.quote(deploy_dir)}",
+                        action=f"[移除 {name}] 清理部署目录失败",
+                        timeout=30,
                     )
                 self.log_received.emit(f"[移除 {name}] ✓ 实例已移除", "info")
             except Exception as e:
-                self.log_received.emit(f"[移除 {name}] 异常: {e}", "error")
+                self.log_received.emit(
+                    f"[移除 {name}] 异常\n"
+                    f"发行版: {distro}\n"
+                    f"部署目录: {deploy_dir or '<empty>'}\n"
+                    f"异常: {type(e).__name__}: {e}",
+                    "error",
+                )
                 success = False
 
             self.instance_removed.emit(success, inst_id, was_active)
@@ -980,31 +1117,23 @@ class WSLDeployMixin:
                         configured_accounts.append(account)
 
                 deploy_dir, _, _ = self._get_active_deploy_paths()
-                proc = subprocess.run(
-                    [
-                        "wsl",
-                        "-d",
+                try:
+                    self._run_wsl_checked(
                         distro,
-                        "--",
-                        "bash",
-                        "-c",
-                        f'cd {shlex.quote(deploy_dir)} && docker compose -f docker-compose.yml restart nekro_napcat',
-                    ],
-                    capture_output=True,
-                    timeout=60,
-                    creationflags=self._creation_flags(),
-                )
-
-                if proc.returncode != 0:
-                    stderr_text = self._clean_stderr(proc.stderr, 0)
+                        "docker compose -f docker-compose.yml restart nekro_napcat",
+                        action="[NapCat 配网] 重启 NapCat 服务失败",
+                        cwd=deploy_dir,
+                        timeout=60,
+                    )
+                except RuntimeError as e:
                     self.log_received.emit(
                         "NapCat 配置文件已写入，但重启 NapCat 失败", "warn"
                     )
-                    if stderr_text:
-                        self.log_received.emit(stderr_text, "debug")
+                    self.log_received.emit(str(e), "debug")
                     _emit(
                         "restart_failed",
-                        "NapCat 配置已写入，但重启服务失败，请手动重启 NapCat 后再验证。",
+                        "NapCat 配置已写入，但重启服务失败，请手动重启 NapCat 后再验证。\n\n"
+                        + str(e),
                         backup_dir=backup_dir,
                     )
                     return
