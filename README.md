@@ -1,6 +1,6 @@
-# Nekro-Agent for Windows
+# Nekro Agent启动器
 
-基于 PyQt6 的 Windows 桌面启动器，用于在 Windows 上通过 WSL2 和 Docker Compose 安装、启动、更新和维护 [Nekro Agent](https://github.com/KroMiose/nekro-agent)。
+Nekro Agent启动器是基于 PyQt6 的 Windows 桌面启动器，用于在 Windows 上通过 WSL2 和 Docker Compose 安装、启动、更新和维护 [Nekro Agent](https://github.com/KroMiose/nekro-agent)。
 
 当前文档对应版本：`v1.3.0`
 

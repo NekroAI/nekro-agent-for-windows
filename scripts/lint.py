@@ -173,9 +173,17 @@ def check_line_endings_and_whitespace():
 
 def check_git_diff():
     proc = subprocess.run(
-        ["git", "diff", "--check"],
+        [
+            "git",
+            "-c",
+            "core.whitespace=trailing-space,space-before-tab,cr-at-eol",
+            "diff",
+            "--check",
+        ],
         cwd=ROOT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         capture_output=True,
     )
     output = (proc.stdout or "") + (proc.stderr or "")

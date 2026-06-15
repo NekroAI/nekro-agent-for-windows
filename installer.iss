@@ -1,8 +1,8 @@
 ; =========================
-; Nekro Agent 安装脚本
+; Nekro Agent启动器安装脚本
 ; =========================
 
-#define MyAppName "Nekro Agent"
+#define MyAppName "Nekro Agent启动器"
 #define MyAppPublisher "Nekro AI"
 #define MyAppExeName "NekroAgent.exe"
 
@@ -38,7 +38,7 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 VersionInfoVersion={#MyAppVersion}
 VersionInfoProductVersion={#MyAppVersion}
 VersionInfoCompany={#MyAppPublisher}
-VersionInfoDescription={#MyAppName} Installer
+VersionInfoDescription={#MyAppName}
 VersionInfoProductName={#MyAppName}
 VersionInfoCopyright=Copyright (C) 2025 {#MyAppPublisher}
 
@@ -59,7 +59,7 @@ Name: "{group}\卸载 {#MyAppName}";     Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}";    Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-; runasoriginaluser: 即使安装器以 admin 运行，也用原始用户身份启动程序
+; runasoriginaluser: 即使启动器安装流程以 admin 运行，也用原始用户身份启动程序
 Filename: "{app}\{#MyAppExeName}"; Description: "启动 {#MyAppName}"; \
     Flags: nowait postinstall skipifsilent runasoriginaluser
 

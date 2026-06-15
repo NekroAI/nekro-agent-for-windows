@@ -186,7 +186,7 @@ class SettingsPage(QWidget):
         parent_layout.addWidget(card, row, column)
 
     def _build_about_card(self, parent_layout, row, column):
-        card = SectionCard("关于启动器", f"Nekro Agent Windows 启动器 v{APP_VERSION}")
+        card = SectionCard("关于启动器", f"Nekro Agent启动器 v{APP_VERSION}")
         card_layout = card.body_layout()
 
         version_row = QHBoxLayout()

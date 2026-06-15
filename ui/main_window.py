@@ -179,7 +179,7 @@ class BrowserTabBar(QTabBar):
 class MainWindow(QMainWindow):
     def __init__(self, splash=None):
         super().__init__()
-        self.setWindowTitle("Nekro Agent 启动器")
+        self.setWindowTitle("Nekro Agent启动器")
         self.resize(1220, 820)
         self.setMinimumSize(880, 620)
         self.setStyleSheet(STYLESHEET)
