@@ -228,6 +228,8 @@ class SplashScreen(QWidget):
             return
 
         _, phase, message = parts
+        stage_match = re.match(r"^(\d+)/(\d+)\|(.+)$", message)
+        stage_message = stage_match.group(3) if stage_match else message
 
         if phase == "start":
             self._deploy_stage = "pulling"
@@ -235,6 +237,13 @@ class SplashScreen(QWidget):
             self._pull_total = 0
             self._pull_done = 0
             self._set_progress(0.20)
+
+        elif phase == "speedtest":
+            self._deploy_stage = "speedtest"
+            self._status_text = stage_message or "正在测速镜像源..."
+            self._pull_total = 0
+            self._pull_done = 0
+            self._set_progress(0.18)
 
         elif phase == "update":
             layer_match = re.match(r"^([a-f0-9]{6,64}):\s*(.+)$", message, re.IGNORECASE)
@@ -252,7 +261,7 @@ class SplashScreen(QWidget):
                     self._status_text = f"拉取镜像层 {self._pull_done}/{self._pull_total}..."
 
         elif phase == "stage":
-            self._status_text = message or "正在拉取镜像..."
+            self._status_text = stage_message or "正在拉取镜像..."
             self._pull_total = 0
             self._pull_done = 0
 

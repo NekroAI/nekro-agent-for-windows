@@ -1,0 +1,121 @@
+import unittest
+
+from core.wsl.images import WSLImageMixin
+
+
+class _Signal:
+    def __init__(self):
+        self.messages = []
+
+    def emit(self, *args):
+        self.messages.append(args)
+
+
+class _DummyImages(WSLImageMixin):
+    _DOCKER_PROXY_REGISTRIES = ("slow.test", "fast.test")
+
+    def __init__(self):
+        self.log_received = _Signal()
+        self.progress = []
+        self.pulls = []
+        self.retags = []
+
+    def _emit_pull_progress(self, phase, message):
+        self.progress.append((phase, message))
+
+    def _probe_pull_candidate(self, distro, candidate):
+        latencies = {
+            "slow.test": 200,
+            "fast.test": 50,
+            "Docker Hub": 500,
+        }
+        return True, latencies[candidate.source], ""
+
+    def _pull_image_once(self, distro, image_ref):
+        self.pulls.append(image_ref)
+        return True, ["pull ok"]
+
+    def _retag_pulled_image(self, distro, source_ref, target_ref):
+        self.retags.append((source_ref, target_ref))
+        return True, ""
+
+
+class WSLImageMixinTests(unittest.TestCase):
+    def test_normalize_image_ref_adds_latest_tag(self):
+        self.assertEqual(
+            WSLImageMixin._normalize_image_ref("mlikiowa/napcat-docker"),
+            "mlikiowa/napcat-docker:latest",
+        )
+
+    def test_docker_hub_repo_tag_adds_library_namespace(self):
+        self.assertEqual(
+            WSLImageMixin._docker_hub_repo_tag("postgres:14"),
+            "library/postgres:14",
+        )
+
+    def test_docker_hub_repo_tag_keeps_namespace_and_latest(self):
+        self.assertEqual(
+            WSLImageMixin._docker_hub_repo_tag("kromiose/nekro-agent-sandbox"),
+            "kromiose/nekro-agent-sandbox:latest",
+        )
+
+    def test_docker_hub_repo_tag_strips_docker_io_registry(self):
+        self.assertEqual(
+            WSLImageMixin._docker_hub_repo_tag("docker.io/library/postgres:14"),
+            "library/postgres:14",
+        )
+
+    def test_docker_hub_repo_tag_rejects_non_hub_registry(self):
+        self.assertEqual(
+            WSLImageMixin._docker_hub_repo_tag("ghcr.io/example/app:1"),
+            "",
+        )
+
+    def test_proxy_image_ref_concatenates_registry_and_repo_tag(self):
+        self.assertEqual(
+            WSLImageMixin._proxy_image_ref("docker.1ms.run", "postgres:14"),
+            "docker.1ms.run/library/postgres:14",
+        )
+
+    def test_rank_pull_candidates_prefers_fastest_probe(self):
+        candidates = _DummyImages()._rank_pull_candidates("NekroAgent", "postgres:14")
+
+        self.assertEqual(candidates[0].source, "fast.test")
+        self.assertEqual(candidates[0].pull_ref, "fast.test/library/postgres:14")
+        self.assertEqual(candidates[0].final_ref, "postgres:14")
+
+    def test_pull_images_emits_speedtest_before_pull_stage(self):
+        backend = _DummyImages()
+
+        self.assertTrue(backend._pull_images("NekroAgent", ["postgres:14"]))
+
+        self.assertEqual(
+            backend.progress[0],
+            ("speedtest", "1/1|测速镜像源 (1/1): postgres:14"),
+        )
+        self.assertEqual(backend.progress[1][0], "stage")
+        self.assertIn(
+            "拉取镜像 (1/1) [fast.test (50ms)]: postgres:14",
+            backend.progress[1][1],
+        )
+        self.assertEqual(backend.progress[-1], ("done", "所有镜像拉取完成"))
+        self.assertEqual(backend.pulls, ["fast.test/library/postgres:14"])
+        self.assertEqual(
+            backend.retags,
+            [("fast.test/library/postgres:14", "postgres:14")],
+        )
+
+    def test_speedtest_results_are_reused_by_pull_images(self):
+        backend = _DummyImages()
+
+        result = backend.speedtest_pull_sources("NekroAgent", ["postgres:14"])
+        backend.progress.clear()
+
+        self.assertEqual(result["images"][0]["best_source"], "fast.test")
+        self.assertTrue(backend._pull_images("NekroAgent", ["postgres:14"]))
+        self.assertEqual(backend.progress[0][0], "stage")
+        self.assertNotIn("speedtest", [phase for phase, _message in backend.progress])
+
+
+if __name__ == "__main__":
+    unittest.main()

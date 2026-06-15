@@ -4,7 +4,12 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from ui.widgets import SectionCard, SPINNER_FRAMES, make_secondary_button
+from ui.widgets import (
+    PullProgressView,
+    SectionCard,
+    SPINNER_FRAMES,
+    make_secondary_button,
+)
 
 
 class ImagesPage(QWidget):
@@ -18,6 +23,9 @@ class ImagesPage(QWidget):
 
         card = SectionCard("镜像管理", "查看 Nekro Agent 相关镜像的本地与远程版本状态。")
         card_layout = card.layout()
+
+        self.w.image_pull_progress_view = PullProgressView(self.w)
+        card_layout.addWidget(self.w.image_pull_progress_view)
 
         header = QFrame()
         header.setObjectName("ImageTableHeader")

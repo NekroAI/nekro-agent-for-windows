@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sys
 import time
 import webbrowser
@@ -34,7 +35,6 @@ from core.backend_factory import BackendFactory
 from core.config_manager import ConfigManager
 from core.port_utils import (
     normalize_port,
-    validate_instance_port_conflicts,
     validate_port_bindings,
 )
 from ui.styles import STYLESHEET
@@ -1023,7 +1023,7 @@ class MainWindow(QMainWindow):
         pull_view = getattr(self, "pull_progress_view", None)
         header = pull_view.stage_header if pull_view and pull_view.stage_header else message
         detail_text = pull_view.summary_text if pull_view else ""
-        if phase in {"start", "stage"}:
+        if phase in {"start", "speedtest", "stage"}:
             self._active_update_dialog.set_progress(
                 status_text=header, detail_text="", busy=True
             )
@@ -1486,8 +1486,27 @@ class MainWindow(QMainWindow):
             button.setChecked(current == index)
 
     def _clear_pull_progress(self):
-        if hasattr(self, "pull_progress_view"):
-            self.pull_progress_view.reset()
+        for pull_view in self._pull_progress_views():
+            pull_view.reset()
+
+    def _pull_progress_views(self):
+        views = []
+        for attr in ("pull_progress_view", "image_pull_progress_view"):
+            pull_view = getattr(self, attr, None)
+            if pull_view is not None and pull_view not in views:
+                views.append(pull_view)
+        return views
+
+    def _parse_pull_stage_message(self, message):
+        current = 0
+        total = 0
+        stage_message = message
+        meta_match = re.match(r"^(\d+)/(\d+)\|(.+)$", message)
+        if meta_match:
+            current = int(meta_match.group(1))
+            total = int(meta_match.group(2))
+            stage_message = meta_match.group(3)
+        return current, total, stage_message
 
     def _on_backend_progress(self, text):
         if text.startswith("__pull_progress__|"):
@@ -1495,20 +1514,30 @@ class MainWindow(QMainWindow):
             if len(parts) < 3:
                 return
             _, phase, message = parts
-            pull_view = getattr(self, "pull_progress_view", None)
-            if not pull_view:
+            pull_views = self._pull_progress_views()
+            if not pull_views:
                 return
-            if phase == "start":
-                pull_view.start(message)
-            elif phase == "update":
-                pull_view.update(detail=message)
-            elif phase == "stage":
-                pull_view.begin_stage(message)
-            elif phase == "done":
-                pull_view.finish(message)
+            for pull_view in pull_views:
+                if phase == "start":
+                    pull_view.start(message)
+                elif phase == "update":
+                    pull_view.update(detail=message)
+                elif phase == "speedtest":
+                    _current, _total, stage_message = self._parse_pull_stage_message(
+                        message
+                    )
+                    pull_view.begin_stage(stage_message)
+                elif phase == "stage":
+                    current, total, stage_message = self._parse_pull_stage_message(
+                        message
+                    )
+                    pull_view.begin_stage(stage_message, current, total)
+                elif phase == "done":
+                    pull_view.finish(message)
+                elif phase == "error":
+                    pull_view.fail(message)
+            if phase == "done":
                 QTimer.singleShot(2000, self._clear_pull_progress)
-            elif phase == "error":
-                pull_view.fail(message)
             self._set_active_update_progress(phase, message)
             return
         if text in {"__docker_done__", "__docker_fail__"}:
@@ -2795,20 +2824,11 @@ class MainWindow(QMainWindow):
                 self._show_notice_dialog("端口冲突", message)
                 return
 
-            active_id = self.config.get_active_instance_id()
-            ok, message = validate_instance_port_conflicts(
-                self.config.list_instances(),
-                port_specs,
-                current_instance_id=active_id,
-            )
-            if not ok:
-                self._show_notice_dialog("端口冲突", message)
-                return
-
             self.config.set("nekro_port", nekro_port)
             if deploy_mode == "napcat":
                 self.config.set("napcat_port", napcat_port)
 
+            active_id = self.config.get_active_instance_id()
             deploy_info = self.config.get("deploy_info")
             if deploy_info:
                 deploy_info["port"] = str(nekro_port)

@@ -16,9 +16,9 @@ from PyQt6.QtWidgets import (
 
 from core.port_utils import (
     normalize_port,
-    validate_instance_port_conflicts,
     validate_port_bindings,
 )
+from core.wsl.constants import DISTRO_NAME
 from ui.styles import STYLESHEET
 from ui.widgets import (
     CreateRuntimeThread,
@@ -47,6 +47,25 @@ class CheckStepThread(QThread):
         self.step_done.emit(self._step, passed, detail)
 
 
+class ImageSpeedTestThread(QThread):
+    result_ready = pyqtSignal(object)
+    error_ready = pyqtSignal(str)
+
+    def __init__(self, backend, distro, images):
+        super().__init__()
+        self._backend = backend
+        self._distro = distro
+        self._images = images
+
+    def run(self):
+        try:
+            result = self._backend.speedtest_pull_sources(self._distro, self._images)
+        except Exception as e:
+            self.error_ready.emit(f"{type(e).__name__}: {e}")
+            return
+        self.result_ready.emit(result)
+
+
 class FirstRunDialog(WizardDialogBase):
     """全新部署向导对话框（不含迁移逻辑，迁移使用 MigrationDialog）。"""
 
@@ -55,7 +74,7 @@ class FirstRunDialog(WizardDialogBase):
     def __init__(self, backend, config, parent=None):
         super().__init__(
             "Nekro Agent 环境配置向导",
-            ["检测环境", "创建运行环境", "选择版本", "配置实例", "部署服务"],
+            ["检测环境", "创建运行环境", "选择版本", "配置实例", "镜像测速", "部署服务"],
             parent=parent,
             size=(680, 640),
             minimum_size=(620, 600),
@@ -65,11 +84,14 @@ class FirstRunDialog(WizardDialogBase):
         self.env_result = None
         self._check_in_progress = False
         self._selected_mode = self.config.get("deploy_mode") or "lite"
+        self._pending_deploy_mode = ""
+        self._pending_inst_data = None
 
         self._init_check_page()
         self._init_create_page()
         self._init_select_page()
         self._init_datadir_page()
+        self._init_speedtest_page()
         self._init_deploy_page()
 
         self.backend.progress_updated.connect(self._on_progress)
@@ -100,7 +122,14 @@ class FirstRunDialog(WizardDialogBase):
             pass
 
     def _page_step(self, name: str) -> int:
-        step_map = {"env_check": 0, "create_runtime": 1, "select_mode": 2, "data_dir": 3, "deploy": 4}
+        step_map = {
+            "env_check": 0,
+            "create_runtime": 1,
+            "select_mode": 2,
+            "data_dir": 3,
+            "speedtest": 4,
+            "deploy": 5,
+        }
         return step_map.get(name, 0)
 
     def _show_notice_dialog(self, title, text, button_text="确定", danger=False):
@@ -604,6 +633,194 @@ class FirstRunDialog(WizardDialogBase):
         layout.addLayout(btn_box)
         self._add_page(page, "data_dir")
 
+    def _init_speedtest_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(12)
+
+        title = QLabel("镜像源测速")
+        title.setObjectName("WizardTitle")
+        title.setWordWrap(True)
+        layout.addWidget(title)
+
+        desc = QLabel("正在检测可用于拉取 Docker Hub 镜像的镜像源。测速完成后会优先使用响应最快的可用源。")
+        desc.setObjectName("WizardDesc")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        self.speedtest_status_label = QLabel("等待开始测速...")
+        self.speedtest_status_label.setObjectName("WizardDesc")
+        self.speedtest_status_label.setWordWrap(True)
+        layout.addWidget(self.speedtest_status_label)
+
+        self.speedtest_progress = create_install_progress_bar(0, 0, height=8, radius=4)
+        self.speedtest_progress.setVisible(False)
+        layout.addWidget(self.speedtest_progress)
+
+        self.speedtest_rows_layout = QVBoxLayout()
+        self.speedtest_rows_layout.setSpacing(6)
+        layout.addLayout(self.speedtest_rows_layout)
+        self.speedtest_source_labels = {}
+
+        self.speedtest_detail_label = QLabel("")
+        self.speedtest_detail_label.setObjectName("WizardHint")
+        self.speedtest_detail_label.setWordWrap(True)
+        self.speedtest_detail_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.speedtest_detail_label.setVisible(False)
+        layout.addWidget(self.speedtest_detail_label)
+
+        layout.addStretch()
+
+        btn_box = QHBoxLayout()
+        self.btn_speedtest_back = make_wizard_button("返回", "secondary", fixed_height=38, fixed_width=80)
+        self.btn_speedtest_back.clicked.connect(lambda: self._goto_page("data_dir"))
+        btn_box.addWidget(self.btn_speedtest_back)
+
+        btn_box.addStretch()
+
+        self.btn_speedtest_retry = make_wizard_button("重新测速", "secondary", fixed_height=38, fixed_width=100)
+        self.btn_speedtest_retry.clicked.connect(self._retry_speedtest)
+        btn_box.addWidget(self.btn_speedtest_retry)
+
+        self.btn_speedtest_continue = make_wizard_button("继续部署", fixed_height=38, fixed_width=120)
+        self.btn_speedtest_continue.clicked.connect(self._continue_after_speedtest)
+        btn_box.addWidget(self.btn_speedtest_continue)
+
+        layout.addLayout(btn_box)
+        self._add_page(page, "speedtest")
+
+    def _clear_speedtest_rows(self):
+        while self.speedtest_rows_layout.count():
+            item = self.speedtest_rows_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+        self.speedtest_source_labels = {}
+
+    def _create_speedtest_row(self, source):
+        label = self._create_deploy_step_label(source)
+        self.speedtest_rows_layout.addWidget(label)
+        self.speedtest_source_labels[source] = label
+        return label
+
+    def _set_speedtest_row(self, source, state, detail=""):
+        label = self.speedtest_source_labels.get(source)
+        if label is None:
+            label = self._create_speedtest_row(source)
+        self._set_label_state(label, state, detail)
+
+    def _set_label_state(self, label, state, detail=""):
+        name = label.property("check_name")
+        icon = {"pending": "⏳", "running": "⏳", "done": "✅", "fail": "❌"}.get(state, "⏳")
+        label.setText(f"{icon}  {name}" + (f"  —  {detail}" if detail else ""))
+        label.setProperty("state", "pass" if state == "done" else "fail" if state == "fail" else "pending")
+        label.style().unpolish(label)
+        label.style().polish(label)
+
+    def _start_speedtest_page(self, mode, inst_data):
+        self._pending_deploy_mode = mode
+        self._pending_inst_data = inst_data
+        self._goto_page("speedtest")
+        images = self.backend.get_required_images(
+            mode,
+            self.config,
+            release_channel=inst_data.get("release_channel", "stable"),
+        )
+        self._speedtest_images = images
+        self._begin_speedtest(images)
+
+    def _begin_speedtest(self, images):
+        self._clear_speedtest_rows()
+        for source in [*getattr(self.backend, "_DOCKER_PROXY_REGISTRIES", ()), "Docker Hub"]:
+            self._set_speedtest_row(source, "pending", "等待测速")
+        self.speedtest_status_label.setText(f"正在测速 {len(images)} 个必需镜像的可用源...")
+        self.speedtest_detail_label.clear()
+        self.speedtest_detail_label.setVisible(False)
+        self.speedtest_progress.setVisible(True)
+        self.speedtest_progress.setRange(0, 0)
+        self.btn_speedtest_back.setEnabled(False)
+        self.btn_speedtest_retry.setEnabled(False)
+        self.btn_speedtest_continue.setEnabled(False)
+        thread = ImageSpeedTestThread(self.backend, DISTRO_NAME, images)
+        thread.result_ready.connect(self._on_speedtest_done)
+        thread.error_ready.connect(self._on_speedtest_error)
+        self._speedtest_thread = thread
+        self._track_thread(thread)
+        thread.start()
+
+    def _retry_speedtest(self):
+        self._begin_speedtest(getattr(self, "_speedtest_images", []))
+
+    def _format_speedtest_detail(self, result):
+        lines = []
+        for image_result in result.get("images", []):
+            best_source = image_result.get("best_source") or "未找到可用源，将按默认顺序尝试"
+            lines.append(f"{image_result.get('image', '')}: {best_source}")
+        failures = []
+        for source in result.get("sources", []):
+            if source.get("ok_count"):
+                continue
+            detail = self._check_detail_summary(source.get("last_detail", ""))
+            if detail:
+                failures.append(f"{source.get('source', '')}: {detail}")
+        if failures:
+            lines.append("")
+            lines.append("失败原因摘要:")
+            lines.extend(failures[:5])
+        return "\n".join(lines)
+
+    def _on_speedtest_done(self, result):
+        self.speedtest_progress.setVisible(False)
+        sources = result.get("sources", [])
+        usable_sources = [source for source in sources if source.get("ok_count")]
+        for source in sources:
+            ok_count = source.get("ok_count", 0)
+            total = source.get("total", 0)
+            avg_latency = source.get("avg_latency_ms")
+            if ok_count:
+                detail = f"可用 {ok_count}/{total}"
+                if avg_latency is not None:
+                    detail += f"，平均 {avg_latency}ms"
+                state = "done"
+            else:
+                detail = self._check_detail_summary(source.get("last_detail", "")) or "不可用"
+                state = "fail"
+            self._set_speedtest_row(source.get("source", ""), state, detail)
+
+        if usable_sources:
+            best = usable_sources[0]
+            best_text = best.get("source", "")
+            if best.get("avg_latency_ms") is not None:
+                best_text += f" ({best.get('avg_latency_ms')}ms)"
+            self.speedtest_status_label.setText(f"测速完成，优先使用 {best_text}。")
+        else:
+            self.speedtest_status_label.setText("测速完成，但未找到可用源；继续部署时会按默认顺序尝试拉取。")
+
+        detail = self._format_speedtest_detail(result)
+        self.speedtest_detail_label.setText(detail)
+        self.speedtest_detail_label.setVisible(bool(detail))
+        self.btn_speedtest_back.setEnabled(True)
+        self.btn_speedtest_retry.setEnabled(True)
+        self.btn_speedtest_continue.setEnabled(True)
+
+    def _on_speedtest_error(self, message):
+        self.speedtest_progress.setVisible(False)
+        self.speedtest_status_label.setText("测速流程异常，仍可继续部署并按默认顺序尝试拉取。")
+        self.speedtest_detail_label.setText(message)
+        self.speedtest_detail_label.setVisible(True)
+        for source in self.speedtest_source_labels:
+            self._set_speedtest_row(source, "fail", "测速异常")
+        self.btn_speedtest_back.setEnabled(True)
+        self.btn_speedtest_retry.setEnabled(True)
+        self.btn_speedtest_continue.setEnabled(True)
+
+    def _continue_after_speedtest(self):
+        if not self._pending_inst_data:
+            self._show_notice_dialog("提示", "部署配置尚未准备完成，请返回上一页重新确认。")
+            return
+        self._start_deploy_progress()
+        self.deploy_requested.emit(self._pending_deploy_mode, self._pending_inst_data)
+
     def _init_deploy_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -635,7 +852,16 @@ class FirstRunDialog(WizardDialogBase):
         layout.addWidget(self.deploy_pull_view)
         layout.setSpacing(10)
 
-        self.deploy_step_order = ["config", "docker", "images", "optional", "cc_sandbox", "compose", "health"]
+        self._deploy_active_stage = None
+        self.deploy_step_order = [
+            "config",
+            "docker",
+            "images",
+            "optional",
+            "cc_sandbox",
+            "compose",
+            "health",
+        ]
         self.deploy_steps = {
             "config": self._create_deploy_step_label("写入部署配置"),
             "docker": self._create_deploy_step_label("检查 Docker 服务"),
@@ -672,12 +898,7 @@ class FirstRunDialog(WizardDialogBase):
         label = self.deploy_steps.get(key)
         if not label:
             return
-        name = label.property("check_name")
-        icon = {"pending": "⏳", "running": "⏳", "done": "✅", "fail": "❌"}.get(state, "⏳")
-        label.setText(f"{icon}  {name}" + (f"  —  {detail}" if detail else ""))
-        label.setProperty("state", "pass" if state == "done" else "fail" if state == "fail" else "pending")
-        label.style().unpolish(label)
-        label.style().polish(label)
+        self._set_label_state(label, state, detail)
 
     def _clear_pull_progress(self):
         self.deploy_pull_view.reset()
@@ -753,19 +974,16 @@ class FirstRunDialog(WizardDialogBase):
             deploy_dir = "/root/nekro_agent"
             data_dir = "/root/nekro_agent_data"
 
-        inst_id = instance_name.rstrip("_") if instance_name else self.config.next_instance_id()
+        if instance_name:
+            inst_id = instance_name.rstrip("_")
+        elif self.config.get("first_run") and self.config.get_instance("default"):
+            inst_id = "default"
+        else:
+            inst_id = self.config.next_instance_id()
 
         existing = self.config.get_instance(inst_id)
-        if existing:
+        if existing and inst_id != "default":
             self._show_notice_dialog("实例名冲突", f"已存在 ID 为「{inst_id}」的实例，请更换实例名称。")
-            return
-
-        ok, message = validate_instance_port_conflicts(
-            self.config.list_instances(),
-            port_specs,
-        )
-        if not ok:
-            self._show_notice_dialog("端口冲突", message)
             return
 
         inst_data = {
@@ -778,11 +996,11 @@ class FirstRunDialog(WizardDialogBase):
             "napcat_port": napcat_port,
             "release_channel": "stable",
         }
-        self._start_deploy_progress()
-        self.deploy_requested.emit(mode, inst_data)
+        self._start_speedtest_page(mode, inst_data)
 
     def _start_deploy_progress(self):
         self._goto_page("deploy")
+        self._deploy_active_stage = None
         self.deploy_status_label.setText("正在启动部署流程...")
         self.deploy_detail_label.clear()
         self.deploy_detail_label.setVisible(False)
@@ -820,6 +1038,7 @@ class FirstRunDialog(WizardDialogBase):
         )
 
     def _set_deploy_stage(self, key, message=""):
+        self._deploy_active_stage = key
         if key in self.deploy_step_order:
             index = self.deploy_step_order.index(key)
             for done_key in self.deploy_step_order[:index]:
@@ -862,6 +1081,17 @@ class FirstRunDialog(WizardDialogBase):
     #  信号处理
     # ------------------------------------------------------------------ #
 
+    def _parse_pull_stage_message(self, message):
+        current = 0
+        total = 0
+        stage_message = message
+        meta_match = re.match(r"^(\d+)/(\d+)\|(.+)$", message)
+        if meta_match:
+            current = int(meta_match.group(1))
+            total = int(meta_match.group(2))
+            stage_message = meta_match.group(3)
+        return current, total, stage_message
+
     def _on_progress(self, text):
         current_page = self._current_page_name()
 
@@ -873,26 +1103,50 @@ class FirstRunDialog(WizardDialogBase):
             if current_page == "deploy":
                 if phase == "start":
                     self.deploy_pull_view.start(message)
-                    self._set_deploy_stage("images", message)
+                    target_stage = (
+                        "cc_sandbox"
+                        if self._deploy_active_stage == "cc_sandbox"
+                        else "images"
+                    )
+                    self._set_deploy_stage(target_stage, message)
+                elif phase == "speedtest":
+                    _current, _total, stage_message = self._parse_pull_stage_message(
+                        message
+                    )
+                    self.deploy_pull_view.begin_stage(stage_message)
+                    target_stage = (
+                        "cc_sandbox"
+                        if self._deploy_active_stage == "cc_sandbox"
+                        else "images"
+                    )
+                    self._set_deploy_stage(target_stage, stage_message)
                 elif phase == "stage":
-                    current = 0
-                    total = 0
-                    stage_message = message
-                    meta_match = re.match(r"^(\d+)/(\d+)\|(.+)$", message)
-                    if meta_match:
-                        current = int(meta_match.group(1))
-                        total = int(meta_match.group(2))
-                        stage_message = meta_match.group(3)
+                    current, total, stage_message = self._parse_pull_stage_message(message)
                     self.deploy_pull_view.begin_stage(stage_message, current, total)
-                    self._set_deploy_stage("images", stage_message)
+                    target_stage = (
+                        "cc_sandbox"
+                        if self._deploy_active_stage == "cc_sandbox"
+                        else "images"
+                    )
+                    self._set_deploy_stage(target_stage, stage_message)
                 elif phase == "update":
                     self.deploy_pull_view.update(detail=message)
                 elif phase == "done":
                     self.deploy_pull_view.finish(message)
                     QTimer.singleShot(500, self._clear_pull_progress)
-                    self._set_deploy_step("images", "done")
+                    done_stage = (
+                        "cc_sandbox"
+                        if self._deploy_active_stage == "cc_sandbox"
+                        else "images"
+                    )
+                    self._set_deploy_step(done_stage, "done")
                 elif phase == "error":
-                    self._set_deploy_step("images", "fail", "镜像拉取失败")
+                    fail_stage = (
+                        "cc_sandbox"
+                        if self._deploy_active_stage == "cc_sandbox"
+                        else "images"
+                    )
+                    self._set_deploy_step(fail_stage, "fail", "镜像拉取失败")
                     self.deploy_pull_view.fail("镜像拉取失败，请查看主窗口日志。")
             return
 
