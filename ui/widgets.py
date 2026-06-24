@@ -329,6 +329,13 @@ class WizardDialogBase(QDialog):
         pass
 
     def reject(self):
+        if any(thread.isRunning() for thread in self._active_threads):
+            show_notice_dialog(
+                self,
+                "任务正在进行",
+                "当前步骤正在执行系统操作，请等待完成或失败后再关闭窗口。",
+            )
+            return
         for thread in list(self._active_threads):
             if thread.isRunning():
                 thread.quit()

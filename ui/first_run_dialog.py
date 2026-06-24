@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
 
 from core.port_utils import (
     normalize_port,
+    validate_instance_port_conflicts,
     validate_port_bindings,
 )
 from core.wsl.constants import DISTRO_NAME
@@ -23,6 +24,7 @@ from ui.styles import STYLESHEET
 from ui.widgets import (
     CreateRuntimeThread,
     PullProgressView,
+    SpinnerLabel,
     WizardDialogBase,
     create_install_progress_bar,
     make_wizard_button,
@@ -648,18 +650,39 @@ class FirstRunDialog(WizardDialogBase):
         desc.setWordWrap(True)
         layout.addWidget(desc)
 
+        status_row = QHBoxLayout()
+        status_row.setSpacing(8)
+        self.speedtest_spinner = SpinnerLabel(self)
+        self.speedtest_spinner.setVisible(False)
+        status_row.addWidget(self.speedtest_spinner)
         self.speedtest_status_label = QLabel("等待开始测速...")
         self.speedtest_status_label.setObjectName("WizardDesc")
         self.speedtest_status_label.setWordWrap(True)
-        layout.addWidget(self.speedtest_status_label)
+        status_row.addWidget(self.speedtest_status_label, 1)
+        layout.addLayout(status_row)
 
         self.speedtest_progress = create_install_progress_bar(0, 0, height=8, radius=4)
         self.speedtest_progress.setVisible(False)
         layout.addWidget(self.speedtest_progress)
 
+        # 技术细节(各源结果 + 失败原因摘要),默认折叠,由开关按钮控制
+        self.btn_speedtest_details = make_wizard_button(
+            "查看测速详情 ▾", "secondary", fixed_height=30, fixed_width=140
+        )
+        self.btn_speedtest_details.clicked.connect(self._toggle_speedtest_details)
+        self.btn_speedtest_details.setVisible(False)
+        layout.addWidget(
+            self.btn_speedtest_details, alignment=Qt.AlignmentFlag.AlignLeft
+        )
+
+        self.speedtest_details_widget = QWidget()
+        details_layout = QVBoxLayout(self.speedtest_details_widget)
+        details_layout.setContentsMargins(0, 0, 0, 0)
+        details_layout.setSpacing(8)
+
         self.speedtest_rows_layout = QVBoxLayout()
         self.speedtest_rows_layout.setSpacing(6)
-        layout.addLayout(self.speedtest_rows_layout)
+        details_layout.addLayout(self.speedtest_rows_layout)
         self.speedtest_source_labels = {}
 
         self.speedtest_detail_label = QLabel("")
@@ -667,13 +690,16 @@ class FirstRunDialog(WizardDialogBase):
         self.speedtest_detail_label.setWordWrap(True)
         self.speedtest_detail_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.speedtest_detail_label.setVisible(False)
-        layout.addWidget(self.speedtest_detail_label)
+        details_layout.addWidget(self.speedtest_detail_label)
+
+        self.speedtest_details_widget.setVisible(False)
+        layout.addWidget(self.speedtest_details_widget)
 
         layout.addStretch()
 
         btn_box = QHBoxLayout()
         self.btn_speedtest_back = make_wizard_button("返回", "secondary", fixed_height=38, fixed_width=80)
-        self.btn_speedtest_back.clicked.connect(lambda: self._goto_page("data_dir"))
+        self.btn_speedtest_back.clicked.connect(self._back_from_speedtest)
         btn_box.addWidget(self.btn_speedtest_back)
 
         btn_box.addStretch()
@@ -682,7 +708,7 @@ class FirstRunDialog(WizardDialogBase):
         self.btn_speedtest_retry.clicked.connect(self._retry_speedtest)
         btn_box.addWidget(self.btn_speedtest_retry)
 
-        self.btn_speedtest_continue = make_wizard_button("继续部署", fixed_height=38, fixed_width=120)
+        self.btn_speedtest_continue = make_wizard_button("继续部署", fixed_height=38, fixed_width=170)
         self.btn_speedtest_continue.clicked.connect(self._continue_after_speedtest)
         btn_box.addWidget(self.btn_speedtest_continue)
 
@@ -730,17 +756,24 @@ class FirstRunDialog(WizardDialogBase):
         self._begin_speedtest(images)
 
     def _begin_speedtest(self, images):
+        self._cancel_speedtest_countdown()
         self._clear_speedtest_rows()
+        self.btn_speedtest_details.setVisible(False)
+        self.speedtest_details_widget.setVisible(False)
+        self.btn_speedtest_details.setText("查看测速详情 ▾")
         for source in [*getattr(self.backend, "_DOCKER_PROXY_REGISTRIES", ()), "Docker Hub"]:
-            self._set_speedtest_row(source, "pending", "等待测速")
+            self._set_speedtest_row(source, "running", "测速中...")
         self.speedtest_status_label.setText(f"正在测速 {len(images)} 个必需镜像的可用源...")
         self.speedtest_detail_label.clear()
         self.speedtest_detail_label.setVisible(False)
+        self.speedtest_spinner.setVisible(True)
+        self.speedtest_spinner.start(100)
         self.speedtest_progress.setVisible(True)
         self.speedtest_progress.setRange(0, 0)
         self.btn_speedtest_back.setEnabled(False)
         self.btn_speedtest_retry.setEnabled(False)
         self.btn_speedtest_continue.setEnabled(False)
+        self.btn_speedtest_continue.setText("继续部署")
         thread = ImageSpeedTestThread(self.backend, DISTRO_NAME, images)
         thread.result_ready.connect(self._on_speedtest_done)
         thread.error_ready.connect(self._on_speedtest_error)
@@ -750,6 +783,27 @@ class FirstRunDialog(WizardDialogBase):
 
     def _retry_speedtest(self):
         self._begin_speedtest(getattr(self, "_speedtest_images", []))
+
+    def _back_from_speedtest(self):
+        self._cancel_speedtest_countdown()
+        self._goto_page("data_dir")
+
+    def _toggle_speedtest_details(self):
+        showing = not self.speedtest_details_widget.isVisible()
+        if showing:
+            self._cancel_speedtest_countdown()
+            self.btn_speedtest_continue.setText("继续部署")
+        self.speedtest_details_widget.setVisible(showing)
+        self.btn_speedtest_details.setText(
+            "收起测速详情 ▴" if showing else "查看测速详情 ▾"
+        )
+
+    def _cancel_speedtest_countdown(self):
+        timer = getattr(self, "_speedtest_countdown_timer", None)
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+            self._speedtest_countdown_timer = None
 
     def _format_speedtest_detail(self, result):
         lines = []
@@ -770,6 +824,8 @@ class FirstRunDialog(WizardDialogBase):
         return "\n".join(lines)
 
     def _on_speedtest_done(self, result):
+        self.speedtest_spinner.stop()
+        self.speedtest_spinner.setVisible(False)
         self.speedtest_progress.setVisible(False)
         sources = result.get("sources", [])
         usable_sources = [source for source in sources if source.get("ok_count")]
@@ -792,29 +848,43 @@ class FirstRunDialog(WizardDialogBase):
             best_text = best.get("source", "")
             if best.get("avg_latency_ms") is not None:
                 best_text += f" ({best.get('avg_latency_ms')}ms)"
-            self.speedtest_status_label.setText(f"测速完成，优先使用 {best_text}。")
+            self.speedtest_status_label.setText(
+                f"测速完成，已自动选用最快的可用源：{best_text}，共 {len(usable_sources)} 个源可用。"
+            )
         else:
-            self.speedtest_status_label.setText("测速完成，但未找到可用源；继续部署时会按默认顺序尝试拉取。")
+            self.speedtest_status_label.setText(
+                "测速完成，但未找到可用源；继续部署时会按默认顺序逐个尝试拉取。"
+            )
 
         detail = self._format_speedtest_detail(result)
         self.speedtest_detail_label.setText(detail)
         self.speedtest_detail_label.setVisible(bool(detail))
+        self.btn_speedtest_details.setVisible(True)
         self.btn_speedtest_back.setEnabled(True)
         self.btn_speedtest_retry.setEnabled(True)
         self.btn_speedtest_continue.setEnabled(True)
+        self.btn_speedtest_continue.setText("继续部署")
 
     def _on_speedtest_error(self, message):
+        self._cancel_speedtest_countdown()
+        self.speedtest_spinner.stop()
+        self.speedtest_spinner.setVisible(False)
         self.speedtest_progress.setVisible(False)
         self.speedtest_status_label.setText("测速流程异常，仍可继续部署并按默认顺序尝试拉取。")
         self.speedtest_detail_label.setText(message)
         self.speedtest_detail_label.setVisible(True)
+        self.btn_speedtest_details.setVisible(True)
+        self.speedtest_details_widget.setVisible(True)
+        self.btn_speedtest_details.setText("收起测速详情 ▴")
         for source in self.speedtest_source_labels:
             self._set_speedtest_row(source, "fail", "测速异常")
         self.btn_speedtest_back.setEnabled(True)
         self.btn_speedtest_retry.setEnabled(True)
         self.btn_speedtest_continue.setEnabled(True)
+        # 出错时不自动跳转，交由用户决定重试还是继续。
 
     def _continue_after_speedtest(self):
+        self._cancel_speedtest_countdown()
         if not self._pending_inst_data:
             self._show_notice_dialog("提示", "部署配置尚未准备完成，请返回上一页重新确认。")
             return
@@ -942,22 +1012,6 @@ class FirstRunDialog(WizardDialogBase):
             self._show_notice_dialog("提示", "端口号必须为 1-65535 之间的整数")
             return
 
-        port_specs = [("Nekro Agent 端口", nekro_port)]
-        if mode == "napcat":
-            port_specs.append(("NapCat 端口", napcat_port))
-        ok, message = validate_port_bindings(port_specs)
-        if not ok:
-            self._show_notice_dialog("端口冲突", message)
-            return
-
-        if mode == "napcat":
-            self._show_notice_dialog(
-                "NapCat 登录提示",
-                "NapCat 模式在关闭启动器并重新启动后，可能需要重新进行登录。\n\n"
-                "在部分情况下，QQ 还可能触发新设备风控。这属于当前 NapCat 运行方式下的已知现象，请在部署前知悉。",
-                button_text="我知道了",
-            )
-
         raw_instance_name = self.instance_name_edit.text().strip()
         if raw_instance_name and not re.fullmatch(r"[A-Za-z0-9_-]+", raw_instance_name):
             self._mark_instance_name_error()
@@ -985,6 +1039,30 @@ class FirstRunDialog(WizardDialogBase):
         if existing and inst_id != "default":
             self._show_notice_dialog("实例名冲突", f"已存在 ID 为「{inst_id}」的实例，请更换实例名称。")
             return
+
+        port_specs = [("Nekro Agent 端口", nekro_port)]
+        if mode == "napcat":
+            port_specs.append(("NapCat 端口", napcat_port))
+        ok, message = validate_port_bindings(port_specs)
+        if not ok:
+            self._show_notice_dialog("端口冲突", message)
+            return
+        ok, message = validate_instance_port_conflicts(
+            self.config.list_instances(),
+            port_specs,
+            current_instance_id=inst_id if existing else None,
+        )
+        if not ok:
+            self._show_notice_dialog("端口冲突", message)
+            return
+
+        if mode == "napcat":
+            self._show_notice_dialog(
+                "NapCat 登录提示",
+                "NapCat 模式在关闭启动器并重新启动后，可能需要重新进行登录。\n\n"
+                "在部分情况下，QQ 还可能触发新设备风控。这属于当前 NapCat 运行方式下的已知现象，请在部署前知悉。",
+                button_text="我知道了",
+            )
 
         inst_data = {
             "inst_id": inst_id,

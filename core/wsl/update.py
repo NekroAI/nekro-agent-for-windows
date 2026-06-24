@@ -312,13 +312,25 @@ class WSLUpdateMixin:
                     else 8021
                 )
                 if self.config:
-                    self.config.set("release_channel", "preview")
-                    self.config.set_active_preview_backup_available(bool(create_backup))
+                    preview_available = bool(create_backup)
                     if inst_id:
-                        self.config.update_instance(
+                        self.config.update_instance_with_globals(
                             inst_id,
-                            release_channel="preview",
-                            preview_backup_available=bool(create_backup),
+                            instance_updates={
+                                "release_channel": "preview",
+                                "preview_backup_available": preview_available,
+                            },
+                            global_updates={
+                                "release_channel": "preview",
+                                "preview_backup_available": preview_available,
+                            },
+                        )
+                    else:
+                        self.config.set_many(
+                            {
+                                "release_channel": "preview",
+                                "preview_backup_available": preview_available,
+                            }
                         )
                 if self._log_process is None or self._log_process.poll() is not None:
                     threading.Thread(
@@ -465,13 +477,24 @@ class WSLUpdateMixin:
                     else 8021
                 )
                 if self.config:
-                    self.config.set("release_channel", "stable")
-                    self.config.set_active_preview_backup_available(False)
                     if inst_id:
-                        self.config.update_instance(
+                        self.config.update_instance_with_globals(
                             inst_id,
-                            release_channel="stable",
-                            preview_backup_available=False,
+                            instance_updates={
+                                "release_channel": "stable",
+                                "preview_backup_available": False,
+                            },
+                            global_updates={
+                                "release_channel": "stable",
+                                "preview_backup_available": False,
+                            },
+                        )
+                    else:
+                        self.config.set_many(
+                            {
+                                "release_channel": "stable",
+                                "preview_backup_available": False,
+                            }
                         )
                 if self._log_process is None or self._log_process.poll() is not None:
                     threading.Thread(

@@ -1,4 +1,5 @@
 import os
+import posixpath
 import shlex
 import subprocess
 import time
@@ -9,6 +10,44 @@ from core.wsl.constants import DISTRO_NAME, PREVIEW_IMAGE
 
 class WSLDiscoveryMixin:
     """扫描本机所有 WSL 发行版中已有的 nekro-agent 实例，并提供接管能力。"""
+
+    _DANGEROUS_MIGRATION_PATHS = {
+        "",
+        "/",
+        "/root",
+        "/home",
+        "/opt",
+        "/var",
+        "/var/lib",
+        "/var/lib/docker",
+        "/var/lib/docker/volumes",
+    }
+
+    @staticmethod
+    def _normalize_wsl_abs_path(path):
+        normalized = str(path or "").strip().replace("\\", "/")
+        if not normalized.startswith("/"):
+            return ""
+        return posixpath.normpath(normalized)
+
+    def _is_safe_migration_path(self, path):
+        normalized = self._normalize_wsl_abs_path(path)
+        if not normalized or normalized in self._DANGEROUS_MIGRATION_PATHS:
+            return False
+        return "nekro" in normalized.lower()
+
+    def _wsl_path_exists(self, distro, path, *, user="root"):
+        normalized = self._normalize_wsl_abs_path(path)
+        if not normalized:
+            return False
+        return (
+            self._wsl_exec(
+                distro,
+                f"test -e {shlex.quote(normalized)} && echo yes",
+                user=user,
+            ).strip()
+            == "yes"
+        )
 
     # ------------------------------------------------------------------ #
     # 公开接口
@@ -232,7 +271,9 @@ class WSLDiscoveryMixin:
     def _detect_deploy_mode_from_compose(self, distro: str, deploy_dir: str) -> str:
         """从 docker-compose.yml 内容推断 deploy_mode，不依赖运行中的容器。"""
         compose_content = self._wsl_exec(
-            distro, f'cat "{deploy_dir}/docker-compose.yml" 2>/dev/null', user="root"
+            distro,
+            f"cat {shlex.quote(posixpath.join(deploy_dir, 'docker-compose.yml'))} 2>/dev/null",
+            user="root",
         )
         if "napcat" in compose_content.lower():
             return "napcat"
@@ -241,7 +282,9 @@ class WSLDiscoveryMixin:
     def _detect_agent_image(self, distro: str, deploy_dir: str) -> str:
         """从 docker-compose.yml 中读取实际使用的 nekro-agent 镜像引用。"""
         compose_content = self._wsl_exec(
-            distro, f'cat "{deploy_dir}/docker-compose.yml" 2>/dev/null', user="root"
+            distro,
+            f"cat {shlex.quote(posixpath.join(deploy_dir, 'docker-compose.yml'))} 2>/dev/null",
+            user="root",
         )
         for line in compose_content.splitlines():
             stripped = line.strip()
@@ -253,7 +296,11 @@ class WSLDiscoveryMixin:
     def _find_env_path(self, distro: str, deploy_dir: str) -> str:
         """定位 .env 文件路径。"""
         standard = f"{deploy_dir}/.env"
-        check = self._wsl_exec(distro, f'test -f "{standard}" && echo yes', user="root")
+        check = self._wsl_exec(
+            distro,
+            f"test -f {shlex.quote(standard)} && echo yes",
+            user="root",
+        )
         if check.strip() == "yes":
             return standard
 
@@ -352,8 +399,12 @@ class WSLDiscoveryMixin:
 
         # 7. 将解压出的数据移动到 /root 下的标准路径
         _step(5, "整理目录结构...")
-        self._relocate_dir(data_dir, dest_data_dir, timeout=300)
-        self._relocate_dir(deploy_dir, dest_deploy_dir)
+        if not self._relocate_dir(data_dir, dest_data_dir, timeout=300):
+            self.log_received.emit("[接管] ✗ 数据目录整理失败", "error")
+            return False
+        if not self._relocate_dir(deploy_dir, dest_deploy_dir):
+            self.log_received.emit("[接管] ✗ 部署目录整理失败", "error")
+            return False
 
         # 8. 清理临时文件
         _step(6, "清理临时文件...")
@@ -386,12 +437,25 @@ class WSLDiscoveryMixin:
 
     def _relocate_dir(self, src, dest, timeout=120):
         """将 src 目录移动到 dest（同路径则跳过），优先 mv 快速重命名。"""
+        src = self._normalize_wsl_abs_path(src)
+        dest = self._normalize_wsl_abs_path(dest)
         if src == dest:
-            return
+            return True
+        if not self._is_safe_migration_path(src):
+            self.log_received.emit(f"[接管] 拒绝移动高风险源路径: {src or '<empty>'}", "error")
+            return False
+        if not self._is_safe_migration_path(dest) or not dest.startswith("/root/"):
+            self.log_received.emit(f"[接管] 拒绝移动到非托管目标路径: {dest or '<empty>'}", "error")
+            return False
+        if not self._wsl_path_exists(DISTRO_NAME, src, user="root"):
+            self.log_received.emit(f"[接管] 待整理目录不存在: {src}", "error")
+            return False
+
         self.log_received.emit(f"[接管] 移动目录: {src} → {dest}", "info")
+        dest_parent = posixpath.dirname(dest.rstrip("/")) or "/"
         self._run_wsl_checked(
             DISTRO_NAME,
-            f"mkdir -p \"$(dirname {shlex.quote(dest)})\"",
+            f"mkdir -p {shlex.quote(dest_parent)}",
             action="[接管] 创建目标父目录失败",
             timeout=30,
             user="root",
@@ -402,42 +466,43 @@ class WSLDiscoveryMixin:
             timeout=timeout,
             user="root",
         )
-        if proc.returncode != 0:
-            self._run_wsl_checked(
-                DISTRO_NAME,
-                f"mkdir -p {shlex.quote(dest)}",
-                action="[接管] 创建目标目录失败",
-                timeout=30,
-                user="root",
-            )
-            mv_result = self._wsl_run(
-                DISTRO_NAME,
-                (
-                    f"cp -a {shlex.quote(src.rstrip('/') + '/.')} "
-                    f"{shlex.quote(dest.rstrip('/') + '/')} && "
-                    f"rm -rf {shlex.quote(src)}"
+        if proc.returncode == 0:
+            return True
+
+        self._run_wsl_checked(
+            DISTRO_NAME,
+            f"mkdir -p {shlex.quote(dest)}",
+            action="[接管] 创建目标目录失败",
+            timeout=30,
+            user="root",
+        )
+        fallback_cmd = (
+            f"cp -a {shlex.quote(src.rstrip('/') + '/.')} "
+            f"{shlex.quote(dest.rstrip('/') + '/')} && "
+            f"rm -rf {shlex.quote(src)}"
+        )
+        mv_result = self._wsl_run(
+            DISTRO_NAME,
+            fallback_cmd,
+            timeout=timeout,
+            user="root",
+        )
+        if mv_result.returncode != 0:
+            self.log_received.emit(
+                self._format_command_failure(
+                    "[接管] 目录移动失败",
+                    cmd=fallback_cmd,
+                    distro=DISTRO_NAME,
+                    user="root",
+                    timeout=timeout,
+                    returncode=mv_result.returncode,
+                    stdout=mv_result.stdout,
+                    stderr=mv_result.stderr,
                 ),
-                timeout=timeout,
-                user="root",
+                "error",
             )
-            if mv_result.returncode != 0:
-                self.log_received.emit(
-                    self._format_command_failure(
-                        "[接管] 目录移动失败",
-                        cmd=(
-                            f"cp -a {shlex.quote(src.rstrip('/') + '/.')} "
-                            f"{shlex.quote(dest.rstrip('/') + '/')} && "
-                            f"rm -rf {shlex.quote(src)}"
-                        ),
-                        distro=DISTRO_NAME,
-                        user="root",
-                        timeout=timeout,
-                        returncode=mv_result.returncode,
-                        stdout=mv_result.stdout,
-                        stderr=mv_result.stderr,
-                    ),
-                    "warn",
-                )
+            return False
+        return True
 
     def _stop_source_instance(self, distro: str, deploy_dir: str) -> bool:
         """停止源发行版中的 nekro-agent 容器，兼容新版插件式和旧版独立 docker-compose。"""
@@ -549,12 +614,63 @@ class WSLDiscoveryMixin:
                     "warn",
                 )
 
-            self._wsl_exec(src_distro, f'rm -f "{image_archive}" 2>/dev/null', user="root")
-            self._wsl_exec(DISTRO_NAME, f'rm -f "{image_archive}" 2>/dev/null', user="root")
+            self._wsl_exec(
+                src_distro,
+                f"rm -f {shlex.quote(image_archive)} 2>/dev/null",
+                user="root",
+            )
+            self._wsl_exec(
+                DISTRO_NAME,
+                f"rm -f {shlex.quote(image_archive)} 2>/dev/null",
+                user="root",
+            )
             return ok
         except Exception as e:
             self.log_received.emit(f"[接管] 镜像迁移异常: {e}", "warn")
             return False
+
+    def _migration_archive_targets(
+        self,
+        distro: str,
+        deploy_dir: str,
+        data_dir: str,
+        instance: dict,
+    ) -> list[str]:
+        targets = []
+        required = [
+            ("部署目录", deploy_dir),
+            ("数据目录", data_dir),
+        ]
+        for label, path in required:
+            normalized = self._normalize_wsl_abs_path(path)
+            if not self._is_safe_migration_path(normalized):
+                self.log_received.emit(
+                    f"[接管] {label}路径不符合迁移安全规则: {path or '<empty>'}",
+                    "error",
+                )
+                return []
+            if not self._wsl_path_exists(distro, normalized, user="root"):
+                self.log_received.emit(
+                    f"[接管] {label}不存在，无法迁移: {normalized}",
+                    "error",
+                )
+                return []
+            targets.append(normalized)
+
+        instance_name = instance.get("env", {}).get("INSTANCE_NAME", "")
+        optional_volumes = [
+            f"/var/lib/docker/volumes/{instance_name}nekro_postgres_data",
+            f"/var/lib/docker/volumes/{instance_name}nekro_qdrant_data",
+        ]
+        for volume in optional_volumes:
+            if self._wsl_path_exists(distro, volume, user="root"):
+                targets.append(volume)
+            else:
+                self.log_received.emit(
+                    f"[接管] 可选 Docker volume 不存在，跳过: {volume}",
+                    "debug",
+                )
+        return targets
 
     def _pack_source_data(
         self,
@@ -573,20 +689,21 @@ class WSLDiscoveryMixin:
             if check.strip() != "yes":
                 return False
 
-            instance_name = instance.get("env", {}).get("INSTANCE_NAME", "")
-            postgres_vol = f"{instance_name}nekro_postgres_data"
-            qdrant_vol = f"{instance_name}nekro_qdrant_data"
+            targets = self._migration_archive_targets(
+                src_distro,
+                deploy_dir,
+                data_dir,
+                instance,
+            )
+            if not targets:
+                return False
 
             pack_cmd = (
-                f"tar --ignore-failed-read -czf {shlex.quote(archive_path)} "
-                f"{shlex.quote(deploy_dir)} "
-                f"{shlex.quote(data_dir)} "
-                f"{shlex.quote('/var/lib/docker/volumes/' + postgres_vol)} "
-                f"{shlex.quote('/var/lib/docker/volumes/' + qdrant_vol)} "
-                f'2>/dev/null'
+                f"tar -czf {shlex.quote(archive_path)} "
+                + " ".join(shlex.quote(target) for target in targets)
             )
             proc = self._wsl_run(src_distro, pack_cmd, timeout=300, user="root")
-            if proc.returncode != 0 and proc.returncode != 1:
+            if proc.returncode != 0:
                 self.log_received.emit(
                     self._format_command_failure(
                         "[接管] 源实例数据打包失败",
@@ -634,20 +751,21 @@ class WSLDiscoveryMixin:
             archive_win = os.path.join(win_temp, "na_migrate.tar.gz")
             archive_wsl_src = f"{wsl_temp}/na_migrate.tar.gz"
 
-            instance_name = instance.get("env", {}).get("INSTANCE_NAME", "")
-            postgres_vol = f"{instance_name}nekro_postgres_data"
-            qdrant_vol = f"{instance_name}nekro_qdrant_data"
+            targets = self._migration_archive_targets(
+                src_distro,
+                deploy_dir,
+                data_dir,
+                instance,
+            )
+            if not targets:
+                return ""
 
             pack_cmd = (
-                f"tar --ignore-failed-read -czf {shlex.quote(archive_wsl_src)} "
-                f"{shlex.quote(deploy_dir)} "
-                f"{shlex.quote(data_dir)} "
-                f"{shlex.quote('/var/lib/docker/volumes/' + postgres_vol)} "
-                f"{shlex.quote('/var/lib/docker/volumes/' + qdrant_vol)} "
-                f'2>/dev/null'
+                f"tar -czf {shlex.quote(archive_wsl_src)} "
+                + " ".join(shlex.quote(target) for target in targets)
             )
             proc = self._wsl_run(src_distro, pack_cmd, timeout=300, user="root")
-            if proc.returncode != 0 and proc.returncode != 1:
+            if proc.returncode != 0:
                 self.log_received.emit(
                     self._format_command_failure(
                         "[接管] Windows 临时目录打包失败",
@@ -694,9 +812,9 @@ class WSLDiscoveryMixin:
         try:
             self._wsl_exec(DISTRO_NAME, "systemctl stop docker 2>/dev/null || true", timeout=20, user="root")
 
-            restore_cmd = f"tar --ignore-failed-read -xzf {shlex.quote(archive_path)} -C / 2>/dev/null"
+            restore_cmd = f"tar -xzf {shlex.quote(archive_path)} -C /"
             proc = self._wsl_run(DISTRO_NAME, restore_cmd, timeout=300, user="root")
-            if proc.returncode != 0 and proc.returncode != 1:
+            if proc.returncode != 0:
                 self.log_received.emit(
                     self._format_command_failure(
                         "[接管] 数据还原失败",
@@ -728,8 +846,16 @@ class WSLDiscoveryMixin:
     def _cleanup_archive(self, src_distro: str, archive_path: str):
         """清理临时打包文件（以 root 执行，文件可能由 root 创建）。"""
         try:
-            self._wsl_exec(src_distro, f'rm -f "{archive_path}" 2>/dev/null', user="root")
-            self._wsl_exec(DISTRO_NAME, f'rm -f "{archive_path}" 2>/dev/null', user="root")
+            self._wsl_exec(
+                src_distro,
+                f"rm -f {shlex.quote(archive_path)} 2>/dev/null",
+                user="root",
+            )
+            self._wsl_exec(
+                DISTRO_NAME,
+                f"rm -f {shlex.quote(archive_path)} 2>/dev/null",
+                user="root",
+            )
         except Exception:
             pass
 
@@ -764,13 +890,6 @@ class WSLDiscoveryMixin:
         deploy_dir = (instance or {}).get("deploy_dir", "/root/nekro_agent")
         data_dir = (instance or {}).get("data_dir", "/root/nekro_agent_data")
 
-        self.config.set("first_run", False)
-        self.config.set("deploy_mode", deploy_mode)
-        self.config.set("nekro_port", nekro_port)
-        self.config.set("napcat_port", napcat_port)
-        self.config.set("wsl_distro", DISTRO_NAME)
-        self.config.set("release_channel", release_channel)
-
         deploy_info = {
             "port": str(nekro_port),
             "admin_password": env.get("NEKRO_ADMIN_PASSWORD", ""),
@@ -780,12 +899,11 @@ class WSLDiscoveryMixin:
         if deploy_mode == "napcat":
             deploy_info["napcat_port"] = str(napcat_port)
 
-        self.config.set("deploy_info", deploy_info)
-
         inst_id = instance_name or "default"
         existing = self.config.get_instance(inst_id)
         if existing and existing.get("deploy_dir") != deploy_dir:
             inst_id = self.config.next_instance_id()
+            existing = None
         inst_data = {
             "instance_name": instance_name,
             "deploy_dir": deploy_dir,
@@ -799,10 +917,26 @@ class WSLDiscoveryMixin:
                 existing.get("preview_backup_available", False) if existing else False
             ),
         }
-        self.config.set_instance(inst_id, inst_data)
+        global_updates = {
+            "first_run": False,
+            "deploy_mode": deploy_mode,
+            "nekro_port": nekro_port,
+            "napcat_port": napcat_port,
+            "wsl_distro": DISTRO_NAME,
+            "release_channel": release_channel,
+            "deploy_info": deploy_info,
+            "active_instance": inst_id,
+            "preview_backup_available": bool(
+                inst_data.get("preview_backup_available", False)
+            ),
+        }
         if not self.config.get_default_instance_id():
-            self.config.set_default_instance_id(inst_id)
-        self.config.set("active_instance", inst_id)
+            global_updates["default_instance"] = inst_id
+        self.config.update_instance_with_globals(
+            inst_id,
+            instance_updates=inst_data,
+            global_updates=global_updates,
+        )
 
         self.log_received.emit(
             f"[接管] config 已同步 — 实例: {inst_id}, 端口: {nekro_port}, 模式: {deploy_mode}, 频道: {release_channel}", "info"

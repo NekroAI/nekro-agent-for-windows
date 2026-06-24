@@ -1,4 +1,5 @@
 import json
+import re
 import shlex
 import subprocess
 import threading
@@ -6,6 +7,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from core.wsl.constants import DISTRO_NAME, MANAGED_IMAGES_BASE, PREVIEW_IMAGE, REQUIRED_IMAGES_BASE, STABLE_IMAGE
@@ -187,37 +189,109 @@ class WSLImageMixin:
             return "", "", ""
         return registry, repo, ref
 
+    _MANIFEST_ACCEPT = (
+        "application/vnd.docker.distribution.manifest.list.v2+json, "
+        "application/vnd.oci.image.index.v1+json, "
+        "application/vnd.docker.distribution.manifest.v2+json, "
+        "application/vnd.oci.image.manifest.v1+json"
+    )
+
+    @staticmethod
+    def _parse_auth_challenge(header):
+        """解析 Www-Authenticate: Bearer realm=...,service=...,scope=... 头。"""
+        if not header:
+            return None
+        match = re.match(r"\s*Bearer\s+(.*)", header, re.IGNORECASE)
+        if not match:
+            return None
+        params = {
+            key.lower(): value
+            for key, value in re.findall(r'(\w+)="([^"]*)"', match.group(1))
+        }
+        return params if "realm" in params else None
+
+    def _fetch_bearer_token(self, header):
+        """按 registry 返回的 challenge 去对应 realm 换取匿名 pull token。"""
+        params = self._parse_auth_challenge(header)
+        if not params:
+            return None
+        realm = params.get("realm")
+        query = {k: params[k] for k in ("service", "scope") if params.get(k)}
+        url = f"{realm}?{urlencode(query)}" if query else realm
+        token_req = Request(url, headers={"User-Agent": "NekroAgentLauncher/1.0"})
+        with urlopen(token_req, timeout=self._PROBE_TIMEOUT) as resp:
+            data = json.loads(resp.read())
+        return data.get("token") or data.get("access_token")
+
+    def _open_manifest(self, url, headers):
+        """HEAD 探测 manifest；遇到不支持 HEAD 的源回退 GET。返回响应上下文管理器。"""
+        try:
+            req = Request(url, headers=headers, method="HEAD")
+            return urlopen(req, timeout=self._PROBE_TIMEOUT)
+        except HTTPError as e:
+            if e.code in (405, 501):
+                req = Request(url, headers=headers, method="GET")
+                return urlopen(req, timeout=self._PROBE_TIMEOUT)
+            raise
+
+    def _open_manifest_with_auth(self, url, headers):
+        try:
+            return self._open_manifest(url, headers)
+        except HTTPError as e:
+            if e.code != 401:
+                raise
+            token = self._fetch_bearer_token(e.headers.get("Www-Authenticate", ""))
+            if not token:
+                raise
+            auth_headers = {**headers, "Authorization": f"Bearer {token}"}
+            return self._open_manifest(url, auth_headers)
+
     def _probe_registry_manifest(self, candidate):
+        """探测 manifest 是否可达。
+
+        返回 (ok, detail, reachable)。reachable 表示源本身活着（含 429 限流、
+        鉴权受限等），仅是当前不可直接用 manifest 接口验证，拉取时仍可一试。
+        """
         registry, repo, ref = self._registry_manifest_target(candidate.pull_ref)
         if not registry or not repo or not ref:
-            return False, "无法解析镜像引用"
+            return False, "无法解析镜像引用", False
 
+        url = f"https://{registry}/v2/{repo}/manifests/{ref}"
         headers = {
-            "Accept": (
-                "application/vnd.docker.distribution.manifest.list.v2+json, "
-                "application/vnd.oci.image.index.v1+json, "
-                "application/vnd.docker.distribution.manifest.v2+json, "
-                "application/vnd.oci.image.manifest.v1+json"
-            ),
+            "Accept": self._MANIFEST_ACCEPT,
             "User-Agent": "NekroAgentLauncher/1.0",
         }
-        if registry == "registry-1.docker.io":
-            token_req = Request(
-                "https://auth.docker.io/token?"
-                f"service=registry.docker.io&scope=repository:{repo}:pull",
-                headers={"User-Agent": "NekroAgentLauncher/1.0"},
-            )
-            with urlopen(token_req, timeout=self._PROBE_TIMEOUT) as resp:
-                token = json.loads(resp.read())["token"]
-            headers["Authorization"] = f"Bearer {token}"
 
-        manifest_req = Request(
-            f"https://{registry}/v2/{repo}/manifests/{ref}",
-            headers=headers,
-        )
-        with urlopen(manifest_req, timeout=self._PROBE_TIMEOUT) as resp:
-            resp.read(256)
-        return True, ""
+        try:
+            with self._open_manifest(url, headers):
+                return True, "", True
+        except HTTPError as e:
+            if e.code == 401:
+                # 标准 Registry v2：匿名访问需先按 challenge 换 token 再重试。
+                # 官方源与各代理源走的是同一套协议，此处统一处理。
+                challenge = e.headers.get("Www-Authenticate", "")
+                token = None
+                try:
+                    token = self._fetch_bearer_token(challenge)
+                except Exception:
+                    token = None
+                if token:
+                    auth_headers = {**headers, "Authorization": f"Bearer {token}"}
+                    try:
+                        with self._open_manifest(url, auth_headers):
+                            return True, "", True
+                    except HTTPError as e2:
+                        if e2.code == 429:
+                            return False, "HTTP 429 触发限流（源可达）", True
+                        if e2.code in (401, 403):
+                            return False, f"HTTP {e2.code} 鉴权受限（源可达）", True
+                        return False, f"HTTP {e2.code} {e2.reason}", False
+                return False, "HTTP 401 无法获取鉴权令牌（源可达）", True
+            if e.code == 429:
+                return False, "HTTP 429 触发限流（源可达）", True
+            if e.code in (403,):
+                return False, "HTTP 403 鉴权受限（源可达）", True
+            return False, f"HTTP {e.code} {e.reason}", False
 
     def _probe_pull_candidate_with_docker(self, distro, candidate):
         start = time.monotonic()
@@ -274,8 +348,9 @@ class WSLImageMixin:
 
     def _probe_pull_candidate(self, distro, candidate):
         start = time.monotonic()
+        reachable = False
         try:
-            ok, detail = self._probe_registry_manifest(candidate)
+            ok, detail, reachable = self._probe_registry_manifest(candidate)
         except HTTPError as e:
             ok = False
             detail = f"HTTP {e.code} {e.reason}"
@@ -290,38 +365,41 @@ class WSLImageMixin:
             detail = f"{type(e).__name__}: {e}"
         latency_ms = int((time.monotonic() - start) * 1000)
         if ok:
-            return True, latency_ms, ""
+            return True, latency_ms, "", True
 
         docker_ok, docker_latency_ms, docker_detail = self._probe_pull_candidate_with_docker(
             distro,
             candidate,
         )
         if docker_ok:
-            return True, docker_latency_ms, ""
+            return True, docker_latency_ms, "", True
         if docker_detail:
             detail = f"Registry API: {detail}\nDocker CLI: {docker_detail}"
-        return False, latency_ms, detail
+        return False, latency_ms, detail, reachable
 
     def _probe_pull_candidates(self, distro, candidates):
         ranked = []
-        failed = []
+        reachable = []
+        dead = []
         candidate_index = {candidate: index for index, candidate in enumerate(candidates)}
         with ThreadPoolExecutor(max_workers=len(candidates)) as executor:
             futures = {
                 executor.submit(self._probe_pull_candidate, distro, candidate): candidate
                 for candidate in candidates
             }
-            results = []
+            raw = []
             for future in as_completed(futures):
                 candidate = futures[future]
                 try:
-                    ok, latency_ms, detail = future.result()
+                    ok, latency_ms, detail, is_reachable = future.result()
                 except Exception as e:
-                    ok, latency_ms, detail = False, None, str(e)
-                results.append((candidate, ok, latency_ms, detail))
+                    ok, latency_ms, detail, is_reachable = False, None, str(e), False
+                raw.append((candidate, ok, latency_ms, detail, is_reachable))
 
-        results.sort(key=lambda item: candidate_index[item[0]])
-        for candidate, ok, latency_ms, detail in results:
+        raw.sort(key=lambda item: candidate_index[item[0]])
+        results = []
+        for candidate, ok, latency_ms, detail, is_reachable in raw:
+            results.append((candidate, ok, latency_ms, detail))
             if ok and latency_ms is not None:
                 ranked.append(
                     _PullCandidate(
@@ -336,12 +414,18 @@ class WSLImageMixin:
                     f"镜像源测速 {candidate.source}: {latency_ms}ms",
                     "debug",
                 )
+            elif is_reachable:
+                # 源可达但暂时受限（429/鉴权），拉取时仍可一试，排在死源之前。
+                reachable.append(candidate)
+                if detail:
+                    self.log_received.emit(detail, "debug")
             else:
-                failed.append(candidate)
+                dead.append(candidate)
                 if detail:
                     self.log_received.emit(detail, "debug")
 
         ranked.sort(key=lambda item: item.latency_ms if item.latency_ms is not None else 10**9)
+        failed = reachable + dead
         return ranked, failed, results
 
     def _pull_candidate_cache_key(self, image_ref):
@@ -636,8 +720,6 @@ class WSLImageMixin:
 
     def check_images_status(self, only_image=None):
         """检测镜像本地/远程状态，结果通过 image_status_result 信号发出"""
-        import json
-
         distro = DISTRO_NAME
 
         def _do_check():
@@ -645,8 +727,8 @@ class WSLImageMixin:
             for image_ref, name, desc, modes in self.get_managed_images(self.config):
                 if only_image and image_ref != only_image:
                     continue
-                image = image_ref.split(":")[0]
-                tag = image_ref.split(":")[1] if ":" in image_ref else "latest"
+                normalized_ref = self._normalize_image_ref(image_ref)
+                registry, repo, ref = self._registry_manifest_target(image_ref)
                 entry = {
                     "image": image_ref,
                     "name": name,
@@ -657,9 +739,16 @@ class WSLImageMixin:
                     "error": None,
                 }
                 try:
+                    if not registry or not repo or not ref:
+                        raise ValueError(f"无法解析镜像引用: {image_ref}")
+
                     local_out = self._wsl_exec(
                         distro,
-                        f"docker image inspect {image}:{tag} --format '{{{{index .RepoDigests 0}}}}' 2>/dev/null",
+                        (
+                            "docker image inspect "
+                            f"{shlex.quote(normalized_ref)} "
+                            "--format '{{{{index .RepoDigests 0}}}}' 2>/dev/null"
+                        ),
                         timeout=15,
                     ).strip().strip("'")
                     if local_out and "@" in local_out:
@@ -669,21 +758,16 @@ class WSLImageMixin:
                         full_local = ""
                         entry["local"] = None
 
-                    token_req = Request(
-                        f"https://auth.docker.io/token?service=registry.docker.io&scope=repository:{image}:pull",
-                        headers={"User-Agent": "NekroAgent/1.0"},
-                    )
-                    with urlopen(token_req, timeout=10) as resp:
-                        token = json.loads(resp.read())["token"]
-                    manifest_req = Request(
-                        f"https://registry-1.docker.io/v2/{image}/manifests/{tag}",
-                        headers={
-                            "Authorization": f"Bearer {token}",
-                            "Accept": "application/vnd.docker.distribution.manifest.v2+json",
-                            "User-Agent": "NekroAgent/1.0",
-                        },
-                    )
-                    with urlopen(manifest_req, timeout=10) as resp:
+                    manifest_url = f"https://{registry}/v2/{repo}/manifests/{ref}"
+                    manifest_headers = {
+                        "Accept": self._MANIFEST_ACCEPT,
+                        "User-Agent": "NekroAgent/1.0",
+                    }
+                    with self._open_manifest_with_auth(
+                        manifest_url,
+                        manifest_headers,
+                    ) as resp:
+                        resp.read(256)
                         full_remote = resp.headers.get("Docker-Content-Digest", "")
                         entry["remote"] = full_remote[:19] if full_remote else ""
 
@@ -693,24 +777,27 @@ class WSLImageMixin:
                     entry["error"] = (
                         "镜像远程状态检查失败\n"
                         f"镜像: {image_ref}\n"
-                        f"Docker Hub 仓库: {image}\n"
-                        f"标签: {tag}\n"
+                        f"Registry: {registry}\n"
+                        f"仓库: {repo}\n"
+                        f"引用: {ref}\n"
                         f"HTTP: {e.code} {e.reason}"
                     )
                 except URLError as e:
                     entry["error"] = (
                         "镜像远程状态检查失败\n"
                         f"镜像: {image_ref}\n"
-                        f"Docker Hub 仓库: {image}\n"
-                        f"标签: {tag}\n"
+                        f"Registry: {registry}\n"
+                        f"仓库: {repo}\n"
+                        f"引用: {ref}\n"
                         f"网络错误: {e.reason}"
                     )
                 except Exception as e:
                     entry["error"] = (
                         "镜像状态检查失败\n"
                         f"镜像: {image_ref}\n"
-                        f"Docker Hub 仓库: {image}\n"
-                        f"标签: {tag}\n"
+                        f"Registry: {registry}\n"
+                        f"仓库: {repo}\n"
+                        f"引用: {ref}\n"
                         f"异常: {type(e).__name__}: {e}"
                     )
                 results.append(entry)
@@ -723,10 +810,8 @@ class WSLImageMixin:
         distro = DISTRO_NAME
 
         def _do_pull():
-            image = image_ref.split(":")[0]
-            tag = image_ref.split(":")[1] if ":" in image_ref else "latest"
             self._emit_pull_progress("start", f"拉取镜像: {image_ref}")
-            ok = self._pull_images(distro, [f"{image}:{tag}"])
+            ok = self._pull_images(distro, [image_ref])
             if ok:
                 self.image_pull_result.emit(image_ref, True, "拉取成功")
             else:

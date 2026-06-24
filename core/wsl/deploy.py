@@ -1,5 +1,6 @@
 import json
 import os
+import posixpath
 import shlex
 import subprocess
 import threading
@@ -10,9 +11,70 @@ from core.wsl.constants import CC_SANDBOX_IMAGE, DISTRO_NAME, STABLE_IMAGE
 
 
 class WSLDeployMixin:
+    _DANGEROUS_WSL_DELETE_PATHS = {
+        "",
+        "/",
+        "/root",
+        "/home",
+        "/opt",
+        "/var",
+        "/var/lib",
+        "/var/lib/docker",
+        "/var/lib/docker/volumes",
+    }
+
     @staticmethod
     def _instance_release_channel(inst):
         return (inst or {}).get("release_channel", "stable") or "stable"
+
+    @staticmethod
+    def _normalize_wsl_abs_path(path):
+        normalized = str(path or "").strip().replace("\\", "/")
+        if not normalized.startswith("/"):
+            return ""
+        return posixpath.normpath(normalized)
+
+    def _validate_managed_deploy_dir_for_delete(self, distro, deploy_dir, action):
+        path = self._normalize_wsl_abs_path(deploy_dir)
+        if not path:
+            return False, f"{action}\n部署目录为空或不是 WSL 绝对路径: {deploy_dir!r}"
+        if path in self._DANGEROUS_WSL_DELETE_PATHS:
+            return False, f"{action}\n拒绝删除高风险路径: {path}"
+        if not path.startswith("/root/"):
+            return False, f"{action}\n拒绝删除非托管路径: {path}"
+        if not posixpath.basename(path).endswith("nekro_agent"):
+            return False, f"{action}\n部署目录名称不符合托管实例规则: {path}"
+
+        compose_path = posixpath.join(path, "docker-compose.yml")
+        marker_cmd = (
+            f"test -d {shlex.quote(path)} "
+            f"&& test -f {shlex.quote(compose_path)} "
+            f"&& grep -qi 'nekro' {shlex.quote(compose_path)} "
+            "&& echo yes"
+        )
+        marker = self._wsl_exec(distro, marker_cmd, timeout=15).strip()
+        if marker != "yes":
+            return False, (
+                f"{action}\n"
+                "部署目录缺少 Nekro Agent Compose 标记，已拒绝删除。\n"
+                f"目录: {path}"
+            )
+        return True, path
+
+    def _remove_managed_deploy_dir(self, distro, deploy_dir, action):
+        ok, detail_or_path = self._validate_managed_deploy_dir_for_delete(
+            distro,
+            deploy_dir,
+            action,
+        )
+        if not ok:
+            raise RuntimeError(detail_or_path)
+        self._run_wsl_checked(
+            distro,
+            f"rm -rf {shlex.quote(detail_or_path)}",
+            action=action,
+            timeout=30,
+        )
 
     def _launcher_data_path(self, *parts):
         return os.path.join(self.base_path, "launcher_data", *parts)
@@ -32,10 +94,15 @@ class WSLDeployMixin:
     def _save_deploy_info(self, info, inst_id=None):
         if not self.config:
             return
-        self.config.set("deploy_info", info)
         target_id = inst_id or self.config.get_active_instance_id()
         if target_id:
-            self.config.update_instance(target_id, deploy_info=info)
+            self.config.update_instance_with_globals(
+                target_id,
+                instance_updates={"deploy_info": info},
+                global_updates={"deploy_info": info},
+            )
+        else:
+            self.config.set("deploy_info", info)
 
     def _wait_deploy_optional_reply(self, label, prompt, timeout=300):
         self._deploy_optional_reply = None
@@ -398,24 +465,28 @@ class WSLDeployMixin:
         self.status_changed.emit("启动中...")
         self.log_received.emit("正在启动所有实例服务...", "info")
 
+        def _sync_active_compat_fields(inst_id, inst):
+            self.config.set_many(
+                {
+                    "active_instance": inst_id,
+                    "deploy_mode": inst.get("deploy_mode", ""),
+                    "nekro_port": inst.get("nekro_port", 8021),
+                    "napcat_port": inst.get("napcat_port", 6099),
+                    "release_channel": inst.get("release_channel", "stable"),
+                    "preview_backup_available": bool(
+                        inst.get("preview_backup_available", False)
+                    ),
+                    "deploy_info": inst.get("deploy_info"),
+                }
+            )
+
         def _deploy_all():
             failures = []
             try:
                 for inst_id, inst in ordered:
                     attach = inst_id == default_id
                     if attach:
-                        self.config.set("active_instance", inst_id)
-                        self.config.set("deploy_mode", inst.get("deploy_mode", ""))
-                        self.config.set("nekro_port", inst.get("nekro_port", 8021))
-                        self.config.set("napcat_port", inst.get("napcat_port", 6099))
-                        self.config.set(
-                            "release_channel", inst.get("release_channel", "stable")
-                        )
-                        self.config.set(
-                            "preview_backup_available",
-                            bool(inst.get("preview_backup_available", False)),
-                        )
-                        self.config.set("deploy_info", inst.get("deploy_info"))
+                        _sync_active_compat_fields(inst_id, inst)
                     try:
                         ok = self._start_instance_sync(
                             inst_id,
@@ -434,25 +505,7 @@ class WSLDeployMixin:
                 if default_id:
                     default_inst = self.config.get_instance(default_id)
                     if default_inst:
-                        self.config.set("active_instance", default_id)
-                        self.config.set(
-                            "deploy_mode", default_inst.get("deploy_mode", "")
-                        )
-                        self.config.set(
-                            "nekro_port", default_inst.get("nekro_port", 8021)
-                        )
-                        self.config.set(
-                            "napcat_port", default_inst.get("napcat_port", 6099)
-                        )
-                        self.config.set(
-                            "release_channel",
-                            default_inst.get("release_channel", "stable"),
-                        )
-                        self.config.set(
-                            "preview_backup_available",
-                            bool(default_inst.get("preview_backup_available", False)),
-                        )
-                        self.config.set("deploy_info", default_inst.get("deploy_info"))
+                        _sync_active_compat_fields(default_id, default_inst)
 
                 if failures and default_id in failures:
                     self.status_changed.emit("启动失败")
@@ -742,11 +795,10 @@ class WSLDeployMixin:
                 self.log_received.emit("[卸载] ✓ 容器已清除", "info")
 
                 self.log_received.emit("[卸载] 2/3 清理部署文件...", "info")
-                self._run_wsl_checked(
+                self._remove_managed_deploy_dir(
                     distro,
-                    f"rm -rf {shlex.quote(deploy_dir)}",
-                    action="[卸载] 清理部署文件失败",
-                    timeout=30,
+                    deploy_dir,
+                    "[卸载] 清理部署文件失败",
                 )
                 self.log_received.emit("[卸载] ✓ 部署文件已清理", "info")
 
@@ -843,11 +895,10 @@ class WSLDeployMixin:
 
                 self.log_received.emit(f"[移除 {name}] 2/2 清理部署目录...", "info")
                 if deploy_dir:
-                    self._run_wsl_checked(
+                    self._remove_managed_deploy_dir(
                         distro,
-                        f"rm -rf {shlex.quote(deploy_dir)}",
-                        action=f"[移除 {name}] 清理部署目录失败",
-                        timeout=30,
+                        deploy_dir,
+                        f"[移除 {name}] 清理部署目录失败",
                     )
                 self.log_received.emit(f"[移除 {name}] ✓ 实例已移除", "info")
             except Exception as e:

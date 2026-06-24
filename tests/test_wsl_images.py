@@ -29,7 +29,7 @@ class _DummyImages(WSLImageMixin):
             "fast.test": 50,
             "Docker Hub": 500,
         }
-        return True, latencies[candidate.source], ""
+        return True, latencies[candidate.source], "", True
 
     def _pull_image_once(self, distro, image_ref):
         self.pulls.append(image_ref)
@@ -76,6 +76,36 @@ class WSLImageMixinTests(unittest.TestCase):
             WSLImageMixin._proxy_image_ref("docker.1ms.run", "postgres:14"),
             "docker.1ms.run/library/postgres:14",
         )
+
+    def test_registry_manifest_target_handles_registry_with_port(self):
+        self.assertEqual(
+            WSLImageMixin._registry_manifest_target("localhost:5000/team/app:1.2.3"),
+            ("localhost:5000", "team/app", "1.2.3"),
+        )
+
+    def test_registry_manifest_target_handles_digest_ref(self):
+        self.assertEqual(
+            WSLImageMixin._registry_manifest_target(
+                "registry.example.com/team/app@sha256:abc123"
+            ),
+            ("registry.example.com", "team/app", "sha256:abc123"),
+        )
+
+    def test_parse_auth_challenge_extracts_realm_service_scope(self):
+        params = WSLImageMixin._parse_auth_challenge(
+            'Bearer realm="https://auth.docker.io/token",'
+            'service="registry.docker.io",scope="repository:library/postgres:pull"'
+        )
+        self.assertIsNotNone(params)
+        assert params is not None
+        self.assertEqual(params["realm"], "https://auth.docker.io/token")
+        self.assertEqual(params["service"], "registry.docker.io")
+        self.assertEqual(params["scope"], "repository:library/postgres:pull")
+
+    def test_parse_auth_challenge_ignores_non_bearer(self):
+        self.assertIsNone(WSLImageMixin._parse_auth_challenge('Basic realm="x"'))
+        self.assertIsNone(WSLImageMixin._parse_auth_challenge(""))
+        self.assertIsNone(WSLImageMixin._parse_auth_challenge(None))
 
     def test_rank_pull_candidates_prefers_fastest_probe(self):
         candidates = _DummyImages()._rank_pull_candidates("NekroAgent", "postgres:14")

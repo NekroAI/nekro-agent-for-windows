@@ -35,6 +35,7 @@ from core.backend_factory import BackendFactory
 from core.config_manager import ConfigManager
 from core.port_utils import (
     normalize_port,
+    validate_instance_port_conflicts,
     validate_port_bindings,
 )
 from ui.styles import STYLESHEET
@@ -1897,16 +1898,19 @@ class MainWindow(QMainWindow):
         inst = self.config.get_instance(inst_id)
         if not inst:
             return None
-        self.config.set("active_instance", inst_id)
-        self.config.set("deploy_mode", inst.get("deploy_mode", ""))
-        self.config.set("nekro_port", inst.get("nekro_port", 8021))
-        self.config.set("napcat_port", inst.get("napcat_port", 6099))
-        self.config.set("release_channel", inst.get("release_channel", "stable"))
-        self.config.set(
-            "preview_backup_available",
-            bool(inst.get("preview_backup_available", False)),
+        self.config.set_many(
+            {
+                "active_instance": inst_id,
+                "deploy_mode": inst.get("deploy_mode", ""),
+                "nekro_port": inst.get("nekro_port", 8021),
+                "napcat_port": inst.get("napcat_port", 6099),
+                "release_channel": inst.get("release_channel", "stable"),
+                "preview_backup_available": bool(
+                    inst.get("preview_backup_available", False)
+                ),
+                "deploy_info": inst.get("deploy_info"),
+            }
         )
-        self.config.set("deploy_info", inst.get("deploy_info"))
         return inst
 
     def _sync_browser_to_active_instance(self, force_reload=True):
@@ -2112,17 +2116,20 @@ class MainWindow(QMainWindow):
         self.config.set_instance(inst_id, inst_save)
         if not self.config.get_default_instance_id():
             self.config.set_default_instance_id(inst_id)
-        self.config.set("active_instance", inst_id)
-        self.config.set("nekro_port", pending["nekro_port"])
-        self.config.set("napcat_port", pending["napcat_port"])
-        self.config.set("deploy_mode", pending["deploy_mode"])
-        self.config.set("release_channel", pending.get("release_channel", "stable"))
-        self.config.set(
-            "preview_backup_available",
-            bool(pending.get("preview_backup_available", False)),
+        self.config.set_many(
+            {
+                "active_instance": inst_id,
+                "nekro_port": pending["nekro_port"],
+                "napcat_port": pending["napcat_port"],
+                "deploy_mode": pending["deploy_mode"],
+                "release_channel": pending.get("release_channel", "stable"),
+                "preview_backup_available": bool(
+                    pending.get("preview_backup_available", False)
+                ),
+                "deploy_info": pending.get("deploy_info"),
+                "first_run": False,
+            }
         )
-        self.config.set("deploy_info", pending.get("deploy_info"))
-        self.config.set("first_run", False)
         self.refresh_dashboard()
 
     def _do_deploy(
@@ -2199,22 +2206,28 @@ class MainWindow(QMainWindow):
         if pending and pending.get("inst_id"):
             self.config.remove_instance(pending["inst_id"])
 
-        if prev_id:
-            self.config.set("active_instance", prev_id)
-        if prev_mode:
-            self.config.set("deploy_mode", prev_mode)
         prev_inst = self.config.get_instance(prev_id) if prev_id else None
         if prev_inst:
-            self.config.set("nekro_port", prev_inst.get("nekro_port", 8021))
-            self.config.set("napcat_port", prev_inst.get("napcat_port", 6099))
-            self.config.set(
-                "release_channel", prev_inst.get("release_channel", "stable")
+            self.config.set_many(
+                {
+                    "active_instance": prev_id,
+                    "deploy_mode": prev_mode or prev_inst.get("deploy_mode", ""),
+                    "nekro_port": prev_inst.get("nekro_port", 8021),
+                    "napcat_port": prev_inst.get("napcat_port", 6099),
+                    "release_channel": prev_inst.get("release_channel", "stable"),
+                    "preview_backup_available": bool(
+                        prev_inst.get("preview_backup_available", False)
+                    ),
+                    "deploy_info": prev_inst.get("deploy_info"),
+                }
             )
-            self.config.set(
-                "preview_backup_available",
-                bool(prev_inst.get("preview_backup_available", False)),
-            )
-            self.config.set("deploy_info", prev_inst.get("deploy_info"))
+        elif prev_id or prev_mode:
+            values = {}
+            if prev_id:
+                values["active_instance"] = prev_id
+            if prev_mode:
+                values["deploy_mode"] = prev_mode
+            self.config.set_many(values)
         elif not self.config.list_instances():
             self.config.clear_runtime_state(keep_first_run=True)
 
@@ -2813,6 +2826,7 @@ class MainWindow(QMainWindow):
                     if napcat_port == current_napcat:
                         ignore_ports.add(napcat_port)
 
+            active_id = self.config.get_active_instance_id()
             port_specs = [("Nekro Agent 端口", nekro_port)]
             if deploy_mode == "napcat":
                 port_specs.append(("NapCat 端口", napcat_port))
@@ -2823,12 +2837,19 @@ class MainWindow(QMainWindow):
             if not ok:
                 self._show_notice_dialog("端口冲突", message)
                 return
+            ok, message = validate_instance_port_conflicts(
+                self.config.list_instances(),
+                port_specs,
+                current_instance_id=active_id,
+            )
+            if not ok:
+                self._show_notice_dialog("端口冲突", message)
+                return
 
             self.config.set("nekro_port", nekro_port)
             if deploy_mode == "napcat":
                 self.config.set("napcat_port", napcat_port)
 
-            active_id = self.config.get_active_instance_id()
             deploy_info = self.config.get("deploy_info")
             if deploy_info:
                 deploy_info["port"] = str(nekro_port)

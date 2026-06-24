@@ -4,6 +4,7 @@ import os
 import shutil
 import sys
 import threading
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,7 @@ class ConfigManager:
             self.config_path = os.path.join(self.app_data_dir, "config.json")
 
         self.last_save_error = ""
+        self.last_load_error = ""
         self._migrate_legacy_state()
 
         self.default_config = {
@@ -152,12 +154,34 @@ class ConfigManager:
                 with open(self.config_path, "r", encoding="utf-8") as f:
                     return {**self.default_config, **json.load(f)}
             except json.JSONDecodeError as e:
-                logger.error("配置文件格式错误，将使用默认配置: %s", e)
+                self.last_load_error = f"配置文件格式错误: {e}"
+                corrupt_path = self._quarantine_corrupt_config()
+                if corrupt_path:
+                    logger.error(
+                        "配置文件格式错误，已保留损坏文件 %s，将使用默认配置: %s",
+                        corrupt_path,
+                        e,
+                    )
+                else:
+                    logger.error("配置文件格式错误，将使用默认配置: %s", e)
                 return self.default_config.copy()
             except Exception as e:
+                self.last_load_error = f"读取配置文件失败: {e}"
                 logger.error("读取配置文件失败: %s", e)
                 return self.default_config.copy()
         return self.default_config.copy()
+
+    def _quarantine_corrupt_config(self):
+        try:
+            if not os.path.exists(self.config_path):
+                return ""
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            corrupt_path = f"{self.config_path}.corrupt.{stamp}"
+            os.replace(self.config_path, corrupt_path)
+            return corrupt_path
+        except Exception as e:
+            logger.warning("保留损坏配置文件失败 %s: %s", self.config_path, e)
+            return ""
 
     def _save_config_locked(self):
         tmp_path = ""
@@ -191,6 +215,26 @@ class ConfigManager:
     def set(self, key, value):
         with self._lock:
             self.config[key] = value
+            return self._save_config_locked()
+
+    def set_many(self, values):
+        with self._lock:
+            self.config.update(values)
+            return self._save_config_locked()
+
+    def update_instance_with_globals(
+        self,
+        inst_id,
+        instance_updates=None,
+        global_updates=None,
+    ):
+        with self._lock:
+            if global_updates:
+                self.config.update(global_updates)
+            if inst_id and instance_updates:
+                instances = self.config.setdefault("instances", {})
+                inst = instances.setdefault(inst_id, {})
+                inst.update(instance_updates)
             return self._save_config_locked()
 
     # ------------------------------------------------------------------ #
@@ -266,12 +310,14 @@ class ConfigManager:
 
     def set_active_preview_backup_available(self, available: bool):
         inst_id = self.get_active_instance_id()
+        value = bool(available)
         if inst_id:
-            return self.update_instance(
+            return self.update_instance_with_globals(
                 inst_id,
-                preview_backup_available=bool(available),
+                instance_updates={"preview_backup_available": value},
+                global_updates={"preview_backup_available": value},
             )
-        return self.set("preview_backup_available", bool(available))
+        return self.set("preview_backup_available", value)
 
     def clear_runtime_state(self, keep_first_run=False):
         with self._lock:
