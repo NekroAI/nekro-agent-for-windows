@@ -1,0 +1,766 @@
+import hashlib
+import hmac
+import json
+import os
+import secrets
+import select
+import shlex
+import socket
+import socketserver
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+from core.wsl.constants import DISTRO_NAME
+
+
+PROTOCOL_VERSION = "na-tools.daemon.v1"
+PROVIDER = "na-windows-launcher"
+API_BASE = "http://na-tools.local/v1"
+SOCKS_URL = "socks5h://host.docker.internal:18082"
+HTTP_HOST = "127.0.0.1"
+HTTP_PORT = 18081
+SOCKS_HOST = "0.0.0.0"
+SOCKS_PORT = 18082
+MAX_REQUEST_BODY_BYTES = 1024 * 1024
+
+
+def _utc_now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _json_bytes(payload):
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _sha256_hex(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def _error(code, message, details=None):
+    err = {"code": code, "message": message}
+    if details:
+        err["details"] = details
+    return {"error": err}
+
+
+@dataclass
+class DaemonBinding:
+    launcher_inst_id: str
+    instance_id: str
+    token: str
+    data_dir: str
+    deploy_dir: str
+    compose_file: str
+    env_file: str
+    channel: str
+    nekro_port: int
+    instance_name: str
+
+
+class DaemonJob:
+    def __init__(self, job_id, job_type, instance_id, request):
+        self.job_id = job_id
+        self.type = job_type
+        self.instance_id = instance_id
+        self.request = request
+        self.status = "queued"
+        self.phase = "validate_instance"
+        self.message = "任务已加入队列"
+        self.progress = {"current": 0, "total": 0, "label": ""}
+        self.created_at = _utc_now()
+        self.started_at = None
+        self.finished_at = None
+        self.exit_code = None
+        self.error = None
+        self.result = None
+        self.logs = []
+        self._next_seq = 1
+        self._condition = threading.Condition()
+
+    def snapshot(self):
+        with self._condition:
+            return {
+                "job_id": self.job_id,
+                "type": self.type,
+                "instance_id": self.instance_id,
+                "status": self.status,
+                "phase": self.phase,
+                "message": self.message,
+                "progress": dict(self.progress),
+                "created_at": self.created_at,
+                "started_at": self.started_at,
+                "finished_at": self.finished_at,
+                "exit_code": self.exit_code,
+                "error": self.error,
+                "result": self.result,
+            }
+
+    def log_snapshot(self, limit=200, after_seq=0):
+        with self._condition:
+            logs = [item for item in self.logs if item["seq"] > after_seq]
+            if limit > 0:
+                logs = logs[-limit:]
+            next_after_seq = logs[-1]["seq"] if logs else after_seq
+            return {"job_id": self.job_id, "logs": logs, "next_after_seq": next_after_seq}
+
+    def add_log(self, line, level="info", stream="system"):
+        with self._condition:
+            entry = {
+                "seq": self._next_seq,
+                "ts": _utc_now(),
+                "level": level,
+                "stream": stream,
+                "line": str(line),
+            }
+            self._next_seq += 1
+            self.logs.append(entry)
+            if len(self.logs) > 1000:
+                self.logs = self.logs[-1000:]
+            self._condition.notify_all()
+            return entry
+
+    def start(self, phase="validate_instance", message="开始执行任务"):
+        with self._condition:
+            self.status = "running"
+            self.phase = phase
+            self.message = message
+            self.started_at = self.started_at or _utc_now()
+            self._condition.notify_all()
+        self.add_log(message)
+
+    def set_progress(self, phase, current, total, label):
+        with self._condition:
+            self.phase = phase
+            self.message = label
+            self.progress = {"current": current, "total": total, "label": label}
+            self._condition.notify_all()
+        self.add_log(label)
+
+    def succeed(self, message, result=None):
+        with self._condition:
+            self.status = "succeeded"
+            self.phase = "finished"
+            self.message = message
+            self.progress = {"current": 1, "total": 1, "label": message}
+            self.finished_at = _utc_now()
+            self.exit_code = 0
+            self.result = result or {}
+            self._condition.notify_all()
+        self.add_log(message)
+
+    def fail(self, code, message, details=None):
+        with self._condition:
+            self.status = "failed"
+            self.message = message
+            self.finished_at = _utc_now()
+            self.exit_code = 1
+            self.error = {"code": code, "message": message, "details": details or {}}
+            self._condition.notify_all()
+        self.add_log(message, level="error")
+
+    def wait_for_event(self, after_seq, timeout=30):
+        deadline = time.time() + timeout
+        with self._condition:
+            while time.time() < deadline:
+                if self.logs and self.logs[-1]["seq"] > after_seq:
+                    return True
+                if self.status in {"succeeded", "failed", "cancelled"}:
+                    return True
+                remaining = max(0.1, deadline - time.time())
+                self._condition.wait(min(remaining, 1.0))
+        return False
+
+
+class JobStore:
+    def __init__(self):
+        self._jobs = {}
+        self._client_requests = {}
+        self._lock = threading.RLock()
+
+    def create_update_job(self, instance_id, request):
+        client_request_id = str(request.get("client_request_id") or "").strip()
+        with self._lock:
+            if client_request_id and client_request_id in self._client_requests:
+                return self._jobs[self._client_requests[client_request_id]], False
+            for job in self._jobs.values():
+                if job.instance_id == instance_id and job.status in {"queued", "running"}:
+                    return None, False
+            job_id = "upd_" + secrets.token_hex(12)
+            job = DaemonJob(job_id, "update", instance_id, request)
+            self._jobs[job_id] = job
+            if client_request_id:
+                self._client_requests[client_request_id] = job_id
+            return job, True
+
+    def get(self, job_id):
+        with self._lock:
+            return self._jobs.get(job_id)
+
+
+class LauncherDaemonFacade:
+    def __init__(
+        self,
+        backend,
+        *,
+        http_host=HTTP_HOST,
+        http_port=HTTP_PORT,
+        socks_host=SOCKS_HOST,
+        socks_port=SOCKS_PORT,
+    ):
+        self.backend = backend
+        self.http_host = http_host
+        self.http_port = http_port
+        self.socks_host = socks_host
+        self.socks_port = socks_port
+        self.jobs = JobStore()
+        self._bindings_by_instance = {}
+        self._bindings_by_launcher_id = {}
+        self._used_nonces = {}
+        self._lock = threading.RLock()
+        self._http_server = None
+        self._http_thread = None
+        self._socks_server = None
+        self._socks_thread = None
+        self.started_at = _utc_now()
+
+    def start(self):
+        try:
+            if self._http_server is None:
+                handler_cls = self._make_http_handler()
+
+                class ReusableHTTPServer(ThreadingHTTPServer):
+                    allow_reuse_address = True
+
+                self._http_server = ReusableHTTPServer(
+                    (self.http_host, self.http_port),
+                    handler_cls,
+                )
+                self._http_thread = threading.Thread(
+                    target=self._http_server.serve_forever,
+                    name="LauncherDaemonHTTP",
+                    daemon=True,
+                )
+                self._http_thread.start()
+            if self._socks_server is None:
+                socks_cls = self._make_socks_handler()
+
+                class ReusableTCPServer(socketserver.ThreadingTCPServer):
+                    allow_reuse_address = True
+
+                self._socks_server = ReusableTCPServer(
+                    (self.socks_host, self.socks_port),
+                    socks_cls,
+                )
+                self._socks_server.daemon_threads = True
+                self._socks_thread = threading.Thread(
+                    target=self._socks_server.serve_forever,
+                    name="LauncherDaemonSOCKS",
+                    daemon=True,
+                )
+                self._socks_thread.start()
+        except Exception:
+            self.stop()
+            raise
+
+    def stop(self):
+        if self._http_server is not None:
+            self._http_server.shutdown()
+            self._http_server.server_close()
+            self._http_server = None
+        if self._socks_server is not None:
+            self._socks_server.shutdown()
+            self._socks_server.server_close()
+            self._socks_server = None
+
+    def ensure_instance_binding(self, launcher_inst_id, inst):
+        data_dir = str(inst.get("data_dir") or "/root/nekro_agent_data")
+        deploy_dir = str(inst.get("deploy_dir") or "/root/nekro_agent")
+        instance_name = str(inst.get("instance_name") or "")
+        tools_dir = f"{data_dir.rstrip('/')}/.na-tools"
+        salt_path = f"{tools_dir}/instance.salt"
+        token_path = f"{tools_dir}/daemon.token"
+
+        with self._lock:
+            self.backend._run_wsl_checked(
+                DISTRO_NAME,
+                f"mkdir -p {shlex.quote(tools_dir)}",
+                action="[daemon] 创建 .na-tools 目录失败",
+                timeout=30,
+            )
+            salt = self._read_wsl_file(salt_path).strip()
+            if not salt:
+                salt = secrets.token_hex(16)
+                self._write_wsl_file(salt_path, salt + "\n")
+            token = self._read_wsl_file(token_path).strip()
+            if not token:
+                token = secrets.token_hex(32)
+                self._write_wsl_file(token_path, token + "\n")
+
+            identity = f"{data_dir}\0{instance_name.rstrip('_') or launcher_inst_id}\0{salt}"
+            instance_id = "sha256:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+            binding = DaemonBinding(
+                launcher_inst_id=launcher_inst_id,
+                instance_id=instance_id,
+                token=token,
+                data_dir=data_dir,
+                deploy_dir=deploy_dir,
+                compose_file=f"{deploy_dir}/docker-compose.yml",
+                env_file=f"{deploy_dir}/.env",
+                channel=str(inst.get("release_channel") or "stable"),
+                nekro_port=int(inst.get("nekro_port") or 8021),
+                instance_name=instance_name,
+            )
+            self._bindings_by_instance[instance_id] = binding
+            self._bindings_by_launcher_id[launcher_inst_id] = binding
+            self._write_daemon_json(binding, token_path)
+            self._harden_binding_files(tools_dir, salt_path, token_path, binding)
+            if self.backend.config:
+                self.backend.config.update_instance(
+                    launcher_inst_id,
+                    daemon_instance_id=instance_id,
+                )
+            return binding
+
+    def env_values_for_binding(self, binding):
+        return {
+            "NA_TOOLS_DAEMON_ENABLED": "true",
+            "NA_TOOLS_DAEMON_API_BASE": API_BASE,
+            "NA_TOOLS_DAEMON_SOCKS": SOCKS_URL,
+            "NA_TOOLS_DAEMON_INSTANCE_ID": binding.instance_id,
+            "NA_TOOLS_DAEMON_TOKEN_FILE": f"{binding.data_dir}/.na-tools/daemon.token",
+        }
+
+    def _read_wsl_file(self, path):
+        quoted = shlex.quote(path)
+        return self.backend._wsl_exec(
+            DISTRO_NAME,
+            f"test -f {quoted} && cat {quoted}",
+            timeout=15,
+        )
+
+    def _write_wsl_file(self, path, content):
+        self.backend._write_to_wsl(DISTRO_NAME, content, path)
+
+    def _write_daemon_json(self, binding, token_path):
+        payload = {
+            "protocol_version": PROTOCOL_VERSION,
+            "provider": PROVIDER,
+            "api_base": API_BASE,
+            "socks_url": SOCKS_URL,
+            "instance_id": binding.instance_id,
+            "data_dir": binding.data_dir,
+            "token_file": token_path,
+            "http_bind": f"{self.http_host}:{self.http_port}",
+            "socks_bind": f"{self.socks_host}:{self.socks_port}",
+            "daemon_pid": os.getpid(),
+            "started_at": _utc_now(),
+        }
+        self._write_wsl_file(
+            f"{binding.data_dir.rstrip('/')}/.na-tools/daemon.json",
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        )
+
+    def _harden_binding_files(self, tools_dir, salt_path, token_path, binding):
+        daemon_json = f"{binding.data_dir.rstrip('/')}/.na-tools/daemon.json"
+        self.backend._run_wsl_checked(
+            DISTRO_NAME,
+            "chmod 700 {tools_dir} && chmod 600 {salt} {token} {daemon_json}".format(
+                tools_dir=shlex.quote(tools_dir),
+                salt=shlex.quote(salt_path),
+                token=shlex.quote(token_path),
+                daemon_json=shlex.quote(daemon_json),
+            ),
+            action="[daemon] 设置 .na-tools 文件权限失败",
+            timeout=30,
+        )
+
+    def _binding_for_instance(self, instance_id):
+        with self._lock:
+            binding = self._bindings_by_instance.get(instance_id)
+            if binding:
+                return binding
+            if not self.backend.config:
+                return None
+            for launcher_inst_id, inst in self.backend.config.list_instances():
+                if inst.get("daemon_instance_id") == instance_id:
+                    try:
+                        return self.ensure_instance_binding(launcher_inst_id, inst)
+                    except Exception:
+                        return None
+            return None
+
+    def _current_binding(self):
+        if not self.backend.config:
+            return None
+        launcher_inst_id = self.backend.config.get_active_instance_id()
+        if not launcher_inst_id:
+            return None
+        inst = self.backend.config.get_instance(launcher_inst_id)
+        if not inst:
+            return None
+        with self._lock:
+            binding = self._bindings_by_launcher_id.get(launcher_inst_id)
+        if binding:
+            return binding
+        return self.ensure_instance_binding(launcher_inst_id, inst)
+
+    def _validate_auth(self, method, path_with_query, headers, body):
+        def _header(name):
+            return headers.get(name.lower(), "")
+
+        instance_id = _header("X-NA-Instance")
+        timestamp = _header("X-NA-Timestamp")
+        nonce = _header("X-NA-Nonce")
+        signature = _header("X-NA-Signature")
+        if not all([instance_id, timestamp, nonce, signature]):
+            return None, _error("auth_failed", "缺少 daemon 签名头")
+        binding = self._binding_for_instance(instance_id)
+        if not binding:
+            return None, _error("instance_not_bound", "实例未绑定到 Windows 启动器 daemon")
+        try:
+            timestamp_int = int(timestamp)
+        except ValueError:
+            return None, _error("auth_failed", "时间戳格式无效")
+        now_ms = int(time.time() * 1000)
+        if abs(now_ms - timestamp_int) > 60_000:
+            return None, _error("auth_failed", "请求时间戳已过期")
+
+        cutoff = now_ms - 300_000
+        nonce_key = f"{instance_id}:{nonce}"
+        with self._lock:
+            self._used_nonces = {
+                key: value for key, value in self._used_nonces.items() if value >= cutoff
+            }
+            if nonce_key in self._used_nonces:
+                return None, _error("request_replayed", "重复的 daemon 请求 nonce")
+
+        body_hash = _sha256_hex(body)
+        signing_text = "\n".join(
+            [method.upper(), path_with_query, timestamp, nonce, body_hash]
+        )
+        expected = "v1=" + hmac.new(
+            binding.token.encode("utf-8"),
+            signing_text.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(expected, signature):
+            return None, _error("auth_failed", "daemon 签名校验失败")
+        with self._lock:
+            self._used_nonces[nonce_key] = now_ms
+        return binding, None
+
+    def _capabilities(self, binding):
+        enabled = True
+        reason = None
+        try:
+            if not self.backend.runtime_exists():
+                enabled = False
+                reason = "wsl_unavailable"
+            elif not self.backend._wsl_exec(
+                DISTRO_NAME,
+                f"test -f {shlex.quote(binding.compose_file)} && "
+                f"test -f {shlex.quote(binding.env_file)} && echo yes",
+                timeout=15,
+            ).strip() == "yes":
+                enabled = False
+                reason = "compose_missing"
+        except Exception:
+            enabled = False
+            reason = "wsl_unavailable"
+
+        return {
+            "enabled": enabled,
+            "provider": PROVIDER,
+            "protocol_version": PROTOCOL_VERSION,
+            "platform": "windows",
+            "instance_id": binding.instance_id,
+            "supports": {
+                "update": True,
+                "preview": False,
+                "rollback": False,
+                "backup": True,
+                "restore": False,
+                "restore_pre_preview": False,
+                "cancel": False,
+                "log_stream": True,
+                "daemon_update": False,
+            },
+            "limits": {"max_parallel_jobs_per_instance": 1, "job_log_retention_days": 7},
+            "unavailable_reason": reason,
+        }
+
+    def _instance_payload(self, binding):
+        return {
+            "instance_id": binding.instance_id,
+            "data_dir": binding.data_dir,
+            "compose_file": binding.compose_file,
+            "env_file": binding.env_file,
+            "channel": binding.channel,
+            "app": {
+                "expose_port": binding.nekro_port,
+                "health_url": f"http://127.0.0.1:{binding.nekro_port}/api/health",
+            },
+            "container": {
+                "name": f"{binding.instance_name}nekro_agent",
+                "status": "running" if self.backend.is_running else "unknown",
+                "image": self.backend.get_agent_image_ref(self.backend.config),
+                "image_tag": binding.channel,
+            },
+            "docker": {
+                "docker_installed": True,
+                "compose_installed": True,
+                "compose_cmd": ["docker", "compose"],
+            },
+        }
+
+    def _handle_request(self, method, path_with_query, headers, body):
+        parsed = urlparse(path_with_query)
+        path = parsed.path
+        binding, auth_error = self._validate_auth(method, path_with_query, headers, body)
+        if auth_error:
+            return 401, auth_error
+
+        if method == "GET" and path == "/v1/health":
+            return 200, {
+                "ok": True,
+                "daemon_version": "0.1.0",
+                "protocol_version": PROTOCOL_VERSION,
+                "platform": "windows",
+                "started_at": self.started_at,
+            }
+        if method == "GET" and path == "/v1/capabilities":
+            return 200, self._capabilities(binding)
+        if method == "GET" and path == "/v1/instances/current":
+            return 200, self._instance_payload(binding)
+        if method == "POST" and path == "/v1/jobs/update":
+            return self._create_update_job(binding, body)
+        if method == "GET" and path.startswith("/v1/jobs/"):
+            return self._job_response(binding, path, parsed.query)
+        return 404, _error("daemon_protocol_error", "未知 daemon API 路径")
+
+    def _create_update_job(self, binding, body):
+        try:
+            request = json.loads(body.decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            return 400, _error("daemon_protocol_error", "请求 JSON 格式无效")
+        if request.get("instance_id") != binding.instance_id:
+            return 403, _error("instance_mismatch", "请求 instance_id 与签名实例不匹配")
+        channel = request.get("channel") or "stable"
+        if channel != "stable":
+            return 400, _error("invalid_channel", "Windows 启动器首版仅支持 stable update")
+        caps = self._capabilities(binding)
+        if not caps["enabled"]:
+            return 503, _error(
+                caps["unavailable_reason"] or "daemon_unavailable",
+                "当前实例不可执行在线更新",
+            )
+        job, created = self.jobs.create_update_job(binding.instance_id, request)
+        if job is None:
+            return 409, _error("job_conflict", "已有更新任务正在运行")
+        if created:
+            thread = threading.Thread(
+                target=self._run_update_job,
+                args=(job, request),
+                name=f"LauncherUpdateJob-{job.job_id}",
+                daemon=True,
+            )
+            thread.start()
+        return 200, {
+            "job_id": job.job_id,
+            "status": job.status,
+            "phase": job.phase,
+            "message": job.message,
+        }
+
+    def _run_update_job(self, job, request):
+        try:
+            self.backend.run_daemon_update_job(request, job)
+        except Exception as exc:
+            job.fail(
+                "launcher_update_failed",
+                f"Windows 启动器更新任务异常: {type(exc).__name__}: {exc}",
+            )
+            self.backend.status_changed.emit("更新失败")
+
+    def _job_response(self, binding, path, query):
+        parts = path.strip("/").split("/")
+        if len(parts) < 3:
+            return 404, _error("job_not_found", "任务不存在")
+        job = self.jobs.get(parts[2])
+        if not job:
+            return 404, _error("job_not_found", "任务不存在")
+        if job.instance_id != binding.instance_id:
+            return 403, _error("instance_mismatch", "任务不属于当前实例")
+        if len(parts) == 3:
+            return 200, job.snapshot()
+        if len(parts) == 4 and parts[3] == "logs":
+            params = parse_qs(query)
+            try:
+                limit = min(1000, max(1, int((params.get("limit") or ["200"])[0])))
+                after_seq = max(0, int((params.get("after_seq") or ["0"])[0]))
+            except ValueError:
+                return 400, _error("daemon_protocol_error", "日志查询参数格式无效")
+            return 200, job.log_snapshot(limit=limit, after_seq=after_seq)
+        if len(parts) == 4 and parts[3] == "events":
+            return 200, {"sse_job": job}
+        return 404, _error("job_not_found", "任务资源不存在")
+
+    def _make_http_handler(self):
+        facade = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, _format, *_args):
+                return
+
+            def do_GET(self):
+                self._handle()
+
+            def do_POST(self):
+                self._handle()
+
+            def _headers_dict(self):
+                return {key.lower(): self.headers.get(key, "") for key in self.headers.keys()}
+
+            def _handle(self):
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    self._send_json(
+                        400,
+                        _error("daemon_protocol_error", "Content-Length 格式无效"),
+                    )
+                    return
+                if length > MAX_REQUEST_BODY_BYTES:
+                    self._send_json(
+                        413,
+                        _error("daemon_protocol_error", "请求体超过 daemon 限制"),
+                    )
+                    return
+                body = self.rfile.read(length) if length else b""
+                status, payload = facade._handle_request(
+                    self.command,
+                    self.path,
+                    self._headers_dict(),
+                    body,
+                )
+                if isinstance(payload, dict) and "sse_job" in payload:
+                    self._send_sse(payload["sse_job"])
+                    return
+                self._send_json(status, payload)
+
+            def _send_json(self, status, payload):
+                data = _json_bytes(payload)
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def _send_sse(self, job):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "keep-alive")
+                self.end_headers()
+                after_seq = 0
+                params = parse_qs(urlparse(self.path).query)
+                try:
+                    after_seq = int((params.get("after_seq") or ["0"])[0])
+                except ValueError:
+                    after_seq = 0
+                self._write_sse("job", job.snapshot())
+                try:
+                    while True:
+                        snapshot = job.log_snapshot(limit=1000, after_seq=after_seq)
+                        for entry in snapshot["logs"]:
+                            after_seq = max(after_seq, entry["seq"])
+                            self._write_sse("log", entry)
+                        job_snapshot = job.snapshot()
+                        self._write_sse("job", job_snapshot)
+                        if job_snapshot["status"] in {"succeeded", "failed", "cancelled"}:
+                            self._write_sse("result", job_snapshot)
+                            break
+                        if not job.wait_for_event(after_seq, timeout=30):
+                            self._write_sse("ping", {"ts": _utc_now()})
+                except OSError:
+                    return
+
+            def _write_sse(self, event, payload):
+                data = f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                self.wfile.write(data.encode("utf-8"))
+                self.wfile.flush()
+
+        return Handler
+
+    def _make_socks_handler(self):
+        facade = self
+
+        class SocksHandler(socketserver.BaseRequestHandler):
+            def handle(self):
+                sock = self.request
+                sock.settimeout(10)
+                try:
+                    header = sock.recv(2)
+                    if len(header) != 2 or header[0] != 5:
+                        return
+                    methods = sock.recv(header[1])
+                    if not methods:
+                        return
+                    sock.sendall(b"\x05\x00")
+                    req = sock.recv(4)
+                    if len(req) != 4 or req[0] != 5 or req[1] != 1:
+                        self._reply(sock, 7)
+                        return
+                    atyp = req[3]
+                    host = ""
+                    if atyp == 1:
+                        host = socket.inet_ntoa(sock.recv(4))
+                    elif atyp == 3:
+                        ln = sock.recv(1)[0]
+                        host = sock.recv(ln).decode("idna")
+                    else:
+                        self._reply(sock, 8)
+                        return
+                    port = int.from_bytes(sock.recv(2), "big")
+                    if not facade._socks_allowed(host, port):
+                        self._reply(sock, 2)
+                        return
+                    upstream = socket.create_connection((facade.http_host, facade.http_port), timeout=10)
+                    self._reply(sock, 0)
+                    self._relay(sock, upstream)
+                except Exception:
+                    return
+
+            def _reply(self, sock, code):
+                sock.sendall(b"\x05" + bytes([code]) + b"\x00\x01\x00\x00\x00\x00\x00\x00")
+
+            def _relay(self, left, right):
+                sockets = [left, right]
+                try:
+                    while True:
+                        readable, _, _ = select.select(sockets, [], [], 60)
+                        if not readable:
+                            return
+                        for src in readable:
+                            data = src.recv(65536)
+                            if not data:
+                                return
+                            dst = right if src is left else left
+                            dst.sendall(data)
+                finally:
+                    right.close()
+
+        return SocksHandler
+
+    def _socks_allowed(self, host, port):
+        host_l = host.lower()
+        return (
+            (host_l == "na-tools.local" and port == 80)
+            or (host_l in {"127.0.0.1", "localhost"} and port == self.http_port)
+        )

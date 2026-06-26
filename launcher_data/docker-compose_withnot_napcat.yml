@@ -45,9 +45,16 @@ services:
       - ONEBOT_ACCESS_TOKEN=${ONEBOT_ACCESS_TOKEN:-}
       - NEKRO_QDRANT_URL=${QDRANT_URL:-http://nekro_qdrant:6333}
       - NEKRO_QDRANT_API_KEY=${QDRANT_API_KEY:-}
+      - NA_TOOLS_DAEMON_ENABLED=${NA_TOOLS_DAEMON_ENABLED:-false}
+      - NA_TOOLS_DAEMON_API_BASE=${NA_TOOLS_DAEMON_API_BASE:-http://na-tools.local/v1}
+      - NA_TOOLS_DAEMON_SOCKS=${NA_TOOLS_DAEMON_SOCKS:-socks5h://host.docker.internal:18082}
+      - NA_TOOLS_DAEMON_INSTANCE_ID=${NA_TOOLS_DAEMON_INSTANCE_ID:-}
+      - NA_TOOLS_DAEMON_TOKEN_FILE=${NA_TOOLS_DAEMON_TOKEN_FILE:-}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${NEKRO_DATA_DIR}:${NEKRO_DATA_DIR}:rw
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       - nekro_postgres
       - nekro_qdrant

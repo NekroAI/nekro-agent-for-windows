@@ -1,8 +1,13 @@
 import shlex
 import threading
+import time
+import urllib.error
+import urllib.request
+import json
 
 from core.port_utils import normalize_port
 from core.wsl.constants import (
+    CC_SANDBOX_IMAGE,
     DISTRO_NAME,
     NA_BACKUP_TARGETS,
     PREVIEW_BACKUP_ARCHIVE_PATH,
@@ -204,6 +209,193 @@ class WSLUpdateMixin:
             self.update_finished.emit(True, "Nekro Agent 更新完成，正在等待服务重新就绪。")
 
         threading.Thread(target=_do_update, daemon=True).start()
+
+    def run_daemon_update_job(self, request: dict, job):
+        """执行 daemon facade 的非交互 stable 更新任务。"""
+        from core.update_runner import build_update_plan
+
+        distro = DISTRO_NAME
+        deploy_dir, _, _ = self._get_active_deploy_paths()
+        channel = request.get("channel") or "stable"
+        if channel != "stable":
+            job.fail("invalid_channel", "Windows 启动器 daemon 首版仅支持 stable 更新")
+            return
+
+        backup = bool(request.get("backup", True))
+        update_sandbox = bool(request.get("update_sandbox", True))
+        update_cc_sandbox = bool(request.get("update_cc_sandbox", False))
+        agent_image = self.get_agent_image_ref(self.config)
+        steps = [
+            step for step in build_update_plan(agent_image)
+            if step.get("type") != "notify"
+        ]
+        if not backup:
+            steps = [step for step in steps if step.get("type") != "backup"]
+        if update_sandbox:
+            steps.append(
+                {
+                    "type": "pull",
+                    "label": "拉取 Nekro Agent 沙盒镜像",
+                    "image": "kromiose/nekro-agent-sandbox",
+                    "phase": "pull_sandbox",
+                }
+            )
+        if update_cc_sandbox:
+            steps.append(
+                {
+                    "type": "pull",
+                    "label": "拉取 Claude Code 沙盒镜像",
+                    "image": CC_SANDBOX_IMAGE,
+                    "phase": "pull_sandbox",
+                }
+            )
+        steps.append({"type": "verify", "label": "等待服务健康检查通过"})
+
+        total = len(steps) + 1
+        current = 1
+        self._stop_event.clear()
+        self.status_changed.emit("更新中...")
+        job.start("validate_instance", "正在校验实例与 Docker 环境")
+
+        def _fail(code, message, details=None):
+            self.status_changed.emit("更新失败")
+            job.fail(code, message, details=details)
+
+        def _exec(cmd, timeout=300, action="[daemon 更新] 命令执行失败"):
+            proc = self._run_wsl_checked(
+                distro,
+                cmd,
+                action=action,
+                cwd=deploy_dir,
+                timeout=timeout,
+            )
+            out = self._clean_command_output(
+                self._safe_decode(proc.stdout) + self._safe_decode(proc.stderr)
+            ).strip()
+            if out:
+                job.add_log(out, stream="stdout")
+            return proc.returncode, out
+
+        try:
+            self._run_wsl_checked(
+                distro,
+                "test -f docker-compose.yml && test -f .env",
+                action="[daemon 更新] 实例部署文件缺失",
+                cwd=deploy_dir,
+                timeout=30,
+            )
+            self._run_wsl_checked(
+                distro,
+                "systemctl start docker && docker version >/dev/null && docker compose version >/dev/null",
+                action="[daemon 更新] Docker 或 Compose 不可用",
+                timeout=60,
+            )
+        except Exception as e:
+            _fail("docker_unavailable", str(e))
+            return
+
+        for step in steps:
+            current += 1
+            step_type = str(step.get("type") or "")
+            label = str(step.get("label") or "")
+            phase = str(step.get("phase") or "") or {
+                "backup": "backup",
+                "pull": "pull_images",
+                "compose_up": "restart_services",
+                "verify": "verify",
+            }.get(step_type, "validate_instance")
+            job.set_progress(phase, current, total, label)
+            self.log_received.emit(f"[daemon 更新] {label}", "info")
+            self._emit_pull_progress("stage", label)
+
+            if step_type == "backup":
+                ok, backup_message = self._backup_nekro_archive(
+                    distro,
+                    step.get("archive_path", UPDATE_BACKUP_ARCHIVE_PATH),
+                )
+                if not ok:
+                    _fail("backup_failed", backup_message)
+                    return
+                job.add_log(backup_message)
+                continue
+
+            if step_type == "pull":
+                image = step.get("image", "")
+                if not self._pull_images(distro, [image]):
+                    _fail("pull_failed", f"镜像拉取失败: {image}", {"image": image})
+                    return
+                continue
+
+            if step_type == "compose_up":
+                services = step.get("services", [])
+                service_args = " ".join(shlex.quote(service) for service in services)
+                cmd = (
+                    "docker compose -f docker-compose.yml --env-file .env "
+                    f"up -d --no-deps --force-recreate {service_args}"
+                ).strip()
+                try:
+                    _exec(
+                        cmd,
+                        timeout=300,
+                        action=f"[daemon 更新] {label}失败",
+                    )
+                except Exception as e:
+                    _fail("restart_failed", str(e))
+                    return
+                continue
+
+            if step_type == "verify":
+                if not self._wait_daemon_update_health(job):
+                    _fail("verify_timeout", "服务健康检查超时")
+                    return
+                continue
+
+        self._emit_pull_progress("done", "更新完成")
+        self.is_running = True
+        inst_id = self.config.get_active_instance_id() if self.config else ""
+        inst_display = inst_id if inst_id and inst_id != "default" else ""
+        log_prefix = f"[{inst_display}] " if inst_display else ""
+        nekro_port = (
+            normalize_port(self.config.get("nekro_port"), 8021)
+            if self.config
+            else 8021
+        )
+        if self._log_process is None or self._log_process.poll() is not None:
+            threading.Thread(
+                target=self._log_reader,
+                args=(distro, deploy_dir, log_prefix, inst_id),
+                daemon=True,
+            ).start()
+        self.status_changed.emit("运行中")
+        job.succeed(
+            "Nekro Agent 更新完成",
+            {
+                "channel": "stable",
+                "image": agent_image,
+                "app_health": "ok",
+            },
+        )
+
+    def _wait_daemon_update_health(self, job, timeout=120):
+        port = normalize_port(self.config.get("nekro_port"), 8021) if self.config else 8021
+        url = f"http://127.0.0.1:{port}/api/health"
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(url, timeout=3) as response:
+                    body = response.read(4096).decode("utf-8", errors="replace")
+                    if response.status == 200:
+                        try:
+                            payload = json.loads(body or "{}")
+                        except json.JSONDecodeError:
+                            payload = {}
+                        if payload.get("ok") is True:
+                            job.add_log(f"健康检查通过: {url}")
+                            return True
+            except (OSError, urllib.error.URLError):
+                pass
+            time.sleep(2)
+        return False
 
     def switch_to_preview(self, create_backup=True):
         """备份数据与配置后，将 Nekro Agent 主容器切换到预览版镜像。"""

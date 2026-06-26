@@ -201,6 +201,15 @@ class WSLDeployMixin:
         else:
             _log("首次部署，写入配置文件")
 
+        daemon_env = {}
+        launcher_daemon = getattr(self, "launcher_daemon", None)
+        if launcher_daemon is not None:
+            try:
+                binding = launcher_daemon.ensure_instance_binding(inst_id, inst)
+                daemon_env = launcher_daemon.env_values_for_binding(binding)
+            except Exception as e:
+                _log(f"Windows 启动器 daemon 绑定失败，WebUI 在线更新将不可用: {e}", "warn")
+
         compose_content = self._prepare_compose_content(compose_src, inst=inst)
         env_content = self._prepare_env(
             env_src,
@@ -209,6 +218,7 @@ class WSLDeployMixin:
             nekro_port=inst.get("nekro_port") or 8021,
             napcat_port=inst.get("napcat_port") or 6099,
             instance_name=inst_name,
+            daemon_env=daemon_env,
         )
         reuse_existing_runtime = (
             env_exists == "yes"
@@ -981,6 +991,7 @@ class WSLDeployMixin:
         nekro_port=None,
         napcat_port=None,
         instance_name=None,
+        daemon_env=None,
     ):
         """读取 env 模板文件，填充必要值，返回最终 .env 内容"""
         content = ""
@@ -996,6 +1007,8 @@ class WSLDeployMixin:
 
         lines = content.splitlines()
         new_lines = []
+        daemon_env = daemon_env or {}
+        seen_keys = set()
         for line in lines:
             stripped = line.strip()
             if stripped.startswith("#") or "=" not in stripped:
@@ -1003,9 +1016,12 @@ class WSLDeployMixin:
                 continue
 
             key = stripped.split("=", 1)[0].strip()
+            seen_keys.add(key)
             existing_value = existing_env.get(key, "").strip()
 
-            if key == "NEKRO_DATA_DIR":
+            if key in daemon_env:
+                new_lines.append(f"{key}={daemon_env[key]}")
+            elif key == "NEKRO_DATA_DIR":
                 new_lines.append(f"NEKRO_DATA_DIR={data_dir}")
             elif key == "NEKRO_EXPOSE_PORT":
                 new_lines.append(f"NEKRO_EXPOSE_PORT={nekro_port}")
@@ -1032,6 +1048,10 @@ class WSLDeployMixin:
                 new_lines.append(f"{key}={existing_value}")
             else:
                 new_lines.append(line)
+
+        for key, value in daemon_env.items():
+            if key not in seen_keys:
+                new_lines.append(f"{key}={value}")
 
         return "\n".join(new_lines) + "\n"
 

@@ -3,6 +3,7 @@ import sys
 import threading
 
 from core.backend_base import BackendBase
+from core.launcher_daemon import LauncherDaemonFacade
 from core.wsl.deploy import WSLDeployMixin
 from core.wsl.discovery import WSLDiscoveryMixin
 from core.wsl.environment import WSLEnvironmentMixin
@@ -46,3 +47,9 @@ class WSLManager(
         self._pending_deploy_info = None
         self._update_optional_reply = None
         self._deploy_optional_reply = None
+        self.launcher_daemon = LauncherDaemonFacade(self)
+        try:
+            self.launcher_daemon.start()
+            self.log_received.emit("Windows 启动器 daemon facade 已启动", "debug")
+        except Exception as e:
+            self.log_received.emit(f"Windows 启动器 daemon facade 启动失败: {e}", "warn")
