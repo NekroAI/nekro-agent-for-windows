@@ -72,18 +72,37 @@ class WSLDiscoveryMixin:
         """
         if on_step:
             on_step("正在获取 WSL 发行版列表...")
+        self.log_received.emit("[实例扫描] 开始扫描非启动器/已有 WSL 部署", "info")
         distros = self._get_wsl_distros()
+        if distros:
+            self.log_received.emit(
+                f"[实例扫描] 待扫描发行版 {len(distros)} 个: {', '.join(distros)}",
+                "info",
+            )
+        else:
+            self.log_received.emit("[实例扫描] 未获取到可扫描的 WSL 发行版", "warn")
         instances = []
         total = len(distros)
         for i, distro in enumerate(distros, 1):
+            if distro.lower() in {"docker-desktop", "docker-desktop-data"}:
+                self.log_received.emit(f"[实例扫描] {distro}: Docker Desktop 系统发行版，跳过", "debug")
+                continue
             if on_step:
                 on_step(f"正在检测发行版: {distro}（{i}/{total}）")
             try:
                 results = self._scan_distro(distro)
+                self.log_received.emit(
+                    f"[实例扫描] {distro}: 扫描完成，发现 {len(results)} 个候选实例",
+                    "info" if results else "debug",
+                )
                 if results:
                     instances.extend(results)
             except Exception as e:
-                self.log_received.emit(f"[实例扫描] 扫描 {distro} 时异常: {e}", "debug")
+                self.log_received.emit(f"[实例扫描] 扫描 {distro} 时异常: {type(e).__name__}: {e}", "warn")
+        self.log_received.emit(
+            f"[实例扫描] 扫描结束，共发现 {len(instances)} 个可接管实例",
+            "info",
+        )
         return instances
 
     def takeover_instance(self, instance: dict, on_step=None) -> bool:
@@ -130,10 +149,49 @@ class WSLDiscoveryMixin:
                 for line in output.splitlines()
                 if line.strip().strip("\x00")
             ]
+            self.log_received.emit(f"[实例扫描] WSL 发行版列表解析结果: {distros}", "debug")
             return distros
         except Exception as e:
             self.log_received.emit(f"[实例扫描] 获取发行版列表失败: {e}", "debug")
             return []
+
+    def _run_scan_command(self, distro: str, cmd: str, desc: str, *, timeout=15, user="root") -> str | None:
+        try:
+            proc = self._wsl_run(distro, cmd, timeout=timeout, user=user)
+        except Exception as e:
+            self.log_received.emit(
+                f"[实例扫描] {distro}: {desc}异常: {type(e).__name__}: {e}",
+                "debug",
+            )
+            return None
+
+        if proc.returncode != 0:
+            self.log_received.emit(
+                self._format_command_failure(
+                    f"[实例扫描] {distro}: {desc}失败",
+                    cmd=cmd,
+                    distro=distro,
+                    user=user,
+                    timeout=timeout,
+                    returncode=proc.returncode,
+                    stdout=proc.stdout,
+                    stderr=proc.stderr,
+                ),
+                "debug",
+            )
+            return None
+        return self._clean_command_output(self._safe_decode(proc.stdout))
+
+    def _is_scan_candidate_path(self, path: str) -> bool:
+        normalized = self._normalize_wsl_abs_path(path)
+        return bool(
+            normalized
+            and (
+                normalized.startswith("/root/")
+                or normalized.startswith("/home/")
+                or normalized.startswith("/opt/")
+            )
+        )
 
     def _scan_distro(self, distro: str) -> list:
         """扫描单个发行版，返回发现的所有 nekro-agent 实例列表。
@@ -151,12 +209,18 @@ class WSLDiscoveryMixin:
 
         self.log_received.emit(f"[实例扫描] {distro}: 发现 {len(deploy_dirs)} 个部署目录", "debug")
 
-        socket_exists = self._wsl_exec(
+        socket_exists = self._run_scan_command(
             distro,
             "test -S /var/run/docker.sock && echo yes || echo no",
+            "检测 Docker socket",
             user="root",
-        ).strip()
+        )
+        socket_exists = (socket_exists or "").strip()
         docker_running = socket_exists == "yes"
+        self.log_received.emit(
+            f"[实例扫描] {distro}: Docker socket 检测结果={socket_exists or '<empty>'}",
+            "debug",
+        )
 
         all_containers = {}
         if docker_running:
@@ -190,8 +254,19 @@ class WSLDiscoveryMixin:
                         parts = line.split("\t", 1)
                         if len(parts) == 2:
                             all_containers[parts[0].strip()] = parts[1].strip()
-            except Exception:
-                pass
+                if all_containers:
+                    self.log_received.emit(
+                        f"[实例扫描] {distro}: 匹配到 {len(all_containers)} 个 nekro 相关容器: "
+                        + ", ".join(f"{name}={status}" for name, status in all_containers.items()),
+                        "debug",
+                    )
+                else:
+                    self.log_received.emit(f"[实例扫描] {distro}: 未查询到 nekro 相关容器", "debug")
+            except Exception as e:
+                self.log_received.emit(
+                    f"[实例扫描] {distro}: 查询 Docker 容器异常: {type(e).__name__}: {e}",
+                    "debug",
+                )
         else:
             self.log_received.emit(f"[实例扫描] {distro}: Docker daemon 未运行，以文件检测结果为准", "debug")
 
@@ -210,17 +285,41 @@ class WSLDiscoveryMixin:
         all_containers: dict,
     ) -> dict | None:
         """扫描单个部署目录并返回实例信息。"""
+        self.log_received.emit(f"[实例扫描] {distro}/{deploy_dir}: 开始解析部署目录", "debug")
         deploy_mode = self._detect_deploy_mode_from_compose(distro, deploy_dir)
+        self.log_received.emit(
+            f"[实例扫描] {distro}/{deploy_dir}: 部署模式推断为 {deploy_mode}",
+            "debug",
+        )
 
         env_path = self._find_env_path(distro, deploy_dir)
         env = {}
         raw_env = ""
         if env_path:
-            raw_env = self._wsl_exec(distro, f'cat "{env_path}"', user="root")
+            self.log_received.emit(f"[实例扫描] {distro}/{deploy_dir}: 读取 env: {env_path}", "debug")
+            raw_env = self._run_scan_command(
+                distro,
+                f"cat {shlex.quote(env_path)}",
+                f"读取 env 文件 {env_path}",
+                user="root",
+            ) or ""
             env = self._parse_env_values(raw_env)
+            self.log_received.emit(
+                f"[实例扫描] {distro}/{deploy_dir}: env key 数量={len(env)}",
+                "debug",
+            )
+        else:
+            self.log_received.emit(
+                f"[实例扫描] {distro}/{deploy_dir}: 未找到 .env，将使用默认数据目录推断",
+                "warn",
+            )
 
         data_dir = env.get("NEKRO_DATA_DIR") or "/root/nekro_agent_data"
         instance_name = env.get("INSTANCE_NAME", "")
+        self.log_received.emit(
+            f"[实例扫描] {distro}/{deploy_dir}: data_dir={data_dir}, instance_name={instance_name or '<empty>'}",
+            "debug",
+        )
 
         status = "stopped"
         if docker_running:
@@ -231,8 +330,17 @@ class WSLDiscoveryMixin:
                 self.log_received.emit(
                     f"[实例扫描] {distro}/{deploy_dir}: 容器 {agent_container} 状态: {container_status}", "debug"
                 )
+            else:
+                self.log_received.emit(
+                    f"[实例扫描] {distro}/{deploy_dir}: 未匹配到容器 {agent_container}",
+                    "debug",
+                )
 
         agent_image = self._detect_agent_image(distro, deploy_dir)
+        self.log_received.emit(
+            f"[实例扫描] {distro}/{deploy_dir}: agent_image={agent_image}, status={status}",
+            "debug",
+        )
 
         return {
             "distro": distro,
@@ -249,67 +357,174 @@ class WSLDiscoveryMixin:
 
     def _find_all_deploy_dirs(self, distro: str) -> list:
         """在发行版内查找所有 nekro_agent 部署目录，不启动任何服务。"""
+        compose_find_cmd = (
+            "find /root /home /opt -maxdepth 5 "
+            "\\( -name 'docker-compose.yml' -o -name 'docker-compose.yaml' "
+            "-o -name 'compose.yml' -o -name 'compose.yaml' \\) "
+            "-print 2>/dev/null"
+        )
         try:
-            result = self._wsl_exec(
+            all_compose = self._run_scan_command(
                 distro,
-                "find /root /home /opt -maxdepth 4 -name 'docker-compose.yml' -print0 2>/dev/null"
-                " | xargs -0 grep -l 'nekro' 2>/dev/null",
+                compose_find_cmd,
+                "查找 compose 文件候选",
+                timeout=20,
                 user="root",
             )
+            if all_compose is None:
+                return []
+            compose_candidates = [
+                line.strip()
+                for line in all_compose.splitlines()
+                if self._is_scan_candidate_path(line.strip())
+            ]
+            ignored_candidates = [
+                line.strip()
+                for line in all_compose.splitlines()
+                if line.strip() and not self._is_scan_candidate_path(line.strip())
+            ]
+            for path in ignored_candidates[:5]:
+                self.log_received.emit(
+                    f"[实例扫描] {distro}: 忽略非法 compose 候选输出: {path}",
+                    "debug",
+                )
+            if compose_candidates:
+                self.log_received.emit(
+                    f"[实例扫描] {distro}: 发现 {len(compose_candidates)} 个 compose 文件候选",
+                    "debug",
+                )
+                for path in compose_candidates[:20]:
+                    self.log_received.emit(f"[实例扫描] {distro}: compose 候选 {path}", "debug")
+                if len(compose_candidates) > 20:
+                    self.log_received.emit(
+                        f"[实例扫描] {distro}: compose 候选过多，已省略 {len(compose_candidates) - 20} 个",
+                        "debug",
+                    )
+            else:
+                self.log_received.emit(
+                    f"[实例扫描] {distro}: /root /home /opt 下未发现 compose 文件候选",
+                    "debug",
+                )
+
+            result = self._run_scan_command(
+                distro,
+                compose_find_cmd
+                + " | while IFS= read -r file; do "
+                + "grep -qiE 'nekro|nekro-agent' \"$file\" 2>/dev/null && printf '%s\\n' \"$file\"; "
+                + "done",
+                "筛选 nekro compose 文件",
+                timeout=20,
+                user="root",
+            )
+            if result is None:
+                return []
             dirs = []
             for line in result.strip().splitlines():
                 path = line.strip()
-                if path:
+                if self._is_scan_candidate_path(path):
                     d = os.path.dirname(path)
                     if d and d not in dirs:
                         dirs.append(d)
+                        self.log_received.emit(
+                            f"[实例扫描] {distro}: 命中 nekro compose: {path}",
+                            "debug",
+                        )
+                elif path:
+                    self.log_received.emit(
+                        f"[实例扫描] {distro}: 忽略非法 nekro compose 输出: {path}",
+                        "debug",
+                    )
+            if compose_candidates and not dirs:
+                self.log_received.emit(
+                    f"[实例扫描] {distro}: compose 候选均未包含 nekro 关键字，跳过",
+                    "debug",
+                )
             return dirs
-        except Exception:
-            pass
+        except Exception as e:
+            self.log_received.emit(
+                f"[实例扫描] {distro}: 查找部署目录异常: {type(e).__name__}: {e}",
+                "debug",
+            )
         return []
 
     def _detect_deploy_mode_from_compose(self, distro: str, deploy_dir: str) -> str:
         """从 docker-compose.yml 内容推断 deploy_mode，不依赖运行中的容器。"""
-        compose_content = self._wsl_exec(
-            distro,
-            f"cat {shlex.quote(posixpath.join(deploy_dir, 'docker-compose.yml'))} 2>/dev/null",
-            user="root",
-        )
+        compose_content = self._read_first_compose_file(distro, deploy_dir)
         if "napcat" in compose_content.lower():
             return "napcat"
         return "lite"
 
     def _detect_agent_image(self, distro: str, deploy_dir: str) -> str:
         """从 docker-compose.yml 中读取实际使用的 nekro-agent 镜像引用。"""
-        compose_content = self._wsl_exec(
-            distro,
-            f"cat {shlex.quote(posixpath.join(deploy_dir, 'docker-compose.yml'))} 2>/dev/null",
-            user="root",
-        )
+        compose_content = self._read_first_compose_file(distro, deploy_dir)
         for line in compose_content.splitlines():
             stripped = line.strip()
-            if stripped.startswith("image:") and "nekro-agent" in stripped:
+            if stripped.startswith("image:") and "nekro-agent" in stripped.lower():
                 image = stripped.split("image:", 1)[1].strip()
                 return image
         return "kromiose/nekro-agent:latest"
 
+    def _read_first_compose_file(self, distro: str, deploy_dir: str) -> str:
+        for name in ("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"):
+            path = posixpath.join(deploy_dir, name)
+            content = self._run_scan_command(
+                distro,
+                f"test -f {shlex.quote(path)} && cat {shlex.quote(path)} || true",
+                f"读取 compose 文件 {path}",
+                user="root",
+            )
+            if content:
+                self.log_received.emit(
+                    f"[实例扫描] {distro}/{deploy_dir}: 读取 compose 文件 {path}",
+                    "debug",
+                )
+                return content
+        self.log_received.emit(
+            f"[实例扫描] {distro}/{deploy_dir}: 未能读取 compose 文件内容",
+            "debug",
+        )
+        return ""
+
     def _find_env_path(self, distro: str, deploy_dir: str) -> str:
         """定位 .env 文件路径。"""
         standard = f"{deploy_dir}/.env"
-        check = self._wsl_exec(
+        check = self._run_scan_command(
             distro,
-            f"test -f {shlex.quote(standard)} && echo yes",
+            f"test -f {shlex.quote(standard)} && echo yes || echo no",
+            f"检测 env 文件 {standard}",
             user="root",
         )
-        if check.strip() == "yes":
+        if (check or "").strip() == "yes":
             return standard
 
-        found = self._wsl_exec(
+        found = self._run_scan_command(
             distro,
-            f'find /root -maxdepth 4 -name ".env" -path "*/nekro_agent/*" 2>/dev/null | head -1',
+            f"find {shlex.quote(deploy_dir)} -maxdepth 2 -name '.env' 2>/dev/null | head -1",
+            f"查找部署目录 env {deploy_dir}",
             user="root",
         )
-        return found.strip() or ""
+        if found and self._is_scan_candidate_path(found.strip()):
+            return found.strip()
+
+        parent = posixpath.dirname(deploy_dir.rstrip("/")) or "/"
+        found = self._run_scan_command(
+            distro,
+            f"find {shlex.quote(parent)} -maxdepth 3 -name '.env' -path '*nekro*' 2>/dev/null | head -1",
+            f"查找邻近 env {parent}",
+            user="root",
+        )
+        if found and self._is_scan_candidate_path(found.strip()):
+            self.log_received.emit(
+                f"[实例扫描] {distro}/{deploy_dir}: 使用邻近 env 文件 {found.strip()}",
+                "debug",
+            )
+            return found.strip()
+        if found and found.strip():
+            self.log_received.emit(
+                f"[实例扫描] {distro}/{deploy_dir}: 忽略非法 env 输出: {found.strip()}",
+                "debug",
+            )
+        return ""
 
     # ------------------------------------------------------------------ #
     # 接管：场景 A（NekroAgent 发行版内的实例）

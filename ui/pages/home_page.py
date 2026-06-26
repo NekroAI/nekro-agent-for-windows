@@ -1,4 +1,5 @@
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QTextOption
 from PyQt6.QtWidgets import (
     QFrame, QGridLayout, QHBoxLayout, QLabel,
     QSizePolicy, QTextEdit, QVBoxLayout, QWidget,
@@ -154,6 +155,12 @@ class HomePage(QWidget):
         self.w.log_preview = QTextEdit()
         self.w.log_preview.setObjectName("LogViewer")
         self.w.log_preview.setReadOnly(True)
+        self.w.log_preview.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.w.log_preview.setWordWrapMode(QTextOption.WrapMode.WrapAnywhere)
+        self.w.log_preview.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Expanding,
+        )
         self.w.log_preview.setMinimumHeight(250)
         activity_layout.addWidget(self.w.log_preview)
 

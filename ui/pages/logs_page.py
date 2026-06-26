@@ -1,6 +1,7 @@
+from PyQt6.QtGui import QTextOption
 from PyQt6.QtWidgets import (
     QHBoxLayout,
-    QTextEdit, QVBoxLayout, QWidget,
+    QSizePolicy, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from ui.widgets import PullProgressView, SectionCard, make_segment_button
@@ -47,6 +48,12 @@ class LogsPage(QWidget):
         for viewer in [self.w.log_viewer_app, self.w.log_viewer_nekro, self.w.log_viewer_napcat]:
             viewer.setObjectName("LogViewer")
             viewer.setReadOnly(True)
+            viewer.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+            viewer.setWordWrapMode(QTextOption.WrapMode.WrapAnywhere)
+            viewer.setSizePolicy(
+                QSizePolicy.Policy.Ignored,
+                QSizePolicy.Policy.Expanding,
+            )
             card_layout.addWidget(viewer)
 
         self.w._set_log_tab(0)
