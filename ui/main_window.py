@@ -2091,6 +2091,13 @@ class MainWindow(QMainWindow):
         is_new_instance = bool(pending)
 
         if pending:
+            if not self._backend_runtime_exists():
+                self._show_notice_dialog(
+                    "运行环境缺失",
+                    "当前 WSL 运行环境不存在或已被外部删除，请重新创建运行环境后再部署。",
+                    danger=True,
+                )
+                return
             self._apply_pending_instance()
         else:
             self._prev_active_instance = None

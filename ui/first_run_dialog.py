@@ -530,8 +530,6 @@ class FirstRunDialog(WizardDialogBase):
 
     def _select_mode(self, mode):
         self._selected_mode = mode
-        if self.config:
-            self.config.set("deploy_mode", mode)
         self._update_port_inputs_for_mode(mode)
         self._goto_page("data_dir")
 
@@ -888,6 +886,13 @@ class FirstRunDialog(WizardDialogBase):
         if not self._pending_inst_data:
             self._show_notice_dialog("提示", "部署配置尚未准备完成，请返回上一页重新确认。")
             return
+        if not self._backend_runtime_exists():
+            self._show_notice_dialog(
+                "运行环境缺失",
+                "当前 WSL 运行环境不存在或已被外部删除，请返回环境检测页重新创建运行环境后再部署。",
+                danger=True,
+            )
+            return
         self._start_deploy_progress()
         self.deploy_requested.emit(self._pending_deploy_mode, self._pending_inst_data)
 
@@ -1114,6 +1119,23 @@ class FirstRunDialog(WizardDialogBase):
             minimum_width=380,
             maximum_width=500,
         )
+
+    def _backend_runtime_exists(self):
+        runtime_exists = getattr(self.backend, "runtime_exists", None)
+        if callable(runtime_exists):
+            try:
+                return bool(runtime_exists())
+            except Exception:
+                return False
+
+        distro_exists = getattr(self.backend, "_distro_exists", None)
+        if callable(distro_exists):
+            try:
+                return bool(distro_exists())
+            except Exception:
+                return False
+
+        return True
 
     def _set_deploy_stage(self, key, message=""):
         self._deploy_active_stage = key

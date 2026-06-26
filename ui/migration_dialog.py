@@ -73,6 +73,7 @@ class MigrationDialog(WizardDialogBase):
         self.backend = backend
         self.config = config
         self._pending_takeover_instance = None
+        self._current_takeover_step_idx = 0
 
         self._init_scan_page()
         self._init_found_page()
@@ -141,8 +142,9 @@ class MigrationDialog(WizardDialogBase):
 
         btn_box = QHBoxLayout()
         btn_box.addStretch()
-        self._scan_cancel_btn = make_wizard_button("取消", "secondary", fixed_height=38, fixed_width=100)
+        self._scan_cancel_btn = make_wizard_button("扫描中...", "secondary", fixed_height=38, fixed_width=100)
         self._scan_cancel_btn.clicked.connect(self.reject)
+        self._scan_cancel_btn.setEnabled(False)
         btn_box.addWidget(self._scan_cancel_btn)
         layout.addLayout(btn_box)
 
@@ -152,6 +154,8 @@ class MigrationDialog(WizardDialogBase):
         self._scan_desc.setText("正在扫描本机所有 WSL 发行版中的 Nekro Agent 部署，请稍候...")
         self._scan_step_label.setText("")
         self._scan_progress.setRange(0, 0)
+        self._scan_cancel_btn.setText("扫描中...")
+        self._scan_cancel_btn.setEnabled(False)
 
         self._scan_thread = ScanInstancesThread(self.backend)
         self._scan_thread.scan_step.connect(self._scan_step_label.setText)
@@ -170,6 +174,7 @@ class MigrationDialog(WizardDialogBase):
         else:
             self._scan_desc.setText("未检测到已有的 Nekro Agent 部署。")
             self._scan_cancel_btn.setText("关闭")
+            self._scan_cancel_btn.setEnabled(True)
 
     # ------------------------------------------------------------------ #
     # 页面 2：发现实例列表
@@ -327,6 +332,19 @@ class MigrationDialog(WizardDialogBase):
         layout.addWidget(self._create_error)
 
         layout.addStretch()
+
+        btn_box = QHBoxLayout()
+        btn_box.addStretch()
+        self._create_retry_btn = make_wizard_button("重试", "secondary", fixed_height=38, fixed_width=100)
+        self._create_retry_btn.clicked.connect(self._retry_create_runtime)
+        self._create_retry_btn.setVisible(False)
+        btn_box.addWidget(self._create_retry_btn)
+        self._create_close_btn = make_wizard_button("关闭", "secondary", fixed_height=38, fixed_width=100)
+        self._create_close_btn.clicked.connect(self.reject)
+        self._create_close_btn.setVisible(False)
+        btn_box.addWidget(self._create_close_btn)
+        layout.addLayout(btn_box)
+
         self._add_page(page, "create_runtime")
 
     def _auto_create_runtime(self, instance: dict):
@@ -336,6 +354,8 @@ class MigrationDialog(WizardDialogBase):
         self._create_status.setText("正在创建运行环境...")
         self._create_error.setVisible(False)
         self._create_progress.setRange(0, 0)
+        self._create_retry_btn.setVisible(False)
+        self._create_close_btn.setVisible(False)
 
         install_dir = self.backend.get_default_install_dir()
         self._create_thread = CreateRuntimeThread(self.backend, install_dir)
@@ -358,6 +378,13 @@ class MigrationDialog(WizardDialogBase):
         else:
             self._create_status.setText("❌ 运行环境创建失败")
             self._create_error.setVisible(True)
+            self._create_retry_btn.setVisible(True)
+            self._create_close_btn.setVisible(True)
+
+    def _retry_create_runtime(self):
+        inst = self._pending_takeover_instance
+        if inst:
+            self._auto_create_runtime(inst)
 
     # ------------------------------------------------------------------ #
     # 页面 3：迁移进度
@@ -407,6 +434,7 @@ class MigrationDialog(WizardDialogBase):
 
     def _run_takeover(self, instance: dict):
         self._current_takeover_instance = instance
+        self._current_takeover_step_idx = 0
         self._migrate_status.setText("正在准备迁移...")
         self._migrate_progress.setRange(0, 0)
         self._clear_step_list()
@@ -457,6 +485,7 @@ class MigrationDialog(WizardDialogBase):
                 item.widget().deleteLater()
 
     def _on_takeover_step(self, idx: int, total: int, desc: str):
+        self._current_takeover_step_idx = idx
         self._migrate_status.setText(desc)
         if total > 0:
             self._migrate_progress.setRange(0, total)
@@ -478,19 +507,40 @@ class MigrationDialog(WizardDialogBase):
                 lbl.setStyleSheet("font-size: 13px; color: #8a98a6;")
 
     def _on_takeover_done(self, success: bool):
-        for spinner, lbl in self._step_labels:
-            spinner.setText("✓")
-            spinner.setStyleSheet("font-size: 14px; color: #54c08a;")
-            lbl.setStyleSheet("font-size: 13px; color: #54c08a;")
-
         if success:
+            for spinner, lbl in self._step_labels:
+                spinner.setText("✓")
+                spinner.setStyleSheet("font-size: 14px; color: #54c08a;")
+                lbl.setStyleSheet("font-size: 13px; color: #54c08a;")
             self._migrate_progress.setRange(0, 1)
             self._migrate_progress.setValue(1)
             self._show_result(True, "迁移成功！", "实例已成功接管到启动器管理。点击下方按钮启动服务。")
         else:
             if self._pending_takeover_instance is not None:
                 return
+            self._mark_takeover_failed_step()
+            self._migrate_progress.setRange(0, 1)
+            self._migrate_progress.setValue(0)
             self._show_result(False, "迁移失败", "接管过程中出现错误，请查看日志了解详情。可以重试或手动处理。")
+
+    def _mark_takeover_failed_step(self):
+        if not self._step_labels:
+            return
+        failed_idx = max(0, self._current_takeover_step_idx - 1)
+        failed_idx = min(failed_idx, len(self._step_labels) - 1)
+        for i, (spinner, lbl) in enumerate(self._step_labels):
+            if i < failed_idx:
+                spinner.setText("✓")
+                spinner.setStyleSheet("font-size: 14px; color: #54c08a;")
+                lbl.setStyleSheet("font-size: 13px; color: #54c08a;")
+            elif i == failed_idx:
+                spinner.setText("✕")
+                spinner.setStyleSheet("font-size: 14px; color: #f26f82;")
+                lbl.setStyleSheet("font-size: 13px; color: #f26f82; font-weight: bold;")
+            else:
+                spinner.setText("○")
+                spinner.setStyleSheet("font-size: 14px; color: #a0b0be;")
+                lbl.setStyleSheet("font-size: 13px; color: #8a98a6;")
 
     # ------------------------------------------------------------------ #
     # 页面 4：结果
