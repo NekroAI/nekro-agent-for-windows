@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import select
 import shlex
@@ -26,6 +27,10 @@ HTTP_PORT = 18081
 SOCKS_HOST = "0.0.0.0"
 SOCKS_PORT = 18082
 MAX_REQUEST_BODY_BYTES = 1024 * 1024
+FINAL_JOB_STATUSES = {"succeeded", "failed", "cancelled"}
+ACTIVE_JOB_STATUSES = {"queued", "running", "cancel_requested"}
+BACKUP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+BACKUP_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*\.tar\.gz$")
 
 
 def _utc_now():
@@ -140,6 +145,42 @@ class DaemonJob:
             self._condition.notify_all()
         self.add_log(label)
 
+    def request_cancel(self):
+        with self._condition:
+            if self.status in FINAL_JOB_STATUSES:
+                return False
+            if self.status == "queued":
+                self.status = "cancelled"
+                self.phase = "finished"
+                self.message = "任务已取消"
+                self.finished_at = _utc_now()
+                self.exit_code = 130
+                self._condition.notify_all()
+                log_message = "任务已取消"
+            else:
+                self.status = "cancel_requested"
+                self.message = "已请求取消，任务将在安全阶段边界停止"
+                self._condition.notify_all()
+                log_message = self.message
+        self.add_log(log_message, level="warning")
+        return True
+
+    def is_cancel_requested(self):
+        with self._condition:
+            return self.status == "cancel_requested"
+
+    def cancel(self, message="任务已取消"):
+        with self._condition:
+            if self.status in FINAL_JOB_STATUSES:
+                return
+            self.status = "cancelled"
+            self.phase = "finished"
+            self.message = message
+            self.finished_at = _utc_now()
+            self.exit_code = 130
+            self._condition.notify_all()
+        self.add_log(message, level="warning")
+
     def succeed(self, message, result=None):
         with self._condition:
             self.status = "succeeded"
@@ -168,7 +209,7 @@ class DaemonJob:
             while time.time() < deadline:
                 if self.logs and self.logs[-1]["seq"] > after_seq:
                     return True
-                if self.status in {"succeeded", "failed", "cancelled"}:
+                if self.status in FINAL_JOB_STATUSES:
                     return True
                 remaining = max(0.1, deadline - time.time())
                 self._condition.wait(min(remaining, 1.0))
@@ -181,20 +222,37 @@ class JobStore:
         self._client_requests = {}
         self._lock = threading.RLock()
 
-    def create_update_job(self, instance_id, request):
+    def create_job(self, job_type, instance_id, request, id_prefix):
         client_request_id = str(request.get("client_request_id") or "").strip()
+        request_key = f"{job_type}:{instance_id}:{client_request_id}"
         with self._lock:
-            if client_request_id and client_request_id in self._client_requests:
-                return self._jobs[self._client_requests[client_request_id]], False
+            if client_request_id and request_key in self._client_requests:
+                return self._jobs[self._client_requests[request_key]], False
             for job in self._jobs.values():
-                if job.instance_id == instance_id and job.status in {"queued", "running"}:
+                if job.instance_id == instance_id and job.status in ACTIVE_JOB_STATUSES:
                     return None, False
-            job_id = "upd_" + secrets.token_hex(12)
-            job = DaemonJob(job_id, "update", instance_id, request)
+            job_id = f"{id_prefix}_" + secrets.token_hex(12)
+            job = DaemonJob(job_id, job_type, instance_id, request)
             self._jobs[job_id] = job
             if client_request_id:
-                self._client_requests[client_request_id] = job_id
+                self._client_requests[request_key] = job_id
             return job, True
+
+    def create_update_job(self, instance_id, request):
+        return self.create_job("update", instance_id, request, "upd")
+
+    def create_backup_job(self, instance_id, request):
+        return self.create_job("backup", instance_id, request, "bkp")
+
+    def create_restore_job(self, instance_id, request):
+        return self.create_job("restore", instance_id, request, "rst")
+
+    def active_for_instance(self, instance_id):
+        with self._lock:
+            for job in self._jobs.values():
+                if job.instance_id == instance_id and job.status in ACTIVE_JOB_STATUSES:
+                    return job
+            return None
 
     def get(self, job_id):
         with self._lock:
@@ -480,12 +538,12 @@ class LauncherDaemonFacade:
             "instance_id": binding.instance_id,
             "supports": {
                 "update": True,
-                "preview": False,
-                "rollback": False,
+                "preview": True,
+                "rollback": True,
                 "backup": True,
-                "restore": False,
-                "restore_pre_preview": False,
-                "cancel": False,
+                "restore": True,
+                "restore_pre_preview": True,
+                "cancel": True,
                 "log_stream": True,
                 "daemon_update": False,
             },
@@ -494,12 +552,17 @@ class LauncherDaemonFacade:
         }
 
     def _instance_payload(self, binding):
+        channel = binding.channel
+        if self.backend.config:
+            inst = self.backend.config.get_instance(binding.launcher_inst_id)
+            if inst:
+                channel = str(inst.get("release_channel") or channel or "stable")
         return {
             "instance_id": binding.instance_id,
             "data_dir": binding.data_dir,
             "compose_file": binding.compose_file,
             "env_file": binding.env_file,
-            "channel": binding.channel,
+            "channel": channel,
             "app": {
                 "expose_port": binding.nekro_port,
                 "health_url": f"http://127.0.0.1:{binding.nekro_port}/api/health",
@@ -507,8 +570,8 @@ class LauncherDaemonFacade:
             "container": {
                 "name": f"{binding.instance_name}nekro_agent",
                 "status": "running" if self.backend.is_running else "unknown",
-                "image": self.backend.get_agent_image_ref(self.backend.config),
-                "image_tag": binding.channel,
+                "image": self.backend.get_agent_image_ref(release_channel=channel),
+                "image_tag": channel,
             },
             "docker": {
                 "docker_installed": True,
@@ -536,22 +599,76 @@ class LauncherDaemonFacade:
             return 200, self._capabilities(binding)
         if method == "GET" and path == "/v1/instances/current":
             return 200, self._instance_payload(binding)
+        if method == "GET" and path == "/v1/backups":
+            return self._list_backups(binding, parsed.query)
         if method == "POST" and path == "/v1/jobs/update":
             return self._create_update_job(binding, body)
+        if method == "POST" and path == "/v1/jobs/backup":
+            return self._create_backup_job(binding, body)
+        if method == "POST" and path == "/v1/jobs/restore":
+            return self._create_restore_job(binding, body)
+        if method == "POST" and path.startswith("/v1/jobs/"):
+            return self._job_action_response(binding, path)
         if method == "GET" and path.startswith("/v1/jobs/"):
             return self._job_response(binding, path, parsed.query)
         return 404, _error("daemon_protocol_error", "未知 daemon API 路径")
 
-    def _create_update_job(self, binding, body):
+    def _request_context(self, binding, request):
+        enriched = dict(request)
+        enriched["_launcher_inst_id"] = binding.launcher_inst_id
+        enriched["_deploy_dir"] = binding.deploy_dir
+        enriched["_data_dir"] = binding.data_dir
+        enriched["_instance_name"] = binding.instance_name
+        enriched["_nekro_port"] = binding.nekro_port
+        enriched["_current_channel"] = binding.channel
+        return enriched
+
+    def _parse_job_request(self, binding, body):
         try:
             request = json.loads(body.decode("utf-8") or "{}")
         except json.JSONDecodeError:
-            return 400, _error("daemon_protocol_error", "请求 JSON 格式无效")
+            return None, (400, _error("daemon_protocol_error", "请求 JSON 格式无效"))
+        if not isinstance(request, dict):
+            return None, (400, _error("daemon_protocol_error", "请求 JSON 必须是对象"))
         if request.get("instance_id") != binding.instance_id:
-            return 403, _error("instance_mismatch", "请求 instance_id 与签名实例不匹配")
+            return None, (403, _error("instance_mismatch", "请求 instance_id 与签名实例不匹配"))
+        return self._request_context(binding, request), None
+
+    def _job_conflict_error(self, binding):
+        active = self.jobs.active_for_instance(binding.instance_id)
+        details = {"job_id": active.job_id} if active else None
+        return 409, _error("job_conflict", "已有更新任务正在运行", details)
+
+    def _list_backups(self, binding, query):
+        params = parse_qs(query)
+        try:
+            limit = min(100, max(1, int((params.get("limit") or ["50"])[0])))
+        except ValueError:
+            return 400, _error("daemon_protocol_error", "备份查询参数格式无效")
+        name = str((params.get("name") or [""])[0]).strip()
+        request = self._request_context(binding, {"instance_id": binding.instance_id})
+        try:
+            return 200, {
+                "backups": self.backend.list_daemon_backups(
+                    request,
+                    name=name,
+                    limit=limit,
+                )
+            }
+        except Exception as exc:
+            return 500, _error(
+                "launcher_update_failed",
+                f"读取备份列表失败: {type(exc).__name__}: {exc}",
+            )
+
+    def _create_update_job(self, binding, body):
+        request, error_response = self._parse_job_request(binding, body)
+        if error_response:
+            return error_response
+        assert request is not None
         channel = request.get("channel") or "stable"
-        if channel != "stable":
-            return 400, _error("invalid_channel", "Windows 启动器首版仅支持 stable update")
+        if channel not in {"stable", "preview", "rollback"}:
+            return 400, _error("invalid_channel", "channel 必须是 stable、preview 或 rollback")
         caps = self._capabilities(binding)
         if not caps["enabled"]:
             return 503, _error(
@@ -560,12 +677,55 @@ class LauncherDaemonFacade:
             )
         job, created = self.jobs.create_update_job(binding.instance_id, request)
         if job is None:
-            return 409, _error("job_conflict", "已有更新任务正在运行")
+            return self._job_conflict_error(binding)
+        return self._start_job(job, created, self._run_update_job)
+
+    def _create_backup_job(self, binding, body):
+        request, error_response = self._parse_job_request(binding, body)
+        if error_response:
+            return error_response
+        assert request is not None
+        name = str(request.get("name") or "manual").strip()
+        if not BACKUP_NAME_RE.fullmatch(name):
+            return 400, _error("invalid_backup_name", "备份名称只能包含字母、数字、点、下划线和短横线")
+        request["name"] = name
+        caps = self._capabilities(binding)
+        if not caps["enabled"]:
+            return 503, _error(
+                caps["unavailable_reason"] or "daemon_unavailable",
+                "当前实例不可执行备份",
+            )
+        job, created = self.jobs.create_backup_job(binding.instance_id, request)
+        if job is None:
+            return self._job_conflict_error(binding)
+        return self._start_job(job, created, self._run_backup_job)
+
+    def _create_restore_job(self, binding, body):
+        request, error_response = self._parse_job_request(binding, body)
+        if error_response:
+            return error_response
+        assert request is not None
+        backup_id = str(request.get("backup_id") or "").strip()
+        if not BACKUP_ID_RE.fullmatch(backup_id) or ".." in backup_id:
+            return 400, _error("invalid_backup_id", "backup_id 必须是当前实例备份文件名")
+        request["backup_id"] = backup_id
+        caps = self._capabilities(binding)
+        if not caps["enabled"]:
+            return 503, _error(
+                caps["unavailable_reason"] or "daemon_unavailable",
+                "当前实例不可执行还原",
+            )
+        job, created = self.jobs.create_restore_job(binding.instance_id, request)
+        if job is None:
+            return self._job_conflict_error(binding)
+        return self._start_job(job, created, self._run_restore_job)
+
+    def _start_job(self, job, created, runner):
         if created:
             thread = threading.Thread(
-                target=self._run_update_job,
-                args=(job, request),
-                name=f"LauncherUpdateJob-{job.job_id}",
+                target=runner,
+                args=(job, job.request),
+                name=f"LauncherDaemonJob-{job.job_id}",
                 daemon=True,
             )
             thread.start()
@@ -585,6 +745,42 @@ class LauncherDaemonFacade:
                 f"Windows 启动器更新任务异常: {type(exc).__name__}: {exc}",
             )
             self.backend.status_changed.emit("更新失败")
+
+    def _run_backup_job(self, job, request):
+        try:
+            self.backend.run_daemon_backup_job(request, job)
+        except Exception as exc:
+            job.fail(
+                "backup_failed",
+                f"Windows 启动器备份任务异常: {type(exc).__name__}: {exc}",
+            )
+
+    def _run_restore_job(self, job, request):
+        try:
+            self.backend.run_daemon_restore_job(request, job)
+        except Exception as exc:
+            job.fail(
+                "launcher_update_failed",
+                f"Windows 启动器还原任务异常: {type(exc).__name__}: {exc}",
+            )
+            self.backend.status_changed.emit("更新失败")
+
+    def _job_action_response(self, binding, path):
+        parts = path.strip("/").split("/")
+        if len(parts) == 4 and parts[3] == "cancel":
+            job = self.jobs.get(parts[2])
+            if not job:
+                return 404, _error("job_not_found", "任务不存在")
+            if job.instance_id != binding.instance_id:
+                return 403, _error("instance_mismatch", "任务不属于当前实例")
+            job.request_cancel()
+            snapshot = job.snapshot()
+            return 200, {
+                "job_id": job.job_id,
+                "status": snapshot["status"],
+                "message": snapshot["message"],
+            }
+        return 404, _error("job_not_found", "任务资源不存在")
 
     def _job_response(self, binding, path, query):
         parts = path.strip("/").split("/")
@@ -683,7 +879,7 @@ class LauncherDaemonFacade:
                             self._write_sse("log", entry)
                         job_snapshot = job.snapshot()
                         self._write_sse("job", job_snapshot)
-                        if job_snapshot["status"] in {"succeeded", "failed", "cancelled"}:
+                        if job_snapshot["status"] in FINAL_JOB_STATUSES:
                             self._write_sse("result", job_snapshot)
                             break
                         if not job.wait_for_event(after_seq, timeout=30):

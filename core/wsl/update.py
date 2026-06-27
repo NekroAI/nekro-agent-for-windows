@@ -1,9 +1,12 @@
+import posixpath
+import re
 import shlex
 import threading
 import time
 import urllib.error
 import urllib.request
 import json
+from datetime import datetime, timezone
 
 from core.port_utils import normalize_port
 from core.wsl.constants import (
@@ -210,28 +213,479 @@ class WSLUpdateMixin:
 
         threading.Thread(target=_do_update, daemon=True).start()
 
-    def run_daemon_update_job(self, request: dict, job):
-        """执行 daemon facade 的非交互 stable 更新任务。"""
-        from core.update_runner import build_update_plan
+    def _daemon_context(self, request: dict):
+        inst_id = str(request.get("_launcher_inst_id") or "")
+        inst = self.config.get_instance(inst_id) if self.config and inst_id else None
+        inst = inst or {}
+        return {
+            "inst_id": inst_id,
+            "deploy_dir": str(request.get("_deploy_dir") or inst.get("deploy_dir") or "/root/nekro_agent"),
+            "data_dir": str(request.get("_data_dir") or inst.get("data_dir") or "/root/nekro_agent_data"),
+            "instance_name": str(request.get("_instance_name") or inst.get("instance_name") or ""),
+            "nekro_port": normalize_port(request.get("_nekro_port") or inst.get("nekro_port"), 8021),
+            "channel": str(inst.get("release_channel") or request.get("_current_channel") or "stable"),
+        }
 
-        distro = DISTRO_NAME
-        deploy_dir, _, _ = self._get_active_deploy_paths()
+    def _daemon_instance_slug(self, request: dict):
+        raw = str(request.get("instance_id") or "instance")
+        if ":" in raw:
+            raw = raw.split(":", 1)[1]
+        slug = re.sub(r"[^A-Za-z0-9_.-]", "_", raw).strip("._-")
+        return (slug or "instance")[:80]
+
+    def _daemon_backup_dir(self, request: dict):
+        return f"/root/.na-tools/backups/{self._daemon_instance_slug(request)}"
+
+    def _daemon_backup_name_from_filename(self, filename):
+        match = re.match(
+            r"^nekro_agent_backup_(?P<name>.+)_(?P<stamp>\d{8}_\d{6})\.tar\.gz$",
+            filename,
+        )
+        if match:
+            return match.group("name")
+        if filename.endswith("_preview_backup.tar.gz") or filename == "na_preview_backup.tar.gz":
+            return "pre-preview"
+        if filename == "na_update_backup.tar.gz":
+            return "stable-update"
+        return "manual"
+
+    def _daemon_backup_summary(self, path, name=None):
+        filename = posixpath.basename(path)
+        stat = self._wsl_exec(
+            DISTRO_NAME,
+            f"test -f {shlex.quote(path)} && stat -c '%s\t%Y' {shlex.quote(path)}",
+            timeout=15,
+        ).strip()
+        size_bytes = 0
+        created_at = datetime.now(timezone.utc).isoformat()
+        if stat:
+            parts = stat.split("\t", 1)
+            if parts:
+                try:
+                    size_bytes = int(float(parts[0]))
+                except ValueError:
+                    size_bytes = 0
+            if len(parts) == 2:
+                try:
+                    created_at = datetime.fromtimestamp(float(parts[1]), timezone.utc).isoformat()
+                except ValueError:
+                    pass
+        return {
+            "backup_id": filename,
+            "filename": filename,
+            "name": name or self._daemon_backup_name_from_filename(filename),
+            "created_at": created_at,
+            "size_bytes": size_bytes,
+        }
+
+    def _daemon_make_backup_path(self, request: dict, name: str):
+        backup_dir = self._daemon_backup_dir(request)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", name).strip("._-") or "manual"
+        filename = f"nekro_agent_backup_{safe_name}_{stamp}.tar.gz"
+        self._run_wsl_checked(
+            DISTRO_NAME,
+            f"mkdir -p {shlex.quote(backup_dir)}",
+            action="[daemon 备份] 创建备份目录失败",
+            timeout=30,
+        )
+        return f"{backup_dir}/{filename}"
+
+    def _daemon_resolve_backup_path(self, request: dict, backup_id: str):
+        if "/" in backup_id or "\\" in backup_id or ".." in backup_id:
+            return ""
+        backup_dir = self._daemon_backup_dir(request)
+        candidate = f"{backup_dir}/{backup_id}"
+        if self._wsl_exec(
+            DISTRO_NAME,
+            f"test -f {shlex.quote(candidate)} && echo yes",
+            timeout=15,
+        ).strip() == "yes":
+            return candidate
+        legacy_paths = {
+            posixpath.basename(self._preview_backup_archive_path(inst_id=request.get("_launcher_inst_id"))):
+                self._preview_backup_archive_path(inst_id=request.get("_launcher_inst_id")),
+            posixpath.basename(UPDATE_BACKUP_ARCHIVE_PATH): UPDATE_BACKUP_ARCHIVE_PATH,
+        }
+        legacy = legacy_paths.get(backup_id)
+        if legacy and self._wsl_exec(
+            DISTRO_NAME,
+            f"test -f {shlex.quote(legacy)} && echo yes",
+            timeout=15,
+        ).strip() == "yes":
+            return legacy
+        return ""
+
+    def _daemon_latest_backup_path(self, request: dict, name: str):
+        backups = self.list_daemon_backups(request, name=name, limit=1)
+        if not backups:
+            return ""
+        return self._daemon_resolve_backup_path(request, backups[0]["backup_id"])
+
+    def list_daemon_backups(self, request: dict, name="", limit=50):
+        backup_dir = self._daemon_backup_dir(request)
+        cmd = (
+            f"mkdir -p {shlex.quote(backup_dir)} && "
+            f"find {shlex.quote(backup_dir)} -maxdepth 1 -type f -name '*.tar.gz' "
+            "-printf '%f\t%s\t%T@\\n' 2>/dev/null"
+        )
+        raw = self._wsl_exec(DISTRO_NAME, cmd, timeout=30)
+        items = []
+        for line in raw.splitlines():
+            parts = line.split("\t")
+            if len(parts) != 3:
+                continue
+            filename, size_raw, mtime_raw = parts
+            item_name = self._daemon_backup_name_from_filename(filename)
+            if name and item_name != name:
+                continue
+            try:
+                size_bytes = int(size_raw)
+                mtime = float(mtime_raw)
+            except ValueError:
+                continue
+            items.append(
+                {
+                    "backup_id": filename,
+                    "filename": filename,
+                    "name": item_name,
+                    "created_at": datetime.fromtimestamp(mtime, timezone.utc).isoformat(),
+                    "size_bytes": size_bytes,
+                    "_mtime": mtime,
+                }
+            )
+
+        for legacy in (
+            self._preview_backup_archive_path(inst_id=request.get("_launcher_inst_id")),
+            UPDATE_BACKUP_ARCHIVE_PATH,
+        ):
+            filename = posixpath.basename(legacy)
+            if any(item["filename"] == filename for item in items):
+                continue
+            if self._wsl_exec(
+                DISTRO_NAME,
+                f"test -f {shlex.quote(legacy)} && echo yes",
+                timeout=15,
+            ).strip() == "yes":
+                summary = self._daemon_backup_summary(legacy)
+                if not name or summary["name"] == name:
+                    items.append({**summary, "_mtime": 0.0})
+
+        items.sort(key=lambda item: item.get("_mtime", 0.0), reverse=True)
+        result = []
+        for item in items[:limit]:
+            item = dict(item)
+            item.pop("_mtime", None)
+            result.append(item)
+        return result
+
+    def _backup_target_candidates_for_paths(self, deploy_dir, data_dir, instance_name):
+        volume_prefix = instance_name
+        targets = [
+            f"/var/lib/docker/volumes/{volume_prefix}nekro_postgres_data",
+            f"/var/lib/docker/volumes/{volume_prefix}nekro_qdrant_data",
+            data_dir,
+            deploy_dir,
+        ]
+        for target in NA_BACKUP_TARGETS:
+            if target not in targets:
+                targets.append(target)
+        return targets
+
+    def _existing_backup_targets_for_paths(self, distro, deploy_dir, data_dir, instance_name):
+        existing = []
+        for target in self._backup_target_candidates_for_paths(deploy_dir, data_dir, instance_name):
+            if self._wsl_exec(distro, f"test -d {shlex.quote(target)} && echo yes").strip() == "yes":
+                existing.append(target)
+        return existing
+
+    def _backup_nekro_archive_for_paths(self, distro, archive_path, deploy_dir, data_dir, instance_name):
+        existing_targets = self._existing_backup_targets_for_paths(distro, deploy_dir, data_dir, instance_name)
+        if not existing_targets:
+            return False, "未找到可备份的目录。"
+
+        archive_dir = posixpath.dirname(archive_path.rstrip("/")) or "/root"
+        target_args = " ".join(shlex.quote(target.lstrip("/")) for target in existing_targets)
+        cmd = (
+            f"mkdir -p {shlex.quote(archive_dir)} && "
+            f"rm -f {shlex.quote(archive_path)} && "
+            f"tar -czf {shlex.quote(archive_path)} -C / {target_args}"
+        )
+        try:
+            self._run_wsl_checked(
+                distro,
+                cmd,
+                action="创建备份归档失败",
+                timeout=600,
+            )
+        except Exception as e:
+            return False, (
+                f"备份失败\n备份文件: {archive_path}\n"
+                f"备份目录:\n" + "\n".join(existing_targets) + f"\n{e}"
+            )
+        return True, f"已生成备份归档：{archive_path}"
+
+    def _daemon_validate_instance(self, ctx, job):
+        checks = [
+            (
+                f"test -d {shlex.quote(ctx['data_dir'])}",
+                "instance_not_bound",
+                f"实例数据目录不存在: {ctx['data_dir']}",
+            ),
+            (
+                "test -f docker-compose.yml",
+                "compose_missing",
+                f"Compose 文件不存在: {ctx['deploy_dir']}/docker-compose.yml",
+            ),
+            (
+                "test -f .env",
+                "env_missing",
+                f"env 文件不存在: {ctx['deploy_dir']}/.env",
+            ),
+        ]
+        for cmd, code, message in checks:
+            try:
+                self._run_wsl_checked(
+                    DISTRO_NAME,
+                    cmd,
+                    action=f"[daemon 更新] {message}",
+                    cwd=ctx["deploy_dir"] if "docker-compose" in cmd or ".env" in cmd else None,
+                    timeout=30,
+                )
+            except Exception as e:
+                job.fail(code, str(e))
+                return False
+        try:
+            self._run_wsl_checked(
+                DISTRO_NAME,
+                "systemctl start docker && docker version >/dev/null && docker compose version >/dev/null",
+                action="[daemon 更新] Docker 或 Compose 不可用",
+                timeout=60,
+            )
+        except Exception as e:
+            job.fail("docker_unavailable", str(e))
+            return False
+        return True
+
+    def _daemon_exec(self, ctx, job, cmd, *, timeout=300, action="[daemon 更新] 命令执行失败"):
+        proc = self._run_wsl_checked(
+            DISTRO_NAME,
+            cmd,
+            action=action,
+            cwd=ctx["deploy_dir"],
+            timeout=timeout,
+        )
+        out = self._clean_command_output(
+            self._safe_decode(proc.stdout) + self._safe_decode(proc.stderr)
+        ).strip()
+        if out:
+            job.add_log(out, stream="stdout")
+        return proc.returncode, out
+
+    def _rewrite_daemon_compose_channel(self, ctx, channel):
+        compose_path = f"{ctx['deploy_dir']}/docker-compose.yml"
+        compose_content = self._wsl_exec_checked(
+            DISTRO_NAME,
+            f"cat {shlex.quote(compose_path)}",
+            timeout=30,
+        )
+        if channel == "preview":
+            if PREVIEW_IMAGE in compose_content:
+                return
+            if PREVIEW_COMPOSE_IMAGE not in compose_content:
+                raise RuntimeError("未找到稳定版镜像引用，无法切换到预览版。")
+            updated_content = compose_content.replace(PREVIEW_COMPOSE_IMAGE, PREVIEW_IMAGE)
+        else:
+            if STABLE_IMAGE in compose_content and PREVIEW_IMAGE not in compose_content:
+                return
+            if PREVIEW_IMAGE not in compose_content:
+                raise RuntimeError("未找到预览版镜像引用，无法切回稳定版。")
+            updated_content = compose_content.replace(PREVIEW_IMAGE, STABLE_IMAGE)
+        self._write_to_wsl(DISTRO_NAME, updated_content, compose_path)
+
+    def _daemon_mark_instance_channel(self, ctx, channel, preview_backup_available=False):
+        if not self.config:
+            return
+        updates = {
+            "release_channel": channel,
+            "preview_backup_available": bool(preview_backup_available),
+        }
+        if ctx["inst_id"]:
+            self.config.update_instance_with_globals(
+                ctx["inst_id"],
+                instance_updates=updates,
+                global_updates=updates,
+            )
+        else:
+            self.config.set_many(updates)
+
+    def _daemon_preview_backup_available(self, ctx):
+        if not self.config:
+            return False
+        if ctx["inst_id"]:
+            inst = self.config.get_instance(ctx["inst_id"]) or {}
+            if "preview_backup_available" in inst:
+                return bool(inst.get("preview_backup_available"))
+        return bool(self.config.get("preview_backup_available", False))
+
+    def _daemon_attach_logs(self, ctx):
+        inst_id = ctx["inst_id"]
+        inst_display = inst_id if inst_id and inst_id != "default" else ""
+        log_prefix = f"[{inst_display}] " if inst_display else ""
+        if self._log_process is None or self._log_process.poll() is not None:
+            threading.Thread(
+                target=self._log_reader,
+                args=(DISTRO_NAME, ctx["deploy_dir"], log_prefix, inst_id),
+                daemon=True,
+            ).start()
+
+    def _daemon_cancelled(self, job):
+        if job.is_cancel_requested():
+            job.cancel("任务已在安全阶段边界取消")
+            return True
+        return False
+
+    def run_daemon_backup_job(self, request: dict, job):
+        """执行 daemon facade 的手动备份任务。"""
+        ctx = self._daemon_context(request)
+        self._stop_event.clear()
+        job.start("validate_instance", "正在校验实例与 Docker 环境")
+        if not self._daemon_validate_instance(ctx, job):
+            return
+        if self._daemon_cancelled(job):
+            return
+        name = str(request.get("name") or "manual")
+        archive_path = self._daemon_make_backup_path(request, name)
+        job.set_progress("backup", 1, 2, "正在创建备份归档")
+        ok, backup_message = self._backup_nekro_archive_for_paths(
+            DISTRO_NAME,
+            archive_path,
+            ctx["deploy_dir"],
+            ctx["data_dir"],
+            ctx["instance_name"],
+        )
+        if not ok:
+            job.fail("backup_failed", backup_message)
+            return
+        summary = self._daemon_backup_summary(archive_path, name=name)
+        job.add_log(backup_message)
+        job.succeed("备份完成", {"backup": summary})
+
+    def run_daemon_restore_job(self, request: dict, job):
+        """执行 daemon facade 的手动还原任务。"""
+        ctx = self._daemon_context(request)
+        backup_id = str(request.get("backup_id") or "")
+        self._stop_event.clear()
+        self.status_changed.emit("更新中...")
+        job.start("validate_instance", "正在校验实例与 Docker 环境")
+        if not self._daemon_validate_instance(ctx, job):
+            self.status_changed.emit("更新失败")
+            return
+        archive_path = self._daemon_resolve_backup_path(request, backup_id)
+        if not archive_path:
+            self.status_changed.emit("更新失败")
+            job.fail("backup_not_found", f"未找到备份: {backup_id}")
+            return
+        if self._daemon_cancelled(job):
+            return
+        job.set_progress("restore", 1, 4, "正在停止服务并恢复备份")
+        try:
+            self._daemon_exec(
+                ctx,
+                job,
+                "docker compose -f docker-compose.yml stop "
+                "nekro_agent nekro_postgres nekro_qdrant nekro_napcat 2>/dev/null || true",
+                timeout=120,
+                action="[daemon 还原] 停止服务失败",
+            )
+            self._daemon_exec(
+                ctx,
+                job,
+                f"tar -xzf {shlex.quote(archive_path)} -C /",
+                timeout=600,
+                action="[daemon 还原] 恢复备份数据失败",
+            )
+            job.set_progress("restart_services", 2, 4, "正在重建并启动服务")
+            self._daemon_exec(
+                ctx,
+                job,
+                "docker compose -f docker-compose.yml --env-file .env up -d",
+                timeout=300,
+                action="[daemon 还原] 重建并启动服务失败",
+            )
+        except Exception as e:
+            self.status_changed.emit("更新失败")
+            job.fail("launcher_update_failed", str(e))
+            return
+        job.set_progress("verify", 3, 4, "等待服务健康检查通过")
+        health = self._wait_daemon_update_health(job, ctx["nekro_port"])
+        if health is None:
+            return
+        if not health:
+            self.status_changed.emit("更新失败")
+            job.fail("verify_timeout", "服务健康检查超时")
+            return
+        self.is_running = True
+        self._daemon_attach_logs(ctx)
+        self.status_changed.emit("运行中")
+        job.succeed(
+            "备份还原完成",
+            {"backup": self._daemon_backup_summary(archive_path), "app_health": "ok"},
+        )
+
+    def run_daemon_update_job(self, request: dict, job):
+        """执行 daemon facade 的非交互更新任务。"""
+        ctx = self._daemon_context(request)
         channel = request.get("channel") or "stable"
-        if channel != "stable":
-            job.fail("invalid_channel", "Windows 启动器 daemon 首版仅支持 stable 更新")
+        if channel not in {"stable", "preview", "rollback"}:
+            job.fail("invalid_channel", "channel 必须是 stable、preview 或 rollback")
             return
 
-        backup = bool(request.get("backup", True))
         update_sandbox = bool(request.get("update_sandbox", True))
         update_cc_sandbox = bool(request.get("update_cc_sandbox", False))
-        agent_image = self.get_agent_image_ref(self.config)
-        steps = [
-            step for step in build_update_plan(agent_image)
-            if step.get("type") != "notify"
-        ]
-        if not backup:
-            steps = [step for step in steps if step.get("type") != "backup"]
-        if update_sandbox:
+        restore_pre_preview = bool(request.get("restore_pre_preview", False))
+        backup_requested = bool(request.get("backup", True))
+        target_channel = "preview" if channel == "preview" else "stable"
+        agent_image = self.get_agent_image_ref(release_channel=target_channel)
+        already_preview = ctx["channel"] == "preview"
+        steps = []
+
+        if channel == "stable":
+            if backup_requested:
+                steps.append({"type": "backup", "name": "stable-update", "label": "创建 stable 更新前备份"})
+            steps.extend(
+                [
+                    {"type": "pull", "image": agent_image, "label": "拉取最新 Nekro Agent 镜像"},
+                    {"type": "compose_up", "services": ["nekro_agent"], "label": "重建 Nekro Agent 容器"},
+                ]
+            )
+        elif channel == "preview":
+            if not already_preview:
+                steps.append({"type": "backup", "name": "pre-preview", "label": "创建预览版切换前备份"})
+            steps.extend(
+                [
+                    {"type": "switch_channel", "channel": "preview", "label": "写入预览版镜像配置"},
+                    {"type": "pull", "image": agent_image, "label": "拉取预览版 Nekro Agent 镜像"},
+                    {"type": "compose_up", "services": ["nekro_agent"], "label": "重建 Nekro Agent 容器"},
+                ]
+            )
+        else:
+            steps.append({"type": "switch_channel", "channel": "stable", "label": "写回稳定版镜像配置"})
+            if restore_pre_preview:
+                steps.append({"type": "restore_pre_preview", "label": "恢复预览版切换前备份"})
+            steps.extend(
+                [
+                    {"type": "pull", "image": agent_image, "label": "拉取稳定版 Nekro Agent 镜像"},
+                    {
+                        "type": "compose_up",
+                        "services": [] if restore_pre_preview else ["nekro_agent"],
+                        "all_services": restore_pre_preview,
+                        "label": "重建并启动服务" if restore_pre_preview else "重建 Nekro Agent 容器",
+                    },
+                ]
+            )
+
+        if update_sandbox and channel != "rollback":
             steps.append(
                 {
                     "type": "pull",
@@ -240,7 +694,7 @@ class WSLUpdateMixin:
                     "phase": "pull_sandbox",
                 }
             )
-        if update_cc_sandbox:
+        if update_cc_sandbox and channel != "rollback":
             steps.append(
                 {
                     "type": "pull",
@@ -251,136 +705,155 @@ class WSLUpdateMixin:
             )
         steps.append({"type": "verify", "label": "等待服务健康检查通过"})
 
-        total = len(steps) + 1
-        current = 1
         self._stop_event.clear()
         self.status_changed.emit("更新中...")
         job.start("validate_instance", "正在校验实例与 Docker 环境")
 
-        def _fail(code, message, details=None):
+        if not self._daemon_validate_instance(ctx, job):
             self.status_changed.emit("更新失败")
-            job.fail(code, message, details=details)
-
-        def _exec(cmd, timeout=300, action="[daemon 更新] 命令执行失败"):
-            proc = self._run_wsl_checked(
-                distro,
-                cmd,
-                action=action,
-                cwd=deploy_dir,
-                timeout=timeout,
-            )
-            out = self._clean_command_output(
-                self._safe_decode(proc.stdout) + self._safe_decode(proc.stderr)
-            ).strip()
-            if out:
-                job.add_log(out, stream="stdout")
-            return proc.returncode, out
-
-        try:
-            self._run_wsl_checked(
-                distro,
-                "test -f docker-compose.yml && test -f .env",
-                action="[daemon 更新] 实例部署文件缺失",
-                cwd=deploy_dir,
-                timeout=30,
-            )
-            self._run_wsl_checked(
-                distro,
-                "systemctl start docker && docker version >/dev/null && docker compose version >/dev/null",
-                action="[daemon 更新] Docker 或 Compose 不可用",
-                timeout=60,
-            )
-        except Exception as e:
-            _fail("docker_unavailable", str(e))
             return
 
-        for step in steps:
-            current += 1
+        total = len(steps) + 1
+        backup_summary = None
+        for index, step in enumerate(steps, start=2):
+            if self._daemon_cancelled(job):
+                return
             step_type = str(step.get("type") or "")
             label = str(step.get("label") or "")
             phase = str(step.get("phase") or "") or {
                 "backup": "backup",
+                "switch_channel": "switch_channel",
                 "pull": "pull_images",
                 "compose_up": "restart_services",
+                "restore_pre_preview": "backup",
                 "verify": "verify",
             }.get(step_type, "validate_instance")
-            job.set_progress(phase, current, total, label)
+            job.set_progress(phase, index, total, label)
             self.log_received.emit(f"[daemon 更新] {label}", "info")
             self._emit_pull_progress("stage", label)
 
-            if step_type == "backup":
-                ok, backup_message = self._backup_nekro_archive(
-                    distro,
-                    step.get("archive_path", UPDATE_BACKUP_ARCHIVE_PATH),
-                )
-                if not ok:
-                    _fail("backup_failed", backup_message)
-                    return
-                job.add_log(backup_message)
-                continue
+            try:
+                if step_type == "backup":
+                    archive_path = self._daemon_make_backup_path(request, str(step.get("name") or "manual"))
+                    ok, backup_message = self._backup_nekro_archive_for_paths(
+                        DISTRO_NAME,
+                        archive_path,
+                        ctx["deploy_dir"],
+                        ctx["data_dir"],
+                        ctx["instance_name"],
+                    )
+                    if not ok:
+                        self.status_changed.emit("更新失败")
+                        job.fail("backup_failed", backup_message)
+                        return
+                    backup_summary = self._daemon_backup_summary(
+                        archive_path,
+                        name=str(step.get("name") or "manual"),
+                    )
+                    job.add_log(backup_message)
+                    continue
 
-            if step_type == "pull":
-                image = step.get("image", "")
-                if not self._pull_images(distro, [image]):
-                    _fail("pull_failed", f"镜像拉取失败: {image}", {"image": image})
-                    return
-                continue
+                if step_type == "switch_channel":
+                    self._rewrite_daemon_compose_channel(ctx, str(step.get("channel") or "stable"))
+                    continue
 
-            if step_type == "compose_up":
-                services = step.get("services", [])
-                service_args = " ".join(shlex.quote(service) for service in services)
-                cmd = (
-                    "docker compose -f docker-compose.yml --env-file .env "
-                    f"up -d --no-deps --force-recreate {service_args}"
-                ).strip()
-                try:
-                    _exec(
+                if step_type == "restore_pre_preview":
+                    archive_path = self._daemon_latest_backup_path(request, "pre-preview")
+                    if not archive_path:
+                        self.status_changed.emit("更新失败")
+                        job.fail("backup_not_found", "未找到 pre-preview 备份")
+                        return
+                    self._daemon_exec(
+                        ctx,
+                        job,
+                        "docker compose -f docker-compose.yml stop "
+                        "nekro_agent nekro_postgres nekro_qdrant nekro_napcat 2>/dev/null || true",
+                        timeout=120,
+                        action="[daemon 更新] 停止服务失败",
+                    )
+                    self._daemon_exec(
+                        ctx,
+                        job,
+                        f"tar -xzf {shlex.quote(archive_path)} -C /",
+                        timeout=600,
+                        action="[daemon 更新] 恢复 pre-preview 备份失败",
+                    )
+                    self._rewrite_daemon_compose_channel(ctx, "stable")
+                    backup_summary = self._daemon_backup_summary(archive_path, name="pre-preview")
+                    continue
+
+                if step_type == "pull":
+                    image = str(step.get("image") or "")
+                    if not self._pull_images(DISTRO_NAME, [image]):
+                        code = "sandbox_pull_failed" if phase == "pull_sandbox" else "pull_failed"
+                        self.status_changed.emit("更新失败")
+                        job.fail(code, f"镜像拉取失败: {image}", {"image": image})
+                        return
+                    continue
+
+                if step_type == "compose_up":
+                    if step.get("all_services"):
+                        cmd = "docker compose -f docker-compose.yml --env-file .env up -d"
+                    else:
+                        services = step.get("services", [])
+                        service_args = " ".join(shlex.quote(service) for service in services)
+                        cmd = (
+                            "docker compose -f docker-compose.yml --env-file .env "
+                            f"up -d --no-deps --force-recreate {service_args}"
+                        ).strip()
+                    self._daemon_exec(
+                        ctx,
+                        job,
                         cmd,
                         timeout=300,
                         action=f"[daemon 更新] {label}失败",
                     )
-                except Exception as e:
-                    _fail("restart_failed", str(e))
-                    return
-                continue
+                    continue
 
-            if step_type == "verify":
-                if not self._wait_daemon_update_health(job):
-                    _fail("verify_timeout", "服务健康检查超时")
-                    return
-                continue
+                if step_type == "verify":
+                    health = self._wait_daemon_update_health(job, ctx["nekro_port"])
+                    if health is None:
+                        return
+                    if not health:
+                        self.status_changed.emit("更新失败")
+                        job.fail("verify_timeout", "服务健康检查超时")
+                        return
+                    continue
+            except Exception as e:
+                self.status_changed.emit("更新失败")
+                code = "restart_failed" if step_type == "compose_up" else "launcher_update_failed"
+                job.fail(code, str(e))
+                return
 
         self._emit_pull_progress("done", "更新完成")
         self.is_running = True
-        inst_id = self.config.get_active_instance_id() if self.config else ""
-        inst_display = inst_id if inst_id and inst_id != "default" else ""
-        log_prefix = f"[{inst_display}] " if inst_display else ""
-        nekro_port = (
-            normalize_port(self.config.get("nekro_port"), 8021)
-            if self.config
-            else 8021
-        )
-        if self._log_process is None or self._log_process.poll() is not None:
-            threading.Thread(
-                target=self._log_reader,
-                args=(distro, deploy_dir, log_prefix, inst_id),
-                daemon=True,
-            ).start()
+        self._daemon_attach_logs(ctx)
+        if channel == "preview":
+            self._daemon_mark_instance_channel(
+                ctx,
+                "preview",
+                preview_backup_available=bool(backup_summary) or self._daemon_preview_backup_available(ctx),
+            )
+        elif channel in {"stable", "rollback"}:
+            self._daemon_mark_instance_channel(ctx, "stable", preview_backup_available=False)
         self.status_changed.emit("运行中")
-        job.succeed(
-            "Nekro Agent 更新完成",
-            {
-                "channel": "stable",
-                "image": agent_image,
-                "app_health": "ok",
-            },
-        )
+        result = {
+            "channel": "preview" if channel == "preview" else "stable",
+            "image": agent_image,
+            "app_health": "ok",
+        }
+        if backup_summary:
+            result["backup"] = backup_summary
+        job.succeed("Nekro Agent 更新完成", result)
 
-    def _wait_daemon_update_health(self, job, timeout=120):
-        port = normalize_port(self.config.get("nekro_port"), 8021) if self.config else 8021
+    def _wait_daemon_update_health(self, job, port=None, timeout=120):
+        port = normalize_port(port, 8021)
         url = f"http://127.0.0.1:{port}/api/health"
         deadline = time.time() + timeout
         while time.time() < deadline:
+            if job.is_cancel_requested():
+                job.cancel("任务已在健康检查阶段取消")
+                return None
             try:
                 with urllib.request.urlopen(url, timeout=3) as response:
                     body = response.read(4096).decode("utf-8", errors="replace")

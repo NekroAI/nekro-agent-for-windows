@@ -152,6 +152,35 @@ class LauncherDaemonTests(unittest.TestCase):
         self.assertIsNotNone(third)
         self.assertTrue(third_created)
 
+    def test_job_store_rejects_parallel_jobs_across_types(self):
+        store = JobStore()
+        first, created = store.create_update_job("sha256:test", {"client_request_id": "one"})
+        second, second_created = store.create_backup_job("sha256:test", {"client_request_id": "two"})
+
+        self.assertIsNotNone(first)
+        self.assertTrue(created)
+        self.assertIsNone(second)
+        self.assertFalse(second_created)
+
+        first.cancel()
+        third, third_created = store.create_backup_job("sha256:test", {"client_request_id": "two"})
+
+        self.assertIsNotNone(third)
+        self.assertTrue(third_created)
+
+    def test_job_cancel_request_marks_running_job_cancel_requested(self):
+        store = JobStore()
+        job, created = store.create_update_job("sha256:test", {"client_request_id": "one"})
+
+        self.assertIsNotNone(job)
+        self.assertTrue(created)
+        job.start()
+        changed = job.request_cancel()
+
+        self.assertTrue(changed)
+        self.assertEqual(job.snapshot()["status"], "cancel_requested")
+        self.assertTrue(job.is_cancel_requested())
+
 
 if __name__ == "__main__":
     unittest.main()
