@@ -242,10 +242,10 @@ class JobStore:
         return self.create_job("update", instance_id, request, "upd")
 
     def create_backup_job(self, instance_id, request):
-        return self.create_job("backup", instance_id, request, "bkp")
+        return self.create_job("backup", instance_id, request, "upd")
 
     def create_restore_job(self, instance_id, request):
-        return self.create_job("restore", instance_id, request, "rst")
+        return self.create_job("restore", instance_id, request, "upd")
 
     def active_for_instance(self, instance_id):
         with self._lock:
