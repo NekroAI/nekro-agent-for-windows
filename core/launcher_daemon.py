@@ -678,24 +678,39 @@ class LauncherDaemonFacade:
             self._used_nonces[nonce_key] = now_ms
         return binding, None
 
-    def _capabilities(self, binding):
-        enabled = True
-        reason = None
+    def _wsl_probe(self, cmd, *, cwd=None, timeout=15):
         try:
-            if not self.backend.runtime_exists():
-                enabled = False
-                reason = "wsl_unavailable"
-            elif not self.backend._wsl_exec(
+            self.backend._run_wsl_checked(
                 DISTRO_NAME,
-                f"test -f {shlex.quote(binding.compose_file)} && "
-                f"test -f {shlex.quote(binding.env_file)} && echo yes",
-                timeout=15,
-            ).strip() == "yes":
-                enabled = False
-                reason = "compose_missing"
+                cmd,
+                action="[daemon] capability 检测失败",
+                cwd=cwd,
+                timeout=timeout,
+            )
+            return True
         except Exception:
-            enabled = False
-            reason = "wsl_unavailable"
+            return False
+
+    def _capability_unavailable_reason(self, binding):
+        if not self.backend.runtime_exists():
+            return "wsl_unavailable"
+        checks = [
+            (f"test -d {shlex.quote(binding.data_dir)}", "instance_not_bound", None),
+            (f"test -f {shlex.quote(binding.compose_file)}", "compose_missing", None),
+            (f"test -f {shlex.quote(binding.env_file)}", "env_missing", None),
+            ("command -v docker >/dev/null 2>&1", "docker_unavailable", None),
+            ("docker compose version >/dev/null 2>&1", "docker_unavailable", None),
+            ("test -S /var/run/docker.sock", "docker_socket_missing", None),
+            ("docker version >/dev/null 2>&1", "docker_not_running", None),
+        ]
+        for cmd, reason, cwd in checks:
+            if not self._wsl_probe(cmd, cwd=cwd):
+                return reason
+        return None
+
+    def _capabilities(self, binding):
+        reason = self._capability_unavailable_reason(binding)
+        enabled = reason is None
 
         return {
             "enabled": enabled,
