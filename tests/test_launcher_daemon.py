@@ -182,6 +182,23 @@ class LauncherDaemonTests(unittest.TestCase):
         self.assertEqual(job.snapshot()["status"], "cancel_requested")
         self.assertTrue(job.is_cancel_requested())
 
+    def test_cancelled_queued_job_is_not_restarted_or_overwritten(self):
+        store = JobStore()
+        job, created = store.create_update_job("sha256:test", {"client_request_id": "one"})
+
+        self.assertIsNotNone(job)
+        self.assertTrue(created)
+        assert job is not None
+        job.request_cancel()
+
+        self.assertFalse(job.start())
+        job.fail("unexpected", "should not overwrite cancellation")
+        job.succeed("should not overwrite cancellation")
+
+        snapshot = job.snapshot()
+        self.assertEqual(snapshot["status"], "cancelled")
+        self.assertEqual(snapshot["exit_code"], 130)
+
     def test_job_store_persists_finished_job_and_logs(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = JobStore(storage_dir=tmpdir)

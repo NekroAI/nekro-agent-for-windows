@@ -19,6 +19,11 @@ class WSLShellMixin:
         "ONEBOT_ACCESS_TOKEN",
         "QDRANT_API_KEY",
         "POSTGRES_PASSWORD",
+        "JWT_SECRET_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "NA_TOOLS_DAEMON_TOKEN",
+        "NA_TOOLS_DAEMON_TOKEN_FILE",
         "Authorization",
         "token",
     )

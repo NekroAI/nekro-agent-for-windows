@@ -302,18 +302,6 @@ class WSLUpdateMixin:
             timeout=15,
         ).strip() == "yes":
             return candidate
-        legacy_paths = {
-            posixpath.basename(self._preview_backup_archive_path(inst_id=request.get("_launcher_inst_id"))):
-                self._preview_backup_archive_path(inst_id=request.get("_launcher_inst_id")),
-            posixpath.basename(UPDATE_BACKUP_ARCHIVE_PATH): UPDATE_BACKUP_ARCHIVE_PATH,
-        }
-        legacy = legacy_paths.get(backup_id)
-        if legacy and self._wsl_exec(
-            DISTRO_NAME,
-            f"test -f {shlex.quote(legacy)} && echo yes",
-            timeout=15,
-        ).strip() == "yes":
-            return legacy
         return ""
 
     def _daemon_latest_backup_path(self, request: dict, name: str):
@@ -354,22 +342,6 @@ class WSLUpdateMixin:
                     "_mtime": mtime,
                 }
             )
-
-        for legacy in (
-            self._preview_backup_archive_path(inst_id=request.get("_launcher_inst_id")),
-            UPDATE_BACKUP_ARCHIVE_PATH,
-        ):
-            filename = posixpath.basename(legacy)
-            if any(item["filename"] == filename for item in items):
-                continue
-            if self._wsl_exec(
-                DISTRO_NAME,
-                f"test -f {shlex.quote(legacy)} && echo yes",
-                timeout=15,
-            ).strip() == "yes":
-                summary = self._daemon_backup_summary(legacy)
-                if not name or summary["name"] == name:
-                    items.append({**summary, "_mtime": 0.0})
 
         items.sort(key=lambda item: item.get("_mtime", 0.0), reverse=True)
         result = []
@@ -419,11 +391,162 @@ class WSLUpdateMixin:
                 timeout=600,
             )
         except Exception as e:
-            return False, (
-                f"备份失败\n备份文件: {archive_path}\n"
-                f"备份目录:\n" + "\n".join(existing_targets) + f"\n{e}"
+            safe_error = self._daemon_redact_text(
+                str(e),
+                sensitive_paths=[archive_path, *existing_targets],
             )
-        return True, f"已生成备份归档：{archive_path}"
+            return False, (
+                "备份失败\n"
+                f"{safe_error}"
+            )
+        return True, f"已生成备份归档：{posixpath.basename(archive_path)}"
+
+    def _daemon_redact_text(self, text, *, ctx=None, sensitive_paths=None):
+        result = self._redact_for_log(text)
+        replacements = []
+        for path in sensitive_paths or []:
+            if path:
+                replacements.append((str(path), "<path>"))
+        if ctx:
+            for key in ("deploy_dir", "data_dir"):
+                path = str(ctx.get(key) or "")
+                if path:
+                    replacements.append((path, f"<{key}>"))
+            port = normalize_port(ctx.get("nekro_port"), 8021)
+            replacements.append((f"http://127.0.0.1:{port}/api/health", "<health_url>"))
+
+        for needle, replacement in sorted(set(replacements), key=lambda item: len(item[0]), reverse=True):
+            result = result.replace(needle, replacement)
+        result = re.sub(
+            r"/root/\.na-tools/backups/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.tar\.gz",
+            "<backup_file>",
+            result,
+        )
+        result = re.sub(
+            r"/root/[A-Za-z0-9_.-]*(?:preview|update)_backup\.tar\.gz",
+            "<backup_file>",
+            result,
+        )
+        result = re.sub(
+            r"(NA_TOOLS_DAEMON_TOKEN_FILE\s*[:=]\s*)([^\s,\n\"']+)",
+            r"\1<redacted>",
+            result,
+            flags=re.IGNORECASE,
+        )
+        return result
+
+    def _daemon_redact_details(self, details, *, ctx=None, sensitive_paths=None):
+        if isinstance(details, str):
+            return self._daemon_redact_text(details, ctx=ctx, sensitive_paths=sensitive_paths)
+        if isinstance(details, dict):
+            return {
+                key: self._daemon_redact_details(value, ctx=ctx, sensitive_paths=sensitive_paths)
+                for key, value in details.items()
+            }
+        if isinstance(details, list):
+            return [
+                self._daemon_redact_details(value, ctx=ctx, sensitive_paths=sensitive_paths)
+                for value in details
+            ]
+        return details
+
+    def _daemon_add_log(self, job, line, level="info", stream="system", *, ctx=None, sensitive_paths=None):
+        job.add_log(
+            self._daemon_redact_text(line, ctx=ctx, sensitive_paths=sensitive_paths),
+            level=level,
+            stream=stream,
+        )
+
+    def _daemon_fail(self, job, code, message, details=None, *, ctx=None, sensitive_paths=None):
+        job.fail(
+            code,
+            self._daemon_redact_text(message, ctx=ctx, sensitive_paths=sensitive_paths),
+            self._daemon_redact_details(details or {}, ctx=ctx, sensitive_paths=sensitive_paths),
+        )
+
+    def _daemon_safe_restore_targets(self, ctx):
+        candidates = self._backup_target_candidates_for_paths(
+            ctx["deploy_dir"],
+            ctx["data_dir"],
+            ctx["instance_name"],
+        )
+        targets = []
+        allowed_prefixes = ("/root/", "/home/", "/opt/", "/srv/", "/var/lib/docker/volumes/")
+        for target in candidates:
+            normalized = posixpath.normpath("/" + str(target or "").lstrip("/"))
+            lower = normalized.lower()
+            if (
+                normalized
+                and normalized != "/"
+                and normalized.startswith(allowed_prefixes)
+                and "nekro" in lower
+                and normalized not in targets
+            ):
+                targets.append(normalized)
+        return targets
+
+    def _daemon_restore_targets_in_archive(self, ctx, archive_path):
+        raw = self._wsl_exec(
+            DISTRO_NAME,
+            f"tar -tzf {shlex.quote(archive_path)}",
+            timeout=60,
+        )
+        archive_entries = []
+        for line in raw.splitlines():
+            entry = posixpath.normpath(line.strip().lstrip("./"))
+            if entry and entry != ".":
+                archive_entries.append(entry)
+        if not archive_entries:
+            return []
+
+        targets = []
+        for target in self._daemon_safe_restore_targets(ctx):
+            rel_target = target.lstrip("/")
+            if any(entry == rel_target or entry.startswith(rel_target.rstrip("/") + "/") for entry in archive_entries):
+                targets.append(target)
+        return targets
+
+    def _daemon_cleanup_restore_targets_with_alpine(self, ctx, job, targets):
+        cleanup_script = "find /target -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +"
+        for target in targets:
+            volume_arg = f"{target}:/target:rw"
+            self._run_wsl_checked(
+                DISTRO_NAME,
+                f"docker run --rm -v {shlex.quote(volume_arg)} alpine sh -c {shlex.quote(cleanup_script)}",
+                action="[daemon 还原] 使用临时 Alpine 容器清理恢复目标失败",
+                timeout=300,
+            )
+            self._daemon_add_log(job, "已清理一个恢复目标目录", ctx=ctx, sensitive_paths=[target])
+
+    def _daemon_restore_archive(self, ctx, job, archive_path, *, action):
+        cmd = f"tar -xzf {shlex.quote(archive_path)} -C /"
+        try:
+            self._daemon_exec(ctx, job, cmd, timeout=600, action=action)
+            return
+        except Exception as first_error:
+            targets = self._daemon_restore_targets_in_archive(ctx, archive_path)
+            if not targets:
+                raise RuntimeError(
+                    self._daemon_redact_text(str(first_error), ctx=ctx, sensitive_paths=[archive_path])
+                ) from first_error
+
+            self._daemon_add_log(
+                job,
+                "直接恢复失败，尝试通过临时 Alpine 容器清理目标目录后重试",
+                level="warning",
+                ctx=ctx,
+                sensitive_paths=[archive_path],
+            )
+            try:
+                self._daemon_cleanup_restore_targets_with_alpine(ctx, job, targets)
+                self._daemon_exec(ctx, job, cmd, timeout=600, action=action)
+            except Exception as second_error:
+                sensitive_paths = [archive_path, *targets]
+                first = self._daemon_redact_text(str(first_error), ctx=ctx, sensitive_paths=sensitive_paths)
+                second = self._daemon_redact_text(str(second_error), ctx=ctx, sensitive_paths=sensitive_paths)
+                raise RuntimeError(
+                    f"{first}\n已尝试 restore ownership fallback 但仍失败:\n{second}"
+                ) from second_error
 
     def _daemon_validate_instance(self, ctx, job):
         checks = [
@@ -453,7 +576,7 @@ class WSLUpdateMixin:
                     timeout=30,
                 )
             except Exception as e:
-                job.fail(code, str(e))
+                self._daemon_fail(job, code, str(e), ctx=ctx)
                 return False
         try:
             self._run_wsl_checked(
@@ -463,7 +586,7 @@ class WSLUpdateMixin:
                 timeout=60,
             )
         except Exception as e:
-            job.fail("docker_unavailable", str(e))
+            self._daemon_fail(job, "docker_unavailable", str(e), ctx=ctx)
             return False
         return True
 
@@ -479,7 +602,7 @@ class WSLUpdateMixin:
             self._safe_decode(proc.stdout) + self._safe_decode(proc.stderr)
         ).strip()
         if out:
-            job.add_log(out, stream="stdout")
+            self._daemon_add_log(job, out, stream="stdout", ctx=ctx)
         return proc.returncode, out
 
     def _rewrite_daemon_compose_channel(self, ctx, channel):
@@ -549,7 +672,8 @@ class WSLUpdateMixin:
         """执行 daemon facade 的手动备份任务。"""
         ctx = self._daemon_context(request)
         self._stop_event.clear()
-        job.start("validate_instance", "正在校验实例与 Docker 环境")
+        if not job.start("validate_instance", "正在校验实例与 Docker 环境"):
+            return
         if not self._daemon_validate_instance(ctx, job):
             return
         if self._daemon_cancelled(job):
@@ -565,10 +689,10 @@ class WSLUpdateMixin:
             ctx["instance_name"],
         )
         if not ok:
-            job.fail("backup_failed", backup_message)
+            self._daemon_fail(job, "backup_failed", backup_message, ctx=ctx, sensitive_paths=[archive_path])
             return
         summary = self._daemon_backup_summary(archive_path, name=name)
-        job.add_log(backup_message)
+        self._daemon_add_log(job, backup_message, ctx=ctx, sensitive_paths=[archive_path])
         job.succeed("备份完成", {"backup": summary})
 
     def run_daemon_restore_job(self, request: dict, job):
@@ -576,15 +700,16 @@ class WSLUpdateMixin:
         ctx = self._daemon_context(request)
         backup_id = str(request.get("backup_id") or "")
         self._stop_event.clear()
+        if not job.start("validate_instance", "正在校验实例与 Docker 环境"):
+            return
         self.status_changed.emit("更新中...")
-        job.start("validate_instance", "正在校验实例与 Docker 环境")
         if not self._daemon_validate_instance(ctx, job):
             self.status_changed.emit("更新失败")
             return
         archive_path = self._daemon_resolve_backup_path(request, backup_id)
         if not archive_path:
             self.status_changed.emit("更新失败")
-            job.fail("backup_not_found", f"未找到备份: {backup_id}")
+            self._daemon_fail(job, "backup_not_found", f"未找到备份: {backup_id}", ctx=ctx)
             return
         if self._daemon_cancelled(job):
             return
@@ -598,12 +723,11 @@ class WSLUpdateMixin:
                 timeout=120,
                 action="[daemon 还原] 停止服务失败",
             )
-            self._daemon_exec(
+            self._daemon_restore_archive(
                 ctx,
                 job,
-                f"tar -xzf {shlex.quote(archive_path)} -C /",
-                timeout=600,
                 action="[daemon 还原] 恢复备份数据失败",
+                archive_path=archive_path,
             )
             job.set_progress("restart_services", 2, 4, "正在重建并启动服务")
             self._daemon_exec(
@@ -615,7 +739,7 @@ class WSLUpdateMixin:
             )
         except Exception as e:
             self.status_changed.emit("更新失败")
-            job.fail("launcher_update_failed", str(e))
+            self._daemon_fail(job, "launcher_update_failed", str(e), ctx=ctx, sensitive_paths=[archive_path])
             return
         job.set_progress("verify", 3, 4, "等待服务健康检查通过")
         health = self._wait_daemon_update_health(job, ctx["nekro_port"])
@@ -623,7 +747,7 @@ class WSLUpdateMixin:
             return
         if not health:
             self.status_changed.emit("更新失败")
-            job.fail("verify_timeout", "服务健康检查超时")
+            self._daemon_fail(job, "verify_timeout", "服务健康检查超时", ctx=ctx)
             return
         self.is_running = True
         self._daemon_attach_logs(ctx)
@@ -638,7 +762,7 @@ class WSLUpdateMixin:
         ctx = self._daemon_context(request)
         channel = request.get("channel") or "stable"
         if channel not in {"stable", "preview", "rollback"}:
-            job.fail("invalid_channel", "channel 必须是 stable、preview 或 rollback")
+            self._daemon_fail(job, "invalid_channel", "channel 必须是 stable、preview 或 rollback")
             return
 
         update_sandbox = bool(request.get("update_sandbox", True))
@@ -651,6 +775,8 @@ class WSLUpdateMixin:
         steps = []
 
         if channel == "stable":
+            if ctx["channel"] == "preview":
+                steps.append({"type": "switch_channel", "channel": "stable", "label": "写回稳定版镜像配置"})
             if backup_requested:
                 steps.append({"type": "backup", "name": "stable-update", "label": "创建 stable 更新前备份"})
             steps.extend(
@@ -673,16 +799,15 @@ class WSLUpdateMixin:
             steps.append({"type": "switch_channel", "channel": "stable", "label": "写回稳定版镜像配置"})
             if restore_pre_preview:
                 steps.append({"type": "restore_pre_preview", "label": "恢复预览版切换前备份"})
-            steps.extend(
-                [
-                    {"type": "pull", "image": agent_image, "label": "拉取稳定版 Nekro Agent 镜像"},
-                    {
-                        "type": "compose_up",
-                        "services": [] if restore_pre_preview else ["nekro_agent"],
-                        "all_services": restore_pre_preview,
-                        "label": "重建并启动服务" if restore_pre_preview else "重建 Nekro Agent 容器",
-                    },
-                ]
+            else:
+                steps.append({"type": "pull", "image": agent_image, "label": "拉取稳定版 Nekro Agent 镜像"})
+            steps.append(
+                {
+                    "type": "compose_up",
+                    "services": [] if restore_pre_preview else ["nekro_agent"],
+                    "all_services": restore_pre_preview,
+                    "label": "重建并启动服务" if restore_pre_preview else "重建 Nekro Agent 容器",
+                }
             )
 
         if update_sandbox and channel != "rollback":
@@ -706,8 +831,9 @@ class WSLUpdateMixin:
         steps.append({"type": "verify", "label": "等待服务健康检查通过"})
 
         self._stop_event.clear()
+        if not job.start("validate_instance", "正在校验实例与 Docker 环境"):
+            return
         self.status_changed.emit("更新中...")
-        job.start("validate_instance", "正在校验实例与 Docker 环境")
 
         if not self._daemon_validate_instance(ctx, job):
             self.status_changed.emit("更新失败")
@@ -744,13 +870,13 @@ class WSLUpdateMixin:
                     )
                     if not ok:
                         self.status_changed.emit("更新失败")
-                        job.fail("backup_failed", backup_message)
+                        self._daemon_fail(job, "backup_failed", backup_message, ctx=ctx)
                         return
                     backup_summary = self._daemon_backup_summary(
                         archive_path,
                         name=str(step.get("name") or "manual"),
                     )
-                    job.add_log(backup_message)
+                    self._daemon_add_log(job, backup_message, ctx=ctx, sensitive_paths=[archive_path])
                     continue
 
                 if step_type == "switch_channel":
@@ -761,7 +887,7 @@ class WSLUpdateMixin:
                     archive_path = self._daemon_latest_backup_path(request, "pre-preview")
                     if not archive_path:
                         self.status_changed.emit("更新失败")
-                        job.fail("backup_not_found", "未找到 pre-preview 备份")
+                        self._daemon_fail(job, "backup_not_found", "未找到 pre-preview 备份", ctx=ctx)
                         return
                     self._daemon_exec(
                         ctx,
@@ -771,12 +897,11 @@ class WSLUpdateMixin:
                         timeout=120,
                         action="[daemon 更新] 停止服务失败",
                     )
-                    self._daemon_exec(
+                    self._daemon_restore_archive(
                         ctx,
                         job,
-                        f"tar -xzf {shlex.quote(archive_path)} -C /",
-                        timeout=600,
                         action="[daemon 更新] 恢复 pre-preview 备份失败",
+                        archive_path=archive_path,
                     )
                     self._rewrite_daemon_compose_channel(ctx, "stable")
                     backup_summary = self._daemon_backup_summary(archive_path, name="pre-preview")
@@ -787,7 +912,7 @@ class WSLUpdateMixin:
                     if not self._pull_images(DISTRO_NAME, [image]):
                         code = "sandbox_pull_failed" if phase == "pull_sandbox" else "pull_failed"
                         self.status_changed.emit("更新失败")
-                        job.fail(code, f"镜像拉取失败: {image}", {"image": image})
+                        self._daemon_fail(job, code, f"镜像拉取失败: {image}", {"image": image}, ctx=ctx)
                         return
                     continue
 
@@ -816,13 +941,14 @@ class WSLUpdateMixin:
                         return
                     if not health:
                         self.status_changed.emit("更新失败")
-                        job.fail("verify_timeout", "服务健康检查超时")
+                        self._daemon_fail(job, "verify_timeout", "服务健康检查超时", ctx=ctx)
                         return
                     continue
             except Exception as e:
                 self.status_changed.emit("更新失败")
                 code = "restart_failed" if step_type == "compose_up" else "launcher_update_failed"
-                job.fail(code, str(e))
+                sensitive_paths = [archive_path] if "archive_path" in locals() else None
+                self._daemon_fail(job, code, str(e), ctx=ctx, sensitive_paths=sensitive_paths)
                 return
 
         self._emit_pull_progress("done", "更新完成")
@@ -863,7 +989,7 @@ class WSLUpdateMixin:
                         except json.JSONDecodeError:
                             payload = {}
                         if payload.get("ok") is True:
-                            job.add_log(f"健康检查通过: {url}")
+                            self._daemon_add_log(job, "健康检查通过", ctx={"nekro_port": port})
                             return True
             except (OSError, urllib.error.URLError):
                 pass

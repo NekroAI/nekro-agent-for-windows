@@ -176,12 +176,15 @@ class DaemonJob:
 
     def start(self, phase="validate_instance", message="开始执行任务"):
         with self._condition:
+            if self.status in FINAL_JOB_STATUSES:
+                return False
             self.status = "running"
             self.phase = phase
             self.message = message
             self.started_at = self.started_at or _utc_now()
             self._condition.notify_all()
         self.add_log(message)
+        return True
 
     def set_progress(self, phase, current, total, label):
         with self._condition:
@@ -229,6 +232,8 @@ class DaemonJob:
 
     def succeed(self, message, result=None):
         with self._condition:
+            if self.status in FINAL_JOB_STATUSES:
+                return
             self.status = "succeeded"
             self.phase = "finished"
             self.message = message
@@ -241,6 +246,8 @@ class DaemonJob:
 
     def fail(self, code, message, details=None):
         with self._condition:
+            if self.status in FINAL_JOB_STATUSES:
+                return
             self.status = "failed"
             self.message = message
             self.finished_at = _utc_now()
@@ -267,6 +274,7 @@ class JobStore:
         self._jobs = {}
         self._client_requests = {}
         self._lock = threading.RLock()
+        self._persist_lock = threading.Lock()
         self.storage_dir = storage_dir
         self.retention_seconds = max(1, retention_days) * 24 * 60 * 60
         if self.storage_dir:
@@ -330,18 +338,20 @@ class JobStore:
     def _persist_job(self, job):
         if not self.storage_dir:
             return
-        state_path = self._job_state_path(job.job_id)
-        log_path = self._job_log_path(job.job_id)
-        state_tmp = f"{state_path}.{os.getpid()}.tmp"
-        log_tmp = f"{log_path}.{os.getpid()}.tmp"
-        with open(state_tmp, "w", encoding="utf-8") as f:
-            json.dump(job.state_record(), f, ensure_ascii=False, indent=2)
-            f.write("\n")
-        os.replace(state_tmp, state_path)
-        with open(log_tmp, "w", encoding="utf-8") as f:
-            for entry in job.log_records():
-                f.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
-        os.replace(log_tmp, log_path)
+        with self._persist_lock:
+            state_path = self._job_state_path(job.job_id)
+            log_path = self._job_log_path(job.job_id)
+            tmp_suffix = f"{os.getpid()}.{threading.get_ident()}.tmp"
+            state_tmp = f"{state_path}.{tmp_suffix}"
+            log_tmp = f"{log_path}.{tmp_suffix}"
+            with open(state_tmp, "w", encoding="utf-8") as f:
+                json.dump(job.state_record(), f, ensure_ascii=False, indent=2)
+                f.write("\n")
+            os.replace(state_tmp, state_path)
+            with open(log_tmp, "w", encoding="utf-8") as f:
+                for entry in job.log_records():
+                    f.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
+            os.replace(log_tmp, log_path)
 
     def _load_jobs(self):
         if not self.storage_dir:
