@@ -67,7 +67,7 @@ class DaemonBinding:
 
 
 class DaemonJob:
-    def __init__(self, job_id, job_type, instance_id, request):
+    def __init__(self, job_id, job_type, instance_id, request, on_change=None):
         self.job_id = job_id
         self.type = job_type
         self.instance_id = instance_id
@@ -85,6 +85,40 @@ class DaemonJob:
         self.logs = []
         self._next_seq = 1
         self._condition = threading.Condition()
+        self._on_change = on_change
+
+    def _notify_change(self):
+        if self._on_change is None:
+            return
+        try:
+            self._on_change(self)
+        except OSError:
+            return
+
+    @classmethod
+    def from_record(cls, record, logs=None, on_change=None):
+        job = cls(
+            str(record.get("job_id") or ""),
+            str(record.get("type") or "update"),
+            str(record.get("instance_id") or ""),
+            record.get("request") if isinstance(record.get("request"), dict) else {},
+            on_change=on_change,
+        )
+        job.status = str(record.get("status") or "failed")
+        job.phase = str(record.get("phase") or "finished")
+        job.message = str(record.get("message") or "")
+        progress = record.get("progress")
+        if isinstance(progress, dict):
+            job.progress = progress
+        job.created_at = record.get("created_at")
+        job.started_at = record.get("started_at")
+        job.finished_at = record.get("finished_at")
+        job.exit_code = record.get("exit_code")
+        job.error = record.get("error")
+        job.result = record.get("result")
+        job.logs = logs or []
+        job._next_seq = max((int(item.get("seq", 0)) for item in job.logs), default=0) + 1
+        return job
 
     def snapshot(self):
         with self._condition:
@@ -126,7 +160,19 @@ class DaemonJob:
             if len(self.logs) > 1000:
                 self.logs = self.logs[-1000:]
             self._condition.notify_all()
-            return entry
+        self._notify_change()
+        return entry
+
+    def state_record(self):
+        with self._condition:
+            return {
+                **self.snapshot(),
+                "request": self.request,
+            }
+
+    def log_records(self):
+        with self._condition:
+            return list(self.logs)
 
     def start(self, phase="validate_instance", message="开始执行任务"):
         with self._condition:
@@ -217,25 +263,35 @@ class DaemonJob:
 
 
 class JobStore:
-    def __init__(self):
+    def __init__(self, storage_dir=None, retention_days=7):
         self._jobs = {}
         self._client_requests = {}
         self._lock = threading.RLock()
+        self.storage_dir = storage_dir
+        self.retention_seconds = max(1, retention_days) * 24 * 60 * 60
+        if self.storage_dir:
+            os.makedirs(self.storage_dir, exist_ok=True)
+            self._load_jobs()
+            self._prune_old_jobs()
 
     def create_job(self, job_type, instance_id, request, id_prefix):
         client_request_id = str(request.get("client_request_id") or "").strip()
         request_key = f"{job_type}:{instance_id}:{client_request_id}"
         with self._lock:
             if client_request_id and request_key in self._client_requests:
-                return self._jobs[self._client_requests[request_key]], False
+                existing_id = self._client_requests[request_key]
+                if existing_id in self._jobs:
+                    return self._jobs[existing_id], False
+                self._client_requests.pop(request_key, None)
             for job in self._jobs.values():
                 if job.instance_id == instance_id and job.status in ACTIVE_JOB_STATUSES:
                     return None, False
             job_id = f"{id_prefix}_" + secrets.token_hex(12)
-            job = DaemonJob(job_id, job_type, instance_id, request)
+            job = DaemonJob(job_id, job_type, instance_id, request, on_change=self._persist_job)
             self._jobs[job_id] = job
             if client_request_id:
                 self._client_requests[request_key] = job_id
+            self._persist_job(job)
             return job, True
 
     def create_update_job(self, instance_id, request):
@@ -258,6 +314,112 @@ class JobStore:
         with self._lock:
             return self._jobs.get(job_id)
 
+    def _safe_job_name(self, job_id):
+        return re.sub(r"[^A-Za-z0-9_.-]", "_", job_id)
+
+    def _job_state_path(self, job_id):
+        if not self.storage_dir:
+            return ""
+        return os.path.join(self.storage_dir, f"{self._safe_job_name(job_id)}.json")
+
+    def _job_log_path(self, job_id):
+        if not self.storage_dir:
+            return ""
+        return os.path.join(self.storage_dir, f"{self._safe_job_name(job_id)}.log")
+
+    def _persist_job(self, job):
+        if not self.storage_dir:
+            return
+        state_path = self._job_state_path(job.job_id)
+        log_path = self._job_log_path(job.job_id)
+        state_tmp = f"{state_path}.{os.getpid()}.tmp"
+        log_tmp = f"{log_path}.{os.getpid()}.tmp"
+        with open(state_tmp, "w", encoding="utf-8") as f:
+            json.dump(job.state_record(), f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(state_tmp, state_path)
+        with open(log_tmp, "w", encoding="utf-8") as f:
+            for entry in job.log_records():
+                f.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
+        os.replace(log_tmp, log_path)
+
+    def _load_jobs(self):
+        if not self.storage_dir:
+            return
+        for name in os.listdir(self.storage_dir):
+            if not name.endswith(".json"):
+                continue
+            state_path = os.path.join(self.storage_dir, name)
+            try:
+                with open(state_path, "r", encoding="utf-8") as f:
+                    record = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            job_id = str(record.get("job_id") or name[:-5])
+            logs = self._load_job_logs(job_id)
+            job = DaemonJob.from_record(record, logs=logs, on_change=self._persist_job)
+            if not job.job_id:
+                continue
+            if job.status in ACTIVE_JOB_STATUSES:
+                job.fail(
+                    "daemon_unavailable",
+                    "任务未完成时 Windows 启动器 daemon 已重启，任务状态已失效",
+                )
+            self._jobs[job.job_id] = job
+            client_request_id = str(job.request.get("client_request_id") or "").strip()
+            if client_request_id:
+                key = f"{job.type}:{job.instance_id}:{client_request_id}"
+                self._client_requests[key] = job.job_id
+
+    def _load_job_logs(self, job_id):
+        log_path = self._job_log_path(job_id)
+        logs = []
+        if not log_path or not os.path.exists(log_path):
+            return logs
+        try:
+            with open(log_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(item, dict):
+                        logs.append(item)
+        except OSError:
+            return logs
+        return logs[-1000:]
+
+    def _prune_old_jobs(self):
+        now = time.time()
+        stale = []
+        with self._lock:
+            for job_id, job in self._jobs.items():
+                snapshot = job.snapshot()
+                if snapshot["status"] not in FINAL_JOB_STATUSES:
+                    continue
+                stamp = snapshot.get("finished_at") or snapshot.get("created_at")
+                if not stamp:
+                    continue
+                try:
+                    finished_ts = datetime.fromisoformat(stamp).timestamp()
+                except ValueError:
+                    continue
+                if now - finished_ts > self.retention_seconds:
+                    stale.append(job_id)
+            for job_id in stale:
+                self._jobs.pop(job_id, None)
+                self._client_requests = {
+                    key: value
+                    for key, value in self._client_requests.items()
+                    if value != job_id
+                }
+                for path in (self._job_state_path(job_id), self._job_log_path(job_id)):
+                    try:
+                        if path and os.path.exists(path):
+                            os.remove(path)
+                    except OSError:
+                        pass
+
 
 class LauncherDaemonFacade:
     def __init__(
@@ -274,7 +436,12 @@ class LauncherDaemonFacade:
         self.http_port = http_port
         self.socks_host = socks_host
         self.socks_port = socks_port
-        self.jobs = JobStore()
+        job_storage_dir = None
+        if getattr(self.backend, "config", None) is not None:
+            app_data_dir = getattr(self.backend.config, "app_data_dir", "")
+            if app_data_dir:
+                job_storage_dir = os.path.join(app_data_dir, "daemon_jobs")
+        self.jobs = JobStore(storage_dir=job_storage_dir)
         self._bindings_by_instance = {}
         self._bindings_by_launcher_id = {}
         self._used_nonces = {}

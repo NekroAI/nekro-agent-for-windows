@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import tempfile
 import time
 import unittest
 
@@ -180,6 +181,27 @@ class LauncherDaemonTests(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual(job.snapshot()["status"], "cancel_requested")
         self.assertTrue(job.is_cancel_requested())
+
+    def test_job_store_persists_finished_job_and_logs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = JobStore(storage_dir=tmpdir)
+            job, created = store.create_update_job("sha256:test", {"client_request_id": "one"})
+
+            self.assertIsNotNone(job)
+            self.assertTrue(created)
+            job.start()
+            job.add_log("pull complete")
+            job.succeed("done", {"app_health": "ok"})
+
+            reloaded = JobStore(storage_dir=tmpdir)
+            loaded = reloaded.get(job.job_id)
+
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+            self.assertEqual(loaded.snapshot()["status"], "succeeded")
+            self.assertEqual(loaded.snapshot()["result"], {"app_health": "ok"})
+            log_lines = [item["line"] for item in loaded.log_snapshot(limit=10)["logs"]]
+            self.assertIn("pull complete", log_lines)
 
 
 if __name__ == "__main__":
