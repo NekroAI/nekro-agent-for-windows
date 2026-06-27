@@ -1052,7 +1052,9 @@ class LauncherDaemonFacade:
                     after_seq = int((params.get("after_seq") or ["0"])[0])
                 except ValueError:
                     after_seq = 0
-                self._write_sse("job", job.snapshot())
+                initial_snapshot = job.snapshot()
+                self._write_sse("job", initial_snapshot)
+                self._write_sse("progress", initial_snapshot["progress"])
                 try:
                     while True:
                         snapshot = job.log_snapshot(limit=1000, after_seq=after_seq)
@@ -1061,6 +1063,7 @@ class LauncherDaemonFacade:
                             self._write_sse("log", entry)
                         job_snapshot = job.snapshot()
                         self._write_sse("job", job_snapshot)
+                        self._write_sse("progress", job_snapshot["progress"])
                         if job_snapshot["status"] in FINAL_JOB_STATUSES:
                             self._write_sse("result", job_snapshot)
                             break
