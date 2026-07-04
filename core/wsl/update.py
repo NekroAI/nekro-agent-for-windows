@@ -61,9 +61,12 @@ class WSLUpdateMixin:
             deploy_dir,
         ]
 
-        for target in NA_BACKUP_TARGETS:
-            if target not in targets:
-                targets.append(target)
+        # NA_BACKUP_TARGETS 是默认实例的历史路径；命名实例的归档若包含
+        # 这些路径，恢复时会把默认实例的数据一并覆盖，必须排除。
+        if not instance_name:
+            for target in NA_BACKUP_TARGETS:
+                if target not in targets:
+                    targets.append(target)
         return targets
 
     def get_backup_size_hint(self):
@@ -380,9 +383,12 @@ class WSLUpdateMixin:
             data_dir,
             deploy_dir,
         ]
-        for target in NA_BACKUP_TARGETS:
-            if target not in targets:
-                targets.append(target)
+        # 同 _backup_target_candidates：默认实例的历史路径不得混入命名实例的
+        # 备份归档，否则恢复（tar -xzf -C /）会覆盖默认实例的在线数据。
+        if not instance_name:
+            for target in NA_BACKUP_TARGETS:
+                if target not in targets:
+                    targets.append(target)
         return targets
 
     def _existing_backup_targets_for_paths(self, distro, deploy_dir, data_dir, instance_name):

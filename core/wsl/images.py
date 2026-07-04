@@ -164,6 +164,15 @@ class WSLImageMixin:
         return candidates
 
     @staticmethod
+    def _local_digest_cmd(normalized_ref):
+        """构造读取本地镜像 RepoDigest 的命令；Go 模板花括号必须原样下发。"""
+        return (
+            "docker image inspect "
+            f"{shlex.quote(normalized_ref)} "
+            "--format '{{index .RepoDigests 0}}' 2>/dev/null"
+        )
+
+    @staticmethod
     def _registry_manifest_target(image_ref):
         if "@" in image_ref:
             name, digest = image_ref.split("@", 1)
@@ -744,11 +753,7 @@ class WSLImageMixin:
 
                     local_out = self._wsl_exec(
                         distro,
-                        (
-                            "docker image inspect "
-                            f"{shlex.quote(normalized_ref)} "
-                            "--format '{{{{index .RepoDigests 0}}}}' 2>/dev/null"
-                        ),
+                        self._local_digest_cmd(normalized_ref),
                         timeout=15,
                     ).strip().strip("'")
                     if local_out and "@" in local_out:

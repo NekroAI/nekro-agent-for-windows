@@ -107,6 +107,12 @@ class WSLImageMixinTests(unittest.TestCase):
         self.assertIsNone(WSLImageMixin._parse_auth_challenge(""))
         self.assertIsNone(WSLImageMixin._parse_auth_challenge(None))
 
+    def test_local_digest_cmd_uses_valid_go_template(self):
+        cmd = WSLImageMixin._local_digest_cmd("postgres:14")
+
+        self.assertIn("'{{index .RepoDigests 0}}'", cmd)
+        self.assertNotIn("{{{{", cmd)
+
     def test_rank_pull_candidates_prefers_fastest_probe(self):
         candidates = _DummyImages()._rank_pull_candidates("NekroAgent", "postgres:14")
 

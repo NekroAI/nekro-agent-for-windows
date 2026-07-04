@@ -132,6 +132,32 @@ class WSLDaemonUpdateTests(unittest.TestCase):
         self.assertTrue(backend.restore_calls)
         self.assertEqual(job.snapshot()["status"], "succeeded")
 
+    def test_named_instance_backup_targets_exclude_default_instance_paths(self):
+        backend = _DummyDaemonUpdate()
+
+        targets = backend._backup_target_candidates_for_paths(
+            "/root/foo_nekro_agent", "/root/foo_nekro_agent_data", "foo_"
+        )
+
+        self.assertIn("/var/lib/docker/volumes/foo_nekro_postgres_data", targets)
+        self.assertIn("/root/foo_nekro_agent_data", targets)
+        self.assertNotIn("/root/nekro_agent", targets)
+        self.assertNotIn("/root/nekro_agent_data", targets)
+        self.assertNotIn("/var/lib/docker/volumes/nekro_postgres_data", targets)
+        self.assertNotIn("/var/lib/docker/volumes/nekro_qdrant_data", targets)
+
+    def test_default_instance_backup_targets_keep_legacy_paths(self):
+        backend = _DummyDaemonUpdate()
+
+        targets = backend._backup_target_candidates_for_paths(
+            "/root/nekro_agent", "/root/nekro_agent_data", ""
+        )
+
+        self.assertIn("/var/lib/docker/volumes/nekro_postgres_data", targets)
+        self.assertIn("/var/lib/docker/volumes/nekro_qdrant_data", targets)
+        self.assertIn("/root/nekro_agent", targets)
+        self.assertIn("/root/nekro_agent_data", targets)
+
     def test_daemon_restore_backup_id_is_limited_to_current_instance_dir(self):
         backend = _BackupScopeDummy()
         request = {"instance_id": "sha256:test"}

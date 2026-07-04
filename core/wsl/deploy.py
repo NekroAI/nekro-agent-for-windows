@@ -351,6 +351,8 @@ class WSLDeployMixin:
         self.progress_updated.emit("__deploy_progress__|health|等待服务就绪")
         _log("Compose 服务已启动，等待就绪...")
         deploy_info = self._parse_deploy_info(env_content, deploy_mode)
+        # update_instance 会原地覆盖 inst["deploy_info"]，旧凭据必须先取出
+        previous_info = inst.get("deploy_info") or {}
         self.config.update_instance(inst_id, deploy_info=deploy_info)
 
         if attach_logs and is_first_deploy:
@@ -359,9 +361,8 @@ class WSLDeployMixin:
             else:
                 self._show_deploy_info(deploy_info, inst_id=inst_id)
         else:
-            old_info = inst.get("deploy_info") or {}
-            if old_info.get("napcat_token"):
-                deploy_info["napcat_token"] = old_info["napcat_token"]
+            if previous_info.get("napcat_token"):
+                deploy_info["napcat_token"] = previous_info["napcat_token"]
             self.config.update_instance(inst_id, deploy_info=deploy_info)
             if attach_logs:
                 self.config.set("deploy_info", deploy_info)

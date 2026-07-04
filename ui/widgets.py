@@ -328,6 +328,12 @@ class WizardDialogBase(QDialog):
     def _disconnect_dialog_signals(self):
         pass
 
+    def done(self, result):
+        # accept/reject/关闭最终都会经过 done；统一断开 backend 信号，
+        # 避免已关闭的向导继续响应部署确认、进度等事件（重复弹窗/抢答）。
+        self._disconnect_dialog_signals()
+        super().done(result)
+
     def reject(self):
         if any(thread.isRunning() for thread in self._active_threads):
             show_notice_dialog(
