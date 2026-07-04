@@ -19,6 +19,7 @@ import socket
 import struct
 import subprocess
 import threading
+from collections import deque
 
 from core.wsl.constants import DISTRO_NAME
 
@@ -233,6 +234,7 @@ class DaemonSocksBridge:
         self._streams_lock = threading.Lock()
         self._watchdog_thread = None
         self._last_wait_reason = ""
+        self._stderr_tail = deque(maxlen=60)
 
     def start(self):
         if self._watchdog_thread is not None:
@@ -333,8 +335,23 @@ class DaemonSocksBridge:
                 self._terminate_proc(proc)
                 return None
             self._proc = proc
+        self._stderr_tail.clear()
+        threading.Thread(
+            target=self._drain_stderr_loop,
+            args=(proc,),
+            name="LauncherDaemonBridgeStderr",
+            daemon=True,
+        ).start()
         assert proc.stdout is not None
-        if not wait_for_magic(proc.stdout):
+        # wsl.exe 卡死时握手读会无限阻塞，用定时器兜底杀掉以便 watchdog 重试
+        handshake_timer = threading.Timer(30, lambda: self._terminate_proc(proc))
+        handshake_timer.daemon = True
+        handshake_timer.start()
+        try:
+            handshake_ok = wait_for_magic(proc.stdout)
+        finally:
+            handshake_timer.cancel()
+        if not handshake_ok:
             self._log("桥接进程握手失败，未收到协议头", "warn")
             self._terminate_proc(proc)
             with self._proc_lock:
@@ -450,27 +467,35 @@ class DaemonSocksBridge:
         except (OSError, ValueError):
             return
 
+    def _drain_stderr_loop(self, proc):
+        """持续排空 stderr，防止 64KB 管道缓冲写满阻塞桥接进程；留存尾部供诊断。"""
+        stderr = proc.stderr
+        if stderr is None:
+            return
+        while True:
+            try:
+                line = stderr.readline()
+            except (OSError, ValueError):
+                return
+            if not line:
+                return
+            text = line.decode("utf-8", "replace").strip()
+            if text:
+                self._stderr_tail.append(text)
+
     def _collect_exit(self, proc, limit=800):
-        """等待桥接进程退出并收集 stderr 尾部用于诊断日志。"""
+        """等待桥接进程退出并整理 stderr 尾部用于诊断日志。"""
         try:
             proc.wait(timeout=3)
         except (subprocess.TimeoutExpired, OSError):
             self._terminate_proc(proc)
             return ""
-        tail = ""
-        stderr = proc.stderr
-        if stderr is not None:
-            try:
-                raw = stderr.read() or b""
-            except (OSError, ValueError):
-                raw = b""
-            cleaner = getattr(self.backend, "_clean_stderr", None)
-            if cleaner is not None:
-                tail = cleaner(raw, max_len=limit)
-            else:
-                tail = raw.decode("utf-8", "replace")[:limit]
+        raw = "\n".join(self._stderr_tail)
         self._terminate_proc(proc)
-        return tail
+        cleaner = getattr(self.backend, "_clean_stderr", None)
+        if cleaner is not None:
+            return cleaner(raw, max_len=limit)
+        return raw[:limit]
 
     def _terminate_proc(self, proc):
         for closer in (proc.stdin, proc.stdout, proc.stderr):

@@ -587,12 +587,21 @@ class LauncherDaemonFacade:
         }
 
     def _read_wsl_file(self, path):
+        """读取 WSL 内文件；文件不存在返回空串，传输失败抛异常。
+
+        区分"文件缺失"与"WSL 调用失败"至关重要：若把瞬时故障当成缺失，
+        ensure_instance_binding 会重新生成 salt/token，导致 instance_id
+        漂移、容器内已烘焙的实例标识全部失效。
+        """
         quoted = shlex.quote(path)
-        return self.backend._wsl_exec(
+        out = self.backend._wsl_exec_checked(
             DISTRO_NAME,
-            f"test -f {quoted} && cat {quoted}",
+            f"if test -f {quoted}; then cat {quoted}; else printf __NA_ABSENT__; fi",
             timeout=15,
         )
+        if out.strip().strip("\x00") == "__NA_ABSENT__":
+            return ""
+        return out
 
     def _write_wsl_file(self, path, content):
         self.backend._write_to_wsl(DISTRO_NAME, content, path)
@@ -689,6 +698,8 @@ class LauncherDaemonFacade:
             }
             if nonce_key in self._used_nonces:
                 return None, _error("request_replayed", "重复的 daemon 请求 nonce")
+            # 原子占位，防止并发重放在校验窗口内双双通过；签名失败时回收
+            self._used_nonces[nonce_key] = now_ms
 
         body_hash = _sha256_hex(body)
         signing_text = "\n".join(
@@ -700,9 +711,9 @@ class LauncherDaemonFacade:
             hashlib.sha256,
         ).hexdigest()
         if not hmac.compare_digest(expected, signature):
+            with self._lock:
+                self._used_nonces.pop(nonce_key, None)
             return None, _error("auth_failed", "daemon 签名校验失败")
-        with self._lock:
-            self._used_nonces[nonce_key] = now_ms
         return binding, None
 
     _CAPABILITY_REASONS = (
