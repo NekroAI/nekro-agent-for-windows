@@ -302,9 +302,10 @@ class FirstRunDialog(WizardDialogBase):
             dialog.setIcon(QMessageBox.Icon.Information)
             dialog.setWindowTitle(f"安装 {self.backend.display_name}")
             dialog.setText(
-                f"将以管理员权限安装 {self.backend.display_name}。\n\n"
-                "注意：安装过程需要 5-10 分钟，请耐心等待。\n"
-                "安装完成后将自动重启电脑。"
+                f"将以管理员权限安装 {self.backend.display_name}，请在弹出的授权窗口中确认。\n\n"
+                "注意：安装过程可能需要 5-10 分钟，请耐心等待。\n"
+                "首次安装通常需要重启电脑生效；重启后若仍提示未安装，\n"
+                "请再次点击安装以完成剩余步骤。"
             )
             dialog.setStandardButtons(QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
             dialog.setStyleSheet(STYLESHEET)
@@ -312,6 +313,12 @@ class FirstRunDialog(WizardDialogBase):
                 label.setWordWrap(True)
             reply = dialog.exec()
             if reply == QMessageBox.StandardButton.Ok:
+                self.check_desc.setText(
+                    f"正在安装 {self.backend.display_name}（请在授权窗口中确认，安装可能需要几分钟）..."
+                )
+                self.btn_action.setEnabled(False)
+                self.check_progress.setVisible(True)
+                self._action_mode = "recheck"
                 self.backend.install_wsl()
             return
 
@@ -1283,6 +1290,31 @@ class FirstRunDialog(WizardDialogBase):
             self.btn_action.setText("安装 Docker")
             self.btn_action.setEnabled(True)
             self._action_mode = "install_docker"
+            return
+        if text == "__wsl_done__":
+            self.check_progress.setVisible(False)
+            self._recheck()
+            return
+        if text == "__wsl_reboot__":
+            self.check_progress.setVisible(False)
+            self.check_desc.setText(
+                f"{self.backend.display_name} 组件已启用，需要重启电脑生效。\n"
+                "请重启电脑后重新打开启动器；若届时仍提示未安装，"
+                "请再次点击安装完成剩余步骤。"
+            )
+            self.btn_action.setText("重新检测")
+            self.btn_action.setEnabled(True)
+            self._action_mode = "recheck"
+            return
+        if text == "__wsl_fail__":
+            self.check_progress.setVisible(False)
+            self.check_desc.setText(
+                f"{self.backend.display_name} 安装未完成，详情见日志。\n"
+                "若输出提示需要重启，请重启电脑后再次尝试。"
+            )
+            self.btn_action.setText(f"安装 {self.backend.display_name}")
+            self.btn_action.setEnabled(True)
+            self._action_mode = "install_wsl"
             return
 
         if self.check_progress.isVisible():

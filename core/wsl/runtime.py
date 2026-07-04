@@ -1,5 +1,6 @@
 import os
 import subprocess
+import tempfile
 import threading
 import time
 from urllib.request import Request, urlopen
@@ -470,32 +471,118 @@ default = root
             self.log_received.emit(detail, "error")
             return False
 
-    def install_wsl(self):
-        """以管理员权限安装 WSL2（通过 ShellExecute runas）"""
-        self.log_received.emit("正在请求管理员权限安装 WSL2...", "info")
-        try:
-            import ctypes
+    _WSL_INSTALL_REBOOT_MARKERS = (
+        "重新启动",
+        "重启",
+        "reboot",
+        "restart",
+    )
 
-            ctypes.windll.shell32.ShellExecuteW(
-                None,
-                "runas",
-                "cmd",
-                '/c wsl --install --no-distribution && shutdown /r /t 60 /c "WSL 安装完成，60秒后自动重启"',
-                None,
-                1,
+    @classmethod
+    def _parse_wsl_install_outcome(cls, exit_token, output):
+        """根据提权安装进程的退出码与输出判定结果。
+
+        返回 "done"（安装完成，可直接重新检测）、"reboot"（组件已启用，
+        需要重启电脑后继续）或 "fail"。首次在全新机器上执行
+        `wsl --install` 通常只启用 Windows 可选组件即要求重启，且可能以
+        非零码退出；重启后需要再执行一次才能完成剩余安装。
+        """
+        if exit_token == "DENIED":
+            return "fail"
+        lowered = (output or "").lower()
+        reboot_marker = any(marker in lowered for marker in cls._WSL_INSTALL_REBOOT_MARKERS)
+        if exit_token == "0":
+            return "reboot" if reboot_marker else "done"
+        return "reboot" if reboot_marker else "fail"
+
+    def install_wsl(self):
+        """以管理员权限安装 WSL2，等待安装进程结束并回收结果（后台线程）。"""
+        self.log_received.emit("正在请求管理员权限安装 WSL2...", "info")
+
+        def _do_install():
+            # 提权进程的输出无法直接通过管道回传，重定向到日志文件再读回；
+            # wsl.exe 输出为 UTF-16，交由 _safe_decode 识别。
+            log_path = os.path.join(
+                tempfile.gettempdir(), f"na_wsl_install_{os.getpid()}.log"
             )
-            self.log_received.emit(
-                "WSL2 安装已启动，安装完成后将在 60 秒后自动重启", "info"
+            inner_cmd = f'wsl --install --no-distribution > "{log_path}" 2>&1'
+            ps_inner = inner_cmd.replace("'", "''")
+            ps_script = (
+                "try { "
+                "$p = Start-Process -FilePath 'cmd.exe' "
+                f"-ArgumentList '/d','/c','{ps_inner}' "
+                "-Verb RunAs -Wait -PassThru; "
+                "Write-Output ('NA_EXIT=' + $p.ExitCode) "
+                "} catch { Write-Output 'NA_EXIT=DENIED' }"
             )
-            return True
-        except Exception as e:
-            self.log_received.emit(
-                "WSL2 安装启动失败\n"
-                "动作: 以管理员权限执行 wsl --install --no-distribution\n"
-                f"异常: {type(e).__name__}: {e}",
-                "error",
-            )
-            return False
+            exit_token = ""
+            try:
+                proc = subprocess.run(
+                    [
+                        "powershell",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-Command",
+                        ps_script,
+                    ],
+                    capture_output=True,
+                    timeout=1800,
+                    creationflags=self._creation_flags(),
+                )
+                for line in self._safe_decode(proc.stdout).splitlines():
+                    line = line.strip().strip("\x00")
+                    if line.startswith("NA_EXIT="):
+                        exit_token = line.split("=", 1)[1].strip()
+            except Exception as e:
+                self.log_received.emit(
+                    self._format_command_failure(
+                        "WSL2 安装进程执行异常",
+                        cmd="wsl --install --no-distribution",
+                        timeout=1800,
+                        exception=e,
+                    ),
+                    "error",
+                )
+                self.progress_updated.emit("__wsl_fail__")
+                return
+
+            output = ""
+            try:
+                with open(log_path, "rb") as f:
+                    output = self._clean_command_output(self._safe_decode(f.read()))
+            except OSError:
+                pass
+            finally:
+                try:
+                    os.remove(log_path)
+                except OSError:
+                    pass
+
+            if output:
+                self.log_received.emit(f"[WSL 安装] 安装输出:\n{output}", "info")
+
+            outcome = self._parse_wsl_install_outcome(exit_token, output)
+            if outcome == "done":
+                self.log_received.emit("[WSL 安装] 安装步骤执行完成，开始重新检测", "info")
+                self.progress_updated.emit("__wsl_done__")
+            elif outcome == "reboot":
+                self.log_received.emit(
+                    "[WSL 安装] Windows 组件已启用，需要重启电脑后生效。"
+                    "重启后请重新打开启动器；若仍提示未安装，请再次点击安装完成剩余步骤。",
+                    "warning",
+                )
+                self.progress_updated.emit("__wsl_reboot__")
+            else:
+                detail = "用户拒绝了管理员权限请求" if exit_token == "DENIED" else (
+                    f"安装进程退出码: {exit_token or '未知'}"
+                )
+                self.log_received.emit(f"[WSL 安装] 安装失败（{detail}）", "error")
+                self.progress_updated.emit("__wsl_fail__")
+
+        threading.Thread(target=_do_install, daemon=True).start()
+        return True
 
     def install_docker(self):
         """在专用发行版内异步安装 Docker"""

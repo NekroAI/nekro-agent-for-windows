@@ -10,22 +10,33 @@ class WSLEnvironmentMixin:
 
         def check_wsl():
             self.log_received.emit("[环境检测] 1/4 检测 WSL2...", "info")
-            try:
-                proc = subprocess.run(
-                    ["wsl", "--status"],
+
+            def _probe(args):
+                # 开机后首次调用 wsl.exe 需要冷启动 WSL 服务，10s 容易误判超时
+                return subprocess.run(
+                    args,
                     capture_output=True,
-                    timeout=10,
+                    timeout=30,
                     creationflags=self._creation_flags(),
                 )
+
+            try:
+                proc = _probe(["wsl", "--status"])
                 ok = proc.returncode == 0
+                if not ok:
+                    # 刚装好的 Store 版 WSL 在个别状态下 --status 返回非零，
+                    # 用 --version 再确认一次，避免把已安装误判成未安装
+                    version_proc = _probe(["wsl", "--version"])
+                    if version_proc.returncode == 0:
+                        ok = True
                 ctx["wsl"] = ok
                 if ok:
                     self.log_received.emit("[环境检测] ✓ WSL2 已安装", "info")
                 else:
                     detail = self._format_command_failure(
-                        "[环境检测] WSL2 检测失败",
+                        "[环境检测] WSL2 检测失败（若刚安装过 WSL，请重启电脑后再检测）",
                         args=["wsl", "--status"],
-                        timeout=10,
+                        timeout=30,
                         returncode=proc.returncode,
                         stdout=proc.stdout,
                         stderr=proc.stderr,
@@ -42,7 +53,7 @@ class WSLEnvironmentMixin:
                 detail = self._format_command_failure(
                     "[环境检测] WSL 检测异常",
                     args=["wsl", "--status"],
-                    timeout=10,
+                    timeout=30,
                     exception=e,
                 )
                 self.log_received.emit(detail, "error")
