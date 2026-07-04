@@ -1,4 +1,5 @@
 from abc import abstractmethod
+import threading
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
@@ -25,6 +26,30 @@ class BackendBase(QObject):
         super().__init__(parent)
         self.config = config
         self.is_running = False
+        self._exclusive_op_lock = threading.Lock()
+        self._exclusive_op_name = ""
+
+    def acquire_exclusive_operation(self, name):
+        """尝试占用互斥操作槽（更新、切换预览、还原、daemon 任务等）。
+
+        成功返回 True；已有互斥操作在执行时返回 False，调用方应放弃本次操作。
+        """
+        if self._exclusive_op_lock.acquire(blocking=False):
+            self._exclusive_op_name = name
+            return True
+        return False
+
+    def release_exclusive_operation(self):
+        """释放互斥操作槽；未持有时静默忽略。"""
+        self._exclusive_op_name = ""
+        try:
+            self._exclusive_op_lock.release()
+        except RuntimeError:
+            pass
+
+    def exclusive_operation_name(self):
+        """返回当前互斥操作名；空字符串表示空闲。"""
+        return self._exclusive_op_name if self._exclusive_op_lock.locked() else ""
 
     @abstractmethod
     def get_check_funcs(self):

@@ -83,6 +83,24 @@ class WSLUpdateMixin:
             f"test -f {shlex.quote(archive_path)} && echo yes",
         ).strip() == "yes"
 
+    def _run_exclusive_ui_operation(self, name, worker):
+        """在互斥槽保护下执行 UI 触发的更新类操作（工作线程内调用）。
+
+        与 WebUI daemon 任务共用同一互斥槽，避免两侧并发执行 compose 操作。
+        """
+        if not self.acquire_exclusive_operation(name):
+            other = self.exclusive_operation_name() or "其他更新操作"
+            self.status_changed.emit("更新失败")
+            self.update_finished.emit(
+                False,
+                f"已有互斥操作正在执行（{other}），请等待完成后重试。",
+            )
+            return
+        try:
+            worker()
+        finally:
+            self.release_exclusive_operation()
+
     def run_remote_update(self):
         """执行内置升级流程，optional 步骤通过信号询问用户确认。"""
         from core.update_runner import build_update_plan, log_update_plan
@@ -211,7 +229,10 @@ class WSLUpdateMixin:
             threading.Thread(target=self._health_check, args=(nekro_port,), daemon=True).start()
             self.update_finished.emit(True, "Nekro Agent 更新完成，正在等待服务重新就绪。")
 
-        threading.Thread(target=_do_update, daemon=True).start()
+        threading.Thread(
+            target=lambda: self._run_exclusive_ui_operation("远程更新", _do_update),
+            daemon=True,
+        ).start()
 
     def _daemon_context(self, request: dict):
         inst_id = str(request.get("_launcher_inst_id") or "")
@@ -1141,7 +1162,10 @@ class WSLUpdateMixin:
                     f"异常: {type(e).__name__}: {e}",
                 )
 
-        threading.Thread(target=_do_switch, daemon=True).start()
+        threading.Thread(
+            target=lambda: self._run_exclusive_ui_operation("切换预览版", _do_switch),
+            daemon=True,
+        ).start()
 
     def restore_stable_from_backup(self):
         """从预览版备份恢复正式版。"""
@@ -1305,7 +1329,10 @@ class WSLUpdateMixin:
                     f"异常: {type(e).__name__}: {e}",
                 )
 
-        threading.Thread(target=_do_restore, daemon=True).start()
+        threading.Thread(
+            target=lambda: self._run_exclusive_ui_operation("恢复正式版", _do_restore),
+            daemon=True,
+        ).start()
 
     def reply_update_optional(self, confirmed: bool):
         """UI 调用此方法回复 optional 步骤的用户选择"""

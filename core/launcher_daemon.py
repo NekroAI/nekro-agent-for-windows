@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+from core.daemon_bridge import DaemonSocksBridge
 from core.wsl.constants import DISTRO_NAME
 
 
@@ -24,7 +25,9 @@ API_BASE = "http://na-tools.local/v1"
 SOCKS_URL = "socks5h://host.docker.internal:18082"
 HTTP_HOST = "127.0.0.1"
 HTTP_PORT = 18081
-SOCKS_HOST = "0.0.0.0"
+# SOCKS 只绑定本机回环；容器侧流量由 WSL 内桥接进程经 stdio 转发进来，
+# 不需要（也不应该）把 SOCKS 暴露到非回环接口。
+SOCKS_HOST = "127.0.0.1"
 SOCKS_PORT = 18082
 MAX_REQUEST_BODY_BYTES = 1024 * 1024
 FINAL_JOB_STATUSES = {"succeeded", "failed", "cancelled"}
@@ -460,6 +463,7 @@ class LauncherDaemonFacade:
         self._http_thread = None
         self._socks_server = None
         self._socks_thread = None
+        self._bridge = None
         self.started_at = _utc_now()
 
     def start(self):
@@ -497,11 +501,22 @@ class LauncherDaemonFacade:
                     daemon=True,
                 )
                 self._socks_thread.start()
+            if self._bridge is None:
+                self._bridge = DaemonSocksBridge(
+                    self.backend,
+                    listen_port=self.socks_port,
+                    target_host=self.socks_host,
+                    target_port=self.socks_port,
+                )
+                self._bridge.start()
         except Exception:
             self.stop()
             raise
 
     def stop(self):
+        if self._bridge is not None:
+            self._bridge.stop()
+            self._bridge = None
         if self._http_server is not None:
             self._http_server.shutdown()
             self._http_server.server_close()
@@ -558,6 +573,8 @@ class LauncherDaemonFacade:
                     launcher_inst_id,
                     daemon_instance_id=instance_id,
                 )
+            if self._bridge is not None:
+                self._bridge.poke()
             return binding
 
     def env_values_for_binding(self, binding):
@@ -590,7 +607,7 @@ class LauncherDaemonFacade:
             "data_dir": binding.data_dir,
             "token_file": token_path,
             "http_bind": f"{self.http_host}:{self.http_port}",
-            "socks_bind": f"{self.socks_host}:{self.socks_port}",
+            "socks_bind": f"wsl:0.0.0.0:{self.socks_port}",
             "daemon_pid": os.getpid(),
             "started_at": _utc_now(),
         }
@@ -688,35 +705,40 @@ class LauncherDaemonFacade:
             self._used_nonces[nonce_key] = now_ms
         return binding, None
 
-    def _wsl_probe(self, cmd, *, cwd=None, timeout=15):
-        try:
-            self.backend._run_wsl_checked(
-                DISTRO_NAME,
-                cmd,
-                action="[daemon] capability 检测失败",
-                cwd=cwd,
-                timeout=timeout,
-            )
-            return True
-        except Exception:
-            return False
+    _CAPABILITY_REASONS = (
+        "instance_not_bound",
+        "compose_missing",
+        "env_missing",
+        "docker_unavailable",
+        "docker_socket_missing",
+        "docker_not_running",
+    )
 
     def _capability_unavailable_reason(self, binding):
         if not self.backend.runtime_exists():
             return "wsl_unavailable"
         checks = [
-            (f"test -d {shlex.quote(binding.data_dir)}", "instance_not_bound", None),
-            (f"test -f {shlex.quote(binding.compose_file)}", "compose_missing", None),
-            (f"test -f {shlex.quote(binding.env_file)}", "env_missing", None),
-            ("command -v docker >/dev/null 2>&1", "docker_unavailable", None),
-            ("docker compose version >/dev/null 2>&1", "docker_unavailable", None),
-            ("test -S /var/run/docker.sock", "docker_socket_missing", None),
-            ("docker version >/dev/null 2>&1", "docker_not_running", None),
+            (f"test -d {shlex.quote(binding.data_dir)}", "instance_not_bound"),
+            (f"test -f {shlex.quote(binding.compose_file)}", "compose_missing"),
+            (f"test -f {shlex.quote(binding.env_file)}", "env_missing"),
+            ("command -v docker >/dev/null 2>&1", "docker_unavailable"),
+            ("docker compose version >/dev/null 2>&1", "docker_unavailable"),
+            ("test -S /var/run/docker.sock", "docker_socket_missing"),
+            ("docker version >/dev/null 2>&1", "docker_not_running"),
         ]
-        for cmd, reason, cwd in checks:
-            if not self._wsl_probe(cmd, cwd=cwd):
-                return reason
-        return None
+        # 合并为一次 WSL 调用：输出第一个失败原因码，全部通过输出 ok。
+        script = " ".join(
+            f"{cmd} || {{ echo {reason}; exit 0; }};" for cmd, reason in checks
+        )
+        script += " echo ok"
+        raw = self.backend._wsl_exec(DISTRO_NAME, script, timeout=45)
+        for line in raw.splitlines():
+            token = line.strip().strip("\x00")
+            if token == "ok":
+                return None
+            if token in self._CAPABILITY_REASONS:
+                return token
+        return "wsl_unavailable"
 
     def _capabilities(self, binding):
         reason = self._capability_unavailable_reason(binding)
@@ -777,12 +799,15 @@ class LauncherDaemonFacade:
         path = parsed.path
         binding, auth_error = self._validate_auth(method, path_with_query, headers, body)
         if auth_error:
-            return 401, auth_error
+            # 协议约定：签名类错误 401，实例绑定/归属类错误 403。
+            error_code = auth_error.get("error", {}).get("code", "")
+            status = 403 if error_code in {"instance_not_bound", "instance_mismatch"} else 401
+            return status, auth_error
 
         if method == "GET" and path == "/v1/health":
             return 200, {
                 "ok": True,
-                "daemon_version": "0.1.0",
+                "daemon_version": self._daemon_version(),
                 "protocol_version": PROTOCOL_VERSION,
                 "platform": "windows",
                 "started_at": self.started_at,
@@ -804,6 +829,14 @@ class LauncherDaemonFacade:
         if method == "GET" and path.startswith("/v1/jobs/"):
             return self._job_response(binding, path, parsed.query)
         return 404, _error("daemon_protocol_error", "未知 daemon API 路径")
+
+    def _daemon_version(self):
+        try:
+            from core.app_updater import APP_VERSION
+
+            return APP_VERSION
+        except Exception:
+            return "0.0.0"
 
     def _request_context(self, binding, request):
         enriched = dict(request)
@@ -830,6 +863,24 @@ class LauncherDaemonFacade:
         active = self.jobs.active_for_instance(binding.instance_id)
         details = {"job_id": active.job_id} if active else None
         return 409, _error("job_conflict", "已有更新任务正在运行", details)
+
+    def _launcher_busy_details(self):
+        """启动器本地是否有互斥操作（UI 更新/切换/部署）在执行。"""
+        name_getter = getattr(self.backend, "exclusive_operation_name", None)
+        if callable(name_getter):
+            name = name_getter()
+            if name:
+                return {"operation": name}
+        if getattr(self.backend, "_deploying", False):
+            return {"operation": "deploy"}
+        return None
+
+    def _launcher_busy_error(self, details):
+        return 409, _error(
+            "launcher_busy",
+            "启动器正在执行本地操作，请等待完成后重试",
+            details,
+        )
 
     def _list_backups(self, binding, query):
         params = parse_qs(query)
@@ -861,6 +912,9 @@ class LauncherDaemonFacade:
         channel = request.get("channel") or "stable"
         if channel not in {"stable", "preview", "rollback"}:
             return 400, _error("invalid_channel", "channel 必须是 stable、preview 或 rollback")
+        busy = self._launcher_busy_details()
+        if busy:
+            return self._launcher_busy_error(busy)
         caps = self._capabilities(binding)
         if not caps["enabled"]:
             return 503, _error(
@@ -881,6 +935,9 @@ class LauncherDaemonFacade:
         if not BACKUP_NAME_RE.fullmatch(name):
             return 400, _error("invalid_backup_name", "备份名称只能包含字母、数字、点、下划线和短横线")
         request["name"] = name
+        busy = self._launcher_busy_details()
+        if busy:
+            return self._launcher_busy_error(busy)
         caps = self._capabilities(binding)
         if not caps["enabled"]:
             return 503, _error(
@@ -901,6 +958,9 @@ class LauncherDaemonFacade:
         if not BACKUP_ID_RE.fullmatch(backup_id) or ".." in backup_id:
             return 400, _error("invalid_backup_id", "backup_id 必须是当前实例备份文件名")
         request["backup_id"] = backup_id
+        busy = self._launcher_busy_details()
+        if busy:
+            return self._launcher_busy_error(busy)
         caps = self._capabilities(binding)
         if not caps["enabled"]:
             return 503, _error(
@@ -928,7 +988,24 @@ class LauncherDaemonFacade:
             "message": job.message,
         }
 
+    def _acquire_backend_exclusive(self, job):
+        """任务真正执行前占用启动器互斥槽，防止与 UI 本地操作并发跑 compose。"""
+        acquire = getattr(self.backend, "acquire_exclusive_operation", None)
+        if not callable(acquire):
+            return True
+        if acquire(f"daemon:{job.type}"):
+            return True
+        job.fail("launcher_busy", "启动器正在执行本地操作，任务无法开始")
+        return False
+
+    def _release_backend_exclusive(self):
+        release = getattr(self.backend, "release_exclusive_operation", None)
+        if callable(release):
+            release()
+
     def _run_update_job(self, job, request):
+        if not self._acquire_backend_exclusive(job):
+            return
         try:
             self.backend.run_daemon_update_job(request, job)
         except Exception as exc:
@@ -937,8 +1014,12 @@ class LauncherDaemonFacade:
                 f"Windows 启动器更新任务异常: {type(exc).__name__}: {exc}",
             )
             self.backend.status_changed.emit("更新失败")
+        finally:
+            self._release_backend_exclusive()
 
     def _run_backup_job(self, job, request):
+        if not self._acquire_backend_exclusive(job):
+            return
         try:
             self.backend.run_daemon_backup_job(request, job)
         except Exception as exc:
@@ -946,8 +1027,12 @@ class LauncherDaemonFacade:
                 "backup_failed",
                 f"Windows 启动器备份任务异常: {type(exc).__name__}: {exc}",
             )
+        finally:
+            self._release_backend_exclusive()
 
     def _run_restore_job(self, job, request):
+        if not self._acquire_backend_exclusive(job):
+            return
         try:
             self.backend.run_daemon_restore_job(request, job)
         except Exception as exc:
@@ -956,6 +1041,8 @@ class LauncherDaemonFacade:
                 f"Windows 启动器还原任务异常: {type(exc).__name__}: {exc}",
             )
             self.backend.status_changed.emit("更新失败")
+        finally:
+            self._release_backend_exclusive()
 
     def _job_action_response(self, binding, path):
         parts = path.strip("/").split("/")
@@ -1054,7 +1141,10 @@ class LauncherDaemonFacade:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "keep-alive")
+                # SSE 响应没有 Content-Length，流结束后必须关闭连接，
+                # 否则依赖 EOF 的客户端会一直挂到超时。
+                self.send_header("Connection", "close")
+                self.close_connection = True
                 self.end_headers()
                 after_seq = 0
                 params = parse_qs(urlparse(self.path).query)
