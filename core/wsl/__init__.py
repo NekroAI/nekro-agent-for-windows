@@ -9,7 +9,11 @@ from core.wsl.constants import (
     ROOTFS_URLS,
     STABLE_IMAGE,
 )
-from core.wsl.manager import WSLManager
+
+# 注意：不要在此处导入 WSLManager。manager 依赖 core.launcher_daemon，
+# 而 launcher_daemon/daemon_bridge 又依赖 core.wsl.constants；包 __init__
+# 急切导入 manager 会让“先导入 launcher_daemon”的路径形成循环导入。
+# 需要 WSLManager 的调用方应直接 `from core.wsl.manager import WSLManager`。
 
 __all__ = [
     "DISTRO_NAME",
@@ -21,5 +25,4 @@ __all__ = [
     "REQUIRED_IMAGES_BASE",
     "ROOTFS_URLS",
     "STABLE_IMAGE",
-    "WSLManager",
 ]

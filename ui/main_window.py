@@ -545,12 +545,12 @@ class MainWindow(QMainWindow):
         return "恢复正式版" if self._release_channel() == "preview" else "切换至预览版"
 
     def _agent_image_ref(self):
-        from core.wsl import WSLManager
+        from core.wsl.manager import WSLManager
 
         return WSLManager.get_agent_image_ref(self.config)
 
     def _managed_images(self):
-        from core.wsl import WSLManager
+        from core.wsl.manager import WSLManager
 
         return WSLManager.get_managed_images(self.config)
 
