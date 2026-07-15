@@ -5,7 +5,12 @@ import tempfile
 import time
 import unittest
 
-from core.launcher_daemon import DaemonBinding, JobStore, LauncherDaemonFacade
+from core.launcher_daemon import (
+    DaemonBinding,
+    JobStore,
+    LauncherDaemonFacade,
+    _ExclusiveHTTPServer,
+)
 
 
 class _Backend:
@@ -53,6 +58,22 @@ def _signed_headers(token, instance_id, method, path, body, nonce="abc"):
 
 
 class LauncherDaemonTests(unittest.TestCase):
+    def test_http_listener_rejects_duplicate_bind(self):
+        from http.server import BaseHTTPRequestHandler
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                return
+
+        first = _ExclusiveHTTPServer(("127.0.0.1", 0), Handler)
+        port = first.server_address[1]
+        try:
+            with self.assertRaises(OSError):
+                second = _ExclusiveHTTPServer(("127.0.0.1", port), Handler)
+                second.server_close()
+        finally:
+            first.server_close()
+
     def test_hmac_auth_accepts_valid_signature_and_rejects_replay(self):
         facade = LauncherDaemonFacade(_Backend())
         binding = DaemonBinding(

@@ -1,3 +1,4 @@
+import copy
 import json
 import logging
 import os
@@ -109,8 +110,10 @@ class ConfigManager:
         }
         self.config = self.load_config()
         if "data_dir" in self.config:
-            self.config.pop("data_dir", None)
-            self.save_config()
+            with self._lock:
+                self._mutate_and_save_locked(
+                    lambda candidate: candidate.pop("data_dir", None)
+                )
         self._migrate_to_multi_instance()
 
     def _migrate_legacy_state(self):
@@ -209,18 +212,30 @@ class ConfigManager:
         with self._lock:
             return self._save_config_locked()
 
+    def _mutate_and_save_locked(self, mutation):
+        previous = self.config
+        candidate = copy.deepcopy(previous)
+        mutation(candidate)
+        self.config = candidate
+        if self._save_config_locked():
+            return True
+        self.config = previous
+        return False
+
     def get(self, key):
         return self.config.get(key, self.default_config.get(key))
 
     def set(self, key, value):
         with self._lock:
-            self.config[key] = value
-            return self._save_config_locked()
+            return self._mutate_and_save_locked(
+                lambda candidate: candidate.__setitem__(key, copy.deepcopy(value))
+            )
 
     def set_many(self, values):
         with self._lock:
-            self.config.update(values)
-            return self._save_config_locked()
+            return self._mutate_and_save_locked(
+                lambda candidate: candidate.update(copy.deepcopy(values))
+            )
 
     def update_instance_with_globals(
         self,
@@ -229,13 +244,15 @@ class ConfigManager:
         global_updates=None,
     ):
         with self._lock:
-            if global_updates:
-                self.config.update(global_updates)
-            if inst_id and instance_updates:
-                instances = self.config.setdefault("instances", {})
-                inst = instances.setdefault(inst_id, {})
-                inst.update(instance_updates)
-            return self._save_config_locked()
+            def _apply(candidate):
+                if global_updates:
+                    candidate.update(copy.deepcopy(global_updates))
+                if inst_id and instance_updates:
+                    instances = candidate.setdefault("instances", {})
+                    inst = instances.setdefault(inst_id, {})
+                    inst.update(copy.deepcopy(instance_updates))
+
+            return self._mutate_and_save_locked(_apply)
 
     # ------------------------------------------------------------------ #
     # 多实例管理
@@ -252,7 +269,7 @@ class ConfigManager:
             return
 
         inst_id = "default"
-        instances[inst_id] = {
+        instance_data = {
             "instance_name": "",
             "deploy_dir": "/root/nekro_agent",
             "data_dir": "/root/nekro_agent_data",
@@ -266,10 +283,12 @@ class ConfigManager:
             ),
         }
         with self._lock:
-            self.config["instances"] = instances
-            self.config["active_instance"] = inst_id
-            self.config["default_instance"] = inst_id
-            self._save_config_locked()
+            def _apply(candidate):
+                candidate["instances"] = {inst_id: instance_data}
+                candidate["active_instance"] = inst_id
+                candidate["default_instance"] = inst_id
+
+            self._mutate_and_save_locked(_apply)
 
     def get_active_instance_id(self):
         return self.config.get("active_instance", "")
@@ -321,17 +340,19 @@ class ConfigManager:
 
     def clear_runtime_state(self, keep_first_run=False):
         with self._lock:
-            self.config["active_instance"] = ""
-            self.config["default_instance"] = ""
-            self.config["deploy_mode"] = ""
-            self.config["release_channel"] = "stable"
-            self.config["preview_backup_available"] = False
-            self.config["deploy_info"] = None
-            self.config["nekro_port"] = self.default_config["nekro_port"]
-            self.config["napcat_port"] = self.default_config["napcat_port"]
-            if keep_first_run:
-                self.config["first_run"] = True
-            return self._save_config_locked()
+            def _apply(candidate):
+                candidate["active_instance"] = ""
+                candidate["default_instance"] = ""
+                candidate["deploy_mode"] = ""
+                candidate["release_channel"] = "stable"
+                candidate["preview_backup_available"] = False
+                candidate["deploy_info"] = None
+                candidate["nekro_port"] = self.default_config["nekro_port"]
+                candidate["napcat_port"] = self.default_config["napcat_port"]
+                if keep_first_run:
+                    candidate["first_run"] = True
+
+            return self._mutate_and_save_locked(_apply)
 
     def get_instance(self, inst_id=None):
         """返回指定实例的配置 dict；不传 inst_id 时返回当前活跃实例。"""
@@ -343,28 +364,34 @@ class ConfigManager:
     def set_instance(self, inst_id, data):
         """创建或更新一个实例配置。"""
         with self._lock:
-            instances = self.config.setdefault("instances", {})
-            instances[inst_id] = data
-            return self._save_config_locked()
+            def _apply(candidate):
+                instances = candidate.setdefault("instances", {})
+                instances[inst_id] = copy.deepcopy(data)
+
+            return self._mutate_and_save_locked(_apply)
 
     def update_instance(self, inst_id, **kwargs):
         """增量更新一个实例的部分字段。"""
         with self._lock:
-            instances = self.config.setdefault("instances", {})
-            inst = instances.setdefault(inst_id, {})
-            inst.update(kwargs)
-            return self._save_config_locked()
+            def _apply(candidate):
+                instances = candidate.setdefault("instances", {})
+                inst = instances.setdefault(inst_id, {})
+                inst.update(copy.deepcopy(kwargs))
+
+            return self._mutate_and_save_locked(_apply)
 
     def remove_instance(self, inst_id):
         with self._lock:
-            instances = self.config.get("instances") or {}
-            instances.pop(inst_id, None)
-            fallback = next(iter(instances), "")
-            if self.config.get("active_instance") == inst_id:
-                self.config["active_instance"] = fallback
-            if self.config.get("default_instance") == inst_id:
-                self.config["default_instance"] = self.config.get("active_instance") or fallback
-            return self._save_config_locked()
+            def _apply(candidate):
+                instances = candidate.get("instances") or {}
+                instances.pop(inst_id, None)
+                fallback = next(iter(instances), "")
+                if candidate.get("active_instance") == inst_id:
+                    candidate["active_instance"] = fallback
+                if candidate.get("default_instance") == inst_id:
+                    candidate["default_instance"] = candidate.get("active_instance") or fallback
+
+            return self._mutate_and_save_locked(_apply)
 
     def list_instances(self):
         """返回 [(inst_id, inst_data), ...] 列表。"""

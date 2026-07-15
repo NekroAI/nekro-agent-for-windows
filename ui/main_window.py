@@ -2,11 +2,12 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import webbrowser
 from html import escape
 
-from PyQt6.QtCore import QRect, QSize, Qt, QThread, QTimer
+from PyQt6.QtCore import QObject, QRect, QSize, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QCloseEvent, QColor, QIcon, QPixmap, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
@@ -177,6 +178,10 @@ class BrowserTabBar(QTabBar):
         super().mousePressEvent(event)
 
 
+class _PreviewBackupSizeNotifier(QObject):
+    finished = pyqtSignal(int, str, str)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, splash=None):
         super().__init__()
@@ -202,6 +207,17 @@ class MainWindow(QMainWindow):
         self._pending_browser_refresh = None
         self._napcat_network_config_in_progress = False
         self._image_status_request_kind = None
+        self._preview_backup_size_in_progress = False
+        self._preview_backup_size_request_id = 0
+        self._preview_backup_size_thread = None
+        self._preview_backup_size_notifier = _PreviewBackupSizeNotifier()
+        self._preview_backup_size_notifier.finished.connect(
+            self._on_preview_backup_size_ready
+        )
+        self._window_closing = False
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._mark_window_closing)
         self.browser_urls = {
             "nekro": (
                 f"http://localhost:{normalize_port(self.config.get('nekro_port'), 8021)}"
@@ -269,6 +285,17 @@ class MainWindow(QMainWindow):
         self.backend.update_optional_confirm.connect(self._on_update_optional_confirm)
         self.backend.update_finished.connect(self._on_update_finished)
         self.backend.instance_removed.connect(self._on_remove_instance_done)
+
+        daemon_start_error = getattr(self.backend, "launcher_daemon_start_error", "")
+        if daemon_start_error:
+            QTimer.singleShot(
+                0,
+                lambda message=daemon_start_error: self._show_notice_dialog(
+                    "启动器后台服务不可用",
+                    message,
+                    danger=True,
+                ),
+            )
 
         if self._splash:
             self.backend.status_changed.connect(self._splash.on_status_changed)
@@ -537,6 +564,8 @@ class MainWindow(QMainWindow):
         return self.config.get("release_channel") or "stable"
 
     def _preview_button_label(self):
+        if self._preview_backup_size_in_progress:
+            return "正在估算备份..."
         if self._update_in_progress:
             if self._active_update_kind == "preview":
                 return "切换中..."
@@ -828,6 +857,7 @@ class MainWindow(QMainWindow):
                 and self._service_ready()
                 and bool(self.config.get("deploy_mode"))
                 and not self._napcat_network_config_in_progress
+                and not self._preview_backup_size_in_progress
                 and not self._blocking_status_detail()
             )
             self.btn_primary_preview.setText(self._preview_button_label())
@@ -891,6 +921,86 @@ class MainWindow(QMainWindow):
             maximum_width=560,
         )
 
+    def _request_preview_backup_size(self):
+        if self._preview_backup_size_in_progress:
+            return
+        if not hasattr(self.backend, "get_backup_size_hint"):
+            self._continue_preview_switch("未知")
+            return
+
+        self._preview_backup_size_in_progress = True
+        self._preview_backup_size_request_id += 1
+        request_id = self._preview_backup_size_request_id
+        backend = self.backend
+        notifier = self._preview_backup_size_notifier
+        self._refresh_advanced_feature_ui()
+        self.log_viewer_app.append(
+            "<span style='color:#7ce0a3;'>[INFO]</span> 正在估算预览版备份占用空间..."
+        )
+
+        def _get_backup_size():
+            backup_size = "未知"
+            error = ""
+            try:
+                backup_size = str(backend.get_backup_size_hint() or "未知")
+            except Exception as exc:
+                error = str(exc).strip() or exc.__class__.__name__
+            try:
+                notifier.finished.emit(request_id, backup_size, error)
+            except RuntimeError:
+                # Qt 已退出时后台 daemon 线程无需再回调 UI。
+                pass
+
+        self._preview_backup_size_thread = threading.Thread(
+            target=_get_backup_size,
+            name="preview-backup-size",
+            daemon=True,
+        )
+        self._preview_backup_size_thread.start()
+
+    def _on_preview_backup_size_ready(self, request_id, backup_size, error):
+        if request_id != self._preview_backup_size_request_id:
+            return
+        self._preview_backup_size_in_progress = False
+        self._preview_backup_size_thread = None
+        self._refresh_advanced_feature_ui()
+        if self._window_closing or not self.isVisible():
+            return
+        if error:
+            self.log_viewer_app.append(
+                "<span style='color:#e3b341;'>[WARN]</span> "
+                f"无法估算预览版备份占用空间，将显示为未知：{escape(error)}"
+            )
+        self._continue_preview_switch(backup_size or "未知")
+
+    def _continue_preview_switch(self, backup_size):
+        if self._update_in_progress:
+            self._show_notice_dialog(
+                "提示", "当前已有更新任务正在进行，请等待完成后再试。"
+            )
+            return
+        if self._release_channel() == "preview":
+            return
+        if not self.config.get("deploy_mode") or not self._service_ready():
+            self._show_notice_dialog(
+                "提示", "服务状态已发生变化，请确认服务就绪后重新切换预览版。"
+            )
+            return
+
+        action = self._show_preview_switch_dialog(backup_size)
+        if not action:
+            return
+
+        dialog = self._create_update_dialog(
+            "切换到预览版",
+            "正在准备切换到预览版 Nekro Agent。",
+            lambda dlg=None, create_backup=(
+                action == "backup"
+            ): self._start_preview_switch(dialog, create_backup),
+            confirm_text="开始切换",
+        )
+        dialog.exec()
+
     def _switch_to_preview_build(self):
         if not self._guard_napcat_network_config_busy("切换预览版"):
             return
@@ -948,26 +1058,7 @@ class MainWindow(QMainWindow):
             )
             return
 
-        backup_size = "未知"
-        if hasattr(self.backend, "get_backup_size_hint"):
-            try:
-                backup_size = self.backend.get_backup_size_hint()
-            except Exception:
-                backup_size = "未知"
-
-        action = self._show_preview_switch_dialog(backup_size)
-        if not action:
-            return
-
-        dialog = self._create_update_dialog(
-            "切换到预览版",
-            "正在准备切换到预览版 Nekro Agent。",
-            lambda dlg=None, create_backup=(
-                action == "backup"
-            ): self._start_preview_switch(dialog, create_backup),
-            confirm_text="开始切换",
-        )
-        dialog.exec()
+        self._request_preview_backup_size()
 
     def _show_confirm_dialog(
         self,
@@ -1801,8 +1892,8 @@ class MainWindow(QMainWindow):
     const filledUser = payload.username ? setValue(usernameField, payload.username) : false;
     const filledPass = payload.password ? setValue(passwordField, payload.password) : false;
 
-    if (window.pywebview && window.pywebview.api && window.pywebview.api.on_fill_result) {{
-        window.pywebview.api.on_fill_result(JSON.stringify({{
+    if (window.qtwebview2 && window.qtwebview2.api && window.qtwebview2.api.on_fill_result) {{
+        window.qtwebview2.api.on_fill_result(JSON.stringify({{
             filledUser: !!filledUser,
             filledPass: !!filledPass,
             inputCount: inputs.length,
@@ -2035,8 +2126,6 @@ class MainWindow(QMainWindow):
         self.browser_urls["nekro"] = f"http://localhost:{nekro_port}"
         napcat_port = normalize_port(self.config.get("napcat_port"), 6099)
         self.browser_urls["napcat"] = f"http://localhost:{napcat_port}"
-
-        import threading
 
         threading.Thread(
             target=self.backend._log_reader,
@@ -2913,24 +3002,36 @@ class MainWindow(QMainWindow):
                 self._show_notice_dialog("端口冲突", message)
                 return
 
-            self.config.set("nekro_port", nekro_port)
+            global_updates = {"nekro_port": nekro_port}
+            instance_updates = {"nekro_port": nekro_port}
             if deploy_mode == "napcat":
-                self.config.set("napcat_port", napcat_port)
+                global_updates["napcat_port"] = napcat_port
+                instance_updates["napcat_port"] = napcat_port
 
-            deploy_info = self.config.get("deploy_info")
+            existing_deploy_info = self.config.get("deploy_info")
+            deploy_info = (
+                dict(existing_deploy_info) if existing_deploy_info else None
+            )
             if deploy_info:
                 deploy_info["port"] = str(nekro_port)
                 if deploy_mode == "napcat":
                     deploy_info["napcat_port"] = str(napcat_port)
-                self.config.set("deploy_info", deploy_info)
+                global_updates["deploy_info"] = deploy_info
+                instance_updates["deploy_info"] = deploy_info
 
-            if active_id:
-                update_kwargs = {"nekro_port": nekro_port}
-                if deploy_mode == "napcat":
-                    update_kwargs["napcat_port"] = napcat_port
-                if deploy_info:
-                    update_kwargs["deploy_info"] = deploy_info
-                self.config.update_instance(active_id, **update_kwargs)
+            saved = self.config.update_instance_with_globals(
+                active_id,
+                instance_updates=instance_updates if active_id else None,
+                global_updates=global_updates,
+            )
+            if not saved:
+                detail = self.config.last_save_error or "未知错误"
+                self._show_notice_dialog(
+                    "保存失败",
+                    f"无法保存端口设置，请检查配置目录是否可写后重试。\n\n错误: {detail}",
+                    danger=True,
+                )
+                return
 
             if not getattr(self.backend, "is_running", False):
                 self.browser_urls["nekro"] = f"http://localhost:{nekro_port}"
@@ -3116,6 +3217,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent):
         if self._force_quit_after_stop:
+            self._mark_window_closing()
             event.accept()
             return
         if not self._guard_napcat_network_config_busy("退出启动器"):
@@ -3143,7 +3245,12 @@ class MainWindow(QMainWindow):
             else:
                 event.ignore()
         else:
+            self._mark_window_closing()
             event.accept()
+
+    def _mark_window_closing(self):
+        self._window_closing = True
+        self._preview_backup_size_request_id += 1
 
     def _on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:

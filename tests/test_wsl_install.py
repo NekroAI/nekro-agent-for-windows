@@ -1,6 +1,102 @@
+import os
+import subprocess
+import tempfile
 import unittest
+from unittest import mock
 
+from core.wsl.constants import DISTRO_NAME
 from core.wsl.runtime import WSLRuntimeMixin
+
+
+class _Signal:
+    def __init__(self):
+        self.messages = []
+
+    def emit(self, *args):
+        self.messages.append(args)
+
+
+class _Config:
+    def __init__(self, fail_once_key=None):
+        self.fail_once_key = fail_once_key
+        self.failed = False
+        self.last_save_error = "simulated save failure"
+        self.calls = []
+
+    def set(self, key, value):
+        self.calls.append((key, value))
+        if key == self.fail_once_key and not self.failed:
+            self.failed = True
+            return False
+        return True
+
+
+class _RuntimeDummy(WSLRuntimeMixin):
+    def __init__(self, *, distro_exists=False, config=None, docker_results=None):
+        self.log_received = _Signal()
+        self.progress_updated = _Signal()
+        self.install_error = _Signal()
+        self.config = config
+        self.distro_exists = distro_exists
+        self.guest_marker = ""
+        self.fail_wsl_conf_once = False
+        self.fail_guest_marker_once = False
+        self.download_calls = 0
+        self.docker_results = list(docker_results or [True])
+        self.docker_calls = 0
+
+    def _creation_flags(self):
+        return 0
+
+    def _distro_exists(self):
+        return self.distro_exists
+
+    def _download_rootfs(self, _dest_path):
+        self.download_calls += 1
+        return True
+
+    def _write_to_wsl(self, _distro, content, wsl_path):
+        if wsl_path == self._RUNTIME_GUEST_MARKER:
+            if self.fail_guest_marker_once:
+                self.fail_guest_marker_once = False
+                raise RuntimeError("simulated guest marker failure")
+            self.guest_marker = content.strip()
+            return
+        if wsl_path == "/etc/wsl.conf" and self.fail_wsl_conf_once:
+            self.fail_wsl_conf_once = False
+            raise RuntimeError("simulated wsl.conf failure")
+
+    def _wsl_exec(self, _distro, cmd, timeout=60, user=None):
+        if cmd.startswith("cat "):
+            return self.guest_marker
+        return ""
+
+    def _wsl_run(self, _distro, cmd, timeout=60, user=None):
+        if cmd.startswith("rm -f -- "):
+            self.guest_marker = ""
+        return subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
+
+    def _install_docker_sync(self):
+        result = self.docker_results[min(self.docker_calls, len(self.docker_results) - 1)]
+        self.docker_calls += 1
+        return result
+
+    @staticmethod
+    def _format_command_failure(action, **_kwargs):
+        return action
+
+
+def _successful_wsl_run(backend, calls):
+    def _run(args, **_kwargs):
+        calls.append(args)
+        if args[:2] == ["wsl", "--import"]:
+            backend.distro_exists = True
+        elif args[:2] == ["wsl", "--unregister"]:
+            backend.distro_exists = False
+            backend.guest_marker = ""
+        return subprocess.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+
+    return _run
 
 
 class ParseWSLInstallOutcomeTests(unittest.TestCase):
@@ -44,6 +140,100 @@ class ParseWSLInstallOutcomeTests(unittest.TestCase):
 
     def test_missing_exit_token_is_fail(self):
         self.assertEqual(WSLRuntimeMixin._parse_wsl_install_outcome("", ""), "fail")
+
+
+class CreateRuntimeRecoveryTests(unittest.TestCase):
+    @mock.patch("core.wsl.runtime.time.sleep")
+    def test_retry_after_wsl_conf_failure_skips_second_import(self, _sleep):
+        backend = _RuntimeDummy()
+        backend.fail_wsl_conf_once = True
+        subprocess_calls = []
+
+        with tempfile.TemporaryDirectory() as install_dir, mock.patch(
+            "core.wsl.runtime.subprocess.run",
+            side_effect=_successful_wsl_run(backend, subprocess_calls),
+        ):
+            self.assertFalse(backend.create_runtime(install_dir))
+            self.assertTrue(os.path.exists(backend._runtime_install_marker_path(install_dir)))
+
+            self.assertTrue(backend.create_runtime(install_dir))
+            self.assertFalse(os.path.exists(backend._runtime_install_marker_path(install_dir)))
+
+        import_calls = [args for args in subprocess_calls if args[:2] == ["wsl", "--import"]]
+        self.assertEqual(len(import_calls), 1)
+        self.assertEqual(backend.download_calls, 1)
+        self.assertEqual(backend.docker_calls, 1)
+
+    @mock.patch("core.wsl.runtime.time.sleep")
+    def test_retry_after_config_save_failure_continues_existing_partial_distro(self, _sleep):
+        config = _Config(fail_once_key="wsl_install_dir")
+        backend = _RuntimeDummy(config=config)
+        subprocess_calls = []
+
+        with tempfile.TemporaryDirectory() as install_dir, mock.patch(
+            "core.wsl.runtime.subprocess.run",
+            side_effect=_successful_wsl_run(backend, subprocess_calls),
+        ):
+            self.assertFalse(backend.create_runtime(install_dir))
+            self.assertTrue(backend.create_runtime(install_dir))
+
+        import_calls = [args for args in subprocess_calls if args[:2] == ["wsl", "--import"]]
+        self.assertEqual(len(import_calls), 1)
+        self.assertEqual(backend.download_calls, 1)
+        self.assertEqual(backend.docker_calls, 1)
+        self.assertGreaterEqual(config.calls.count(("wsl_install_dir", install_dir)), 2)
+
+    @mock.patch("core.wsl.runtime.time.sleep")
+    def test_retry_after_docker_failure_reuses_matching_partial_distro(self, _sleep):
+        backend = _RuntimeDummy(docker_results=[False, True])
+        subprocess_calls = []
+
+        with tempfile.TemporaryDirectory() as install_dir, mock.patch(
+            "core.wsl.runtime.subprocess.run",
+            side_effect=_successful_wsl_run(backend, subprocess_calls),
+        ):
+            self.assertFalse(backend.create_runtime(install_dir))
+            self.assertTrue(backend.create_runtime(install_dir))
+
+        import_calls = [args for args in subprocess_calls if args[:2] == ["wsl", "--import"]]
+        self.assertEqual(len(import_calls), 1)
+        self.assertEqual(backend.docker_calls, 2)
+
+    def test_existing_unmarked_distro_is_not_reused_or_reimported(self):
+        backend = _RuntimeDummy(distro_exists=True)
+
+        with tempfile.TemporaryDirectory() as install_dir, mock.patch(
+            "core.wsl.runtime.subprocess.run"
+        ) as run:
+            self.assertFalse(backend.create_runtime(install_dir))
+
+        run.assert_not_called()
+        self.assertEqual(backend.download_calls, 0)
+        self.assertEqual(backend.docker_calls, 0)
+        message = backend.install_error.messages[-1][0]
+        self.assertIn(DISTRO_NAME, message)
+        self.assertIn("不会再次导入或继续配置", message)
+
+    @mock.patch("core.wsl.runtime.time.sleep")
+    def test_guest_marker_failure_discards_partial_distro_for_retry(self, _sleep):
+        backend = _RuntimeDummy()
+        backend.fail_guest_marker_once = True
+        subprocess_calls = []
+
+        with tempfile.TemporaryDirectory() as install_dir, mock.patch(
+            "core.wsl.runtime.subprocess.run",
+            side_effect=_successful_wsl_run(backend, subprocess_calls),
+        ):
+            self.assertFalse(backend.create_runtime(install_dir))
+            self.assertFalse(backend.distro_exists)
+            self.assertTrue(backend.create_runtime(install_dir))
+
+        import_calls = [args for args in subprocess_calls if args[:2] == ["wsl", "--import"]]
+        unregister_calls = [
+            args for args in subprocess_calls if args[:2] == ["wsl", "--unregister"]
+        ]
+        self.assertEqual(len(import_calls), 2)
+        self.assertEqual(len(unregister_calls), 1)
 
 
 if __name__ == "__main__":

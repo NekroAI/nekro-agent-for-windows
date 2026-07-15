@@ -36,6 +36,24 @@ BACKUP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 BACKUP_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*\.tar\.gz$")
 
 
+class _ExclusiveHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = False
+
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+class _ExclusiveTCPServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = False
+
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 def _utc_now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -470,11 +488,7 @@ class LauncherDaemonFacade:
         try:
             if self._http_server is None:
                 handler_cls = self._make_http_handler()
-
-                class ReusableHTTPServer(ThreadingHTTPServer):
-                    allow_reuse_address = True
-
-                self._http_server = ReusableHTTPServer(
+                self._http_server = _ExclusiveHTTPServer(
                     (self.http_host, self.http_port),
                     handler_cls,
                 )
@@ -486,11 +500,7 @@ class LauncherDaemonFacade:
                 self._http_thread.start()
             if self._socks_server is None:
                 socks_cls = self._make_socks_handler()
-
-                class ReusableTCPServer(socketserver.ThreadingTCPServer):
-                    allow_reuse_address = True
-
-                self._socks_server = ReusableTCPServer(
+                self._socks_server = _ExclusiveTCPServer(
                     (self.socks_host, self.socks_port),
                     socks_cls,
                 )

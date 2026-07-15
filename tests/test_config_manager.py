@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from core.config_manager import ConfigManager
 
@@ -37,6 +38,49 @@ class ConfigManagerTests(unittest.TestCase):
             self.assertIsNotNone(inst)
             assert inst is not None
             self.assertTrue(inst.get("preview_backup_available"))
+
+    def test_failed_save_rolls_back_global_and_instance_changes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = ConfigManager(config_path=os.path.join(temp_dir, "config.json"))
+            self.assertTrue(config.set_instance("default", {"nekro_port": 8021}))
+            self.assertTrue(config.set("active_instance", "default"))
+
+            with patch.object(config, "_save_config_locked", return_value=False):
+                saved = config.update_instance_with_globals(
+                    "default",
+                    instance_updates={"nekro_port": 19001},
+                    global_updates={"nekro_port": 19001},
+                )
+
+            self.assertFalse(saved)
+            self.assertEqual(config.get("nekro_port"), 8021)
+            inst = config.get_instance("default")
+            self.assertIsNotNone(inst)
+            assert inst is not None
+            self.assertEqual(inst.get("nekro_port"), 8021)
+
+    def test_set_copies_mutable_values_before_storing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = ConfigManager(config_path=os.path.join(temp_dir, "config.json"))
+            value = {"port": "8021"}
+
+            self.assertTrue(config.set("deploy_info", value))
+            value["port"] = "19001"
+
+            self.assertEqual(config.get("deploy_info"), {"port": "8021"})
+
+    def test_real_save_failure_keeps_previous_in_memory_value(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            blocker = os.path.join(temp_dir, "blocker")
+            with open(blocker, "w", encoding="utf-8") as f:
+                f.write("not a directory")
+            config = ConfigManager(config_path=os.path.join(blocker, "config.json"))
+
+            saved = config.set("nekro_port", 19001)
+
+            self.assertFalse(saved)
+            self.assertEqual(config.get("nekro_port"), 8021)
+            self.assertTrue(config.last_save_error)
 
 
 if __name__ == "__main__":

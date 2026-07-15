@@ -26,8 +26,8 @@ _NAV_HOOK_JS = r"""
     function notify() {
         try {
             var payload = JSON.stringify({url: location.href, title: document.title || ''});
-            if (window.pywebview && window.pywebview.api && window.pywebview.api.on_nav_change) {
-                window.pywebview.api.on_nav_change(payload);
+            if (window.qtwebview2 && window.qtwebview2.api && window.qtwebview2.api.on_nav_change) {
+                window.qtwebview2.api.on_nav_change(payload);
             }
         } catch(e) {}
     }
@@ -148,7 +148,7 @@ class WebViewWidget(QWidget):
             pass
 
     def _on_nav_change(self, payload_json):
-        """Called from JS via pywebview.api bridge."""
+        """Called from JS via the qtwebview2.api bridge."""
         try:
             msg = json.loads(payload_json)
         except (json.JSONDecodeError, TypeError):
@@ -163,7 +163,7 @@ class WebViewWidget(QWidget):
             QTimer.singleShot(0, lambda t=new_title: self.titleChanged.emit(t))
 
     def _on_fill_result(self, result_json):
-        """Called from JS via pywebview.api bridge after credential fill."""
+        """Called from JS via qtwebview2.api after credential fill."""
         cb = self._fill_callback
         self._fill_callback = None
         if cb:

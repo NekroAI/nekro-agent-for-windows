@@ -23,6 +23,9 @@ class _StopFailureTakeoverDummy(WSLDiscoveryMixin):
     def _distro_exists(self):
         return True
 
+    def _check_migration_destination_conflicts(self, _paths):
+        return True
+
     def _get_running_source_services(self, _distro, _deploy_dir):
         return ["nekro_agent", "nekro_postgres"]
 
@@ -35,16 +38,20 @@ class _StopFailureTakeoverDummy(WSLDiscoveryMixin):
 
 
 class _MigrationFlowDummy(WSLDiscoveryMixin):
-    def __init__(self, *, running_services=None, pack_ok=True):
+    def __init__(self, *, running_services=None, pack_ok=True, conflicts=None):
         self.log_received = _Signal()
         self.progress_updated = _Signal()
         self.running_services = list(running_services or [])
         self.pack_ok = pack_ok
         self.stop_calls = []
         self.start_calls = []
+        self.conflicts = list(conflicts or [])
 
     def _distro_exists(self):
         return True
+
+    def _find_migration_destination_conflicts(self, _paths):
+        return self.conflicts
 
     def _get_running_source_services(self, distro, deploy_dir):
         self.probed = (distro, deploy_dir)
@@ -67,7 +74,13 @@ class _MigrationFlowDummy(WSLDiscoveryMixin):
     def _pack_via_windows_temp(self, *_args):
         return ""
 
-    def _restore_data(self, _archive_path):
+    def _create_migration_staging_dir(self):
+        return "/root/.nekro-agent-migrate.test"
+
+    def _prepare_target_docker_for_migration(self):
+        return False
+
+    def _restore_data(self, _archive_path, _staging_dir):
         return True
 
     def _relocate_dir(self, _src, _dest, timeout=120):
@@ -76,8 +89,14 @@ class _MigrationFlowDummy(WSLDiscoveryMixin):
     def _cleanup_archive(self, _src_distro, _archive_path):
         return None
 
-    def _sync_config_from_env(self, *_args):
+    def _cleanup_migration_staging_dir(self, _staging_dir):
         return None
+
+    def _wsl_path_exists(self, _distro, _path, *, user="root"):
+        return False
+
+    def _sync_config_from_env(self, *_args):
+        return True
 
 
 class _RestoreDummy(WSLDiscoveryMixin, WSLShellMixin):
@@ -114,7 +133,71 @@ class _RestoreDummy(WSLDiscoveryMixin, WSLShellMixin):
         return subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
 
 
+class _RelocateDummy(WSLDiscoveryMixin, WSLShellMixin):
+    def __init__(self, existing_paths):
+        self.log_received = _Signal()
+        self.existing_paths = set(existing_paths)
+        self.commands = []
+
+    def _wsl_path_exists(self, _distro, path, *, user="root"):
+        return path in self.existing_paths
+
+    def _wsl_run(self, distro, cmd, timeout=60, user=None):
+        self.commands.append((distro, cmd, timeout, user))
+        return subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
+
+
 class WSLDiscoveryMigrationTests(unittest.TestCase):
+    def test_config_sync_failure_is_reported(self):
+        class Config:
+            last_save_error = "配置目录只读"
+
+            def get_instance(self, _inst_id):
+                return None
+
+            def next_instance_id(self):
+                return "inst_2"
+
+            def get_default_instance_id(self):
+                return "default"
+
+            def update_instance_with_globals(self, *_args, **_kwargs):
+                return False
+
+        backend = WSLDiscoveryMixin()
+        backend.config = Config()
+        backend.log_received = _Signal()
+
+        saved = backend._sync_config_from_env({}, "lite")
+
+        self.assertFalse(saved)
+        message, level = backend.log_received.messages[-1]
+        self.assertEqual(level, "error")
+        self.assertIn("配置目录只读", message)
+
+    def test_destination_conflict_aborts_before_source_is_stopped(self):
+        backend = _MigrationFlowDummy(
+            running_services=["nekro_agent"],
+            conflicts=["/root/nekro_agent", "/var/lib/docker/volumes/nekro_postgres_data"],
+        )
+        instance = {
+            "distro": "Ubuntu",
+            "deploy_dir": "/root/nekro_agent",
+            "data_dir": "/root/nekro_agent_data",
+            "env": {},
+            "deploy_mode": "lite",
+        }
+
+        self.assertFalse(backend._takeover_foreign(instance))
+
+        self.assertEqual(backend.stop_calls, [])
+        self.assertFalse(hasattr(backend, "probed"))
+        message, level = backend.log_received.messages[-1]
+        self.assertEqual(level, "error")
+        self.assertIn("避免覆盖或合并", message)
+        self.assertIn("/root/nekro_agent", message)
+        self.assertIn("INSTANCE_NAME", message)
+
     def test_stale_stopped_status_still_stops_actually_running_source(self):
         backend = _MigrationFlowDummy(running_services=["nekro_agent"])
         instance = {
@@ -199,37 +282,68 @@ class WSLDiscoveryMigrationTests(unittest.TestCase):
         self.assertIn("docker compose", message)
         self.assertIn("compose stop failed", message)
 
-    def test_restore_failure_keeps_docker_stopped_when_it_was_running(self):
+    def test_restore_failure_only_extracts_into_staging_directory(self):
         backend = _RestoreDummy(docker_active=True, restore_returncode=2)
 
-        self.assertFalse(backend._restore_data("/mnt/wsl/na_migrate.tar.gz"))
+        self.assertFalse(
+            backend._restore_data(
+                "/mnt/wsl/na_migrate.tar.gz",
+                "/root/.nekro-agent-migrate.test",
+            )
+        )
 
         commands = [cmd for _distro, cmd, _timeout, _user in backend.commands]
+        self.assertTrue(commands[0].startswith("tar -tzf /mnt/wsl/na_migrate.tar.gz"))
         self.assertEqual(
-            commands,
-            [
-                "systemctl is-active docker",
-                "systemctl stop docker",
-                "tar -xzf /mnt/wsl/na_migrate.tar.gz -C /",
-            ],
+            commands[1],
+            "tar -xzf /mnt/wsl/na_migrate.tar.gz "
+            "-C /root/.nekro-agent-migrate.test --keep-old-files",
         )
+        self.assertNotIn("-C / ", commands[1])
         message, level = backend.log_received.messages[-1]
         self.assertEqual(level, "error")
-        self.assertIn("目标 Docker 已保持停止", message)
+        self.assertIn("数据还原失败", message)
 
-    def test_restore_keeps_docker_stopped_when_it_was_inactive(self):
+    def test_prepare_target_docker_only_stops_it_when_active(self):
+        active_backend = _RestoreDummy(docker_active=True)
+        inactive_backend = _RestoreDummy(docker_active=False)
+
+        self.assertTrue(active_backend._prepare_target_docker_for_migration())
+        self.assertFalse(inactive_backend._prepare_target_docker_for_migration())
+
+        active_commands = [cmd for _distro, cmd, _timeout, _user in active_backend.commands]
+        inactive_commands = [cmd for _distro, cmd, _timeout, _user in inactive_backend.commands]
+        self.assertEqual(
+            active_commands,
+            ["systemctl is-active docker", "systemctl stop docker"],
+        )
+        self.assertEqual(inactive_commands, ["systemctl is-active docker"])
+
+    def test_restore_succeeds_in_empty_staging_directory(self):
         backend = _RestoreDummy(docker_active=False)
 
-        self.assertTrue(backend._restore_data("/mnt/wsl/na_migrate.tar.gz"))
+        self.assertTrue(
+            backend._restore_data(
+                "/mnt/wsl/na_migrate.tar.gz",
+                "/root/.nekro-agent-migrate.test",
+            )
+        )
 
         commands = [cmd for _distro, cmd, _timeout, _user in backend.commands]
-        self.assertEqual(
-            commands,
-            [
-                "systemctl is-active docker",
-                "tar -xzf /mnt/wsl/na_migrate.tar.gz -C /",
-            ],
-        )
+        self.assertEqual(len(commands), 2)
+        self.assertIn("-C /root/.nekro-agent-migrate.test", commands[1])
+
+    def test_relocate_refuses_existing_destination_without_running_move(self):
+        src = "/root/.nekro-agent-migrate.test/root/nekro_agent"
+        dest = "/root/nekro_agent"
+        backend = _RelocateDummy({src, dest})
+
+        self.assertFalse(backend._relocate_dir(src, dest))
+
+        self.assertEqual(backend.commands, [])
+        message, level = backend.log_received.messages[-1]
+        self.assertEqual(level, "error")
+        self.assertIn("拒绝覆盖或合并", message)
 
     @mock.patch("core.wsl.discovery.time.sleep")
     def test_restore_reports_failure_when_original_docker_state_cannot_be_restored(
@@ -238,7 +352,7 @@ class WSLDiscoveryMigrationTests(unittest.TestCase):
     ):
         backend = _RestoreDummy(docker_active=True, start_returncode=1)
 
-        self.assertFalse(backend._restore_data("/mnt/wsl/na_migrate.tar.gz"))
+        self.assertFalse(backend._restore_target_docker_after_migration())
 
         message, level = backend.log_received.messages[-1]
         self.assertEqual(level, "error")

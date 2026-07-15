@@ -27,6 +27,58 @@ from ui.styles import STYLESHEET
 STATUS_INFO_STYLE = "font-size: 12px; color: #7a8d9f;"
 STATUS_ERROR_STYLE = "font-size: 12px; color: #e26050;"
 
+# 对话框关闭后，网络请求仍可能等到超时才返回。这里在应用进程级持有
+# 已解除 parent 的线程和 worker，直到线程真正结束，避免 QThread 被提前销毁。
+_DETACHED_DOWNLOADS = []
+_DOWNLOAD_SHUTDOWN_HOOKED = False
+
+
+def _shutdown_downloads(wait_ms=750):
+    """应用退出时确保下载线程停止，避免 QThread 在运行中被析构。"""
+    pairs = list(_DETACHED_DOWNLOADS)
+    for worker, thread in pairs:
+        if thread.isRunning():
+            worker.cancel()
+            thread.requestInterruption()
+            thread.quit()
+
+    for _worker, thread in pairs:
+        if not thread.isRunning() or thread.wait(wait_ms):
+            continue
+        # 网络调用可能仍阻塞到 requests 超时。这里只在 QApplication 已进入
+        # aboutToQuit 后兜底终止；普通对话框关闭绝不强制终止线程。
+        thread.terminate()
+        thread.wait(wait_ms)
+
+
+def _ensure_download_shutdown_hook():
+    global _DOWNLOAD_SHUTDOWN_HOOKED
+    if _DOWNLOAD_SHUTDOWN_HOOKED:
+        return
+    from PyQt6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    if app is not None:
+        app.aboutToQuit.connect(_shutdown_downloads)
+        _DOWNLOAD_SHUTDOWN_HOOKED = True
+
+
+def _retain_download_until_finished(worker, thread):
+    pair = (worker, thread)
+    if pair in _DETACHED_DOWNLOADS:
+        return
+    _DETACHED_DOWNLOADS.append(pair)
+    _ensure_download_shutdown_hook()
+
+    def release():
+        try:
+            _DETACHED_DOWNLOADS.remove(pair)
+        except ValueError:
+            pass
+        thread.deleteLater()
+
+    thread.finished.connect(release)
+
 
 def _md_to_html(md: str) -> str:
     """将 GitHub Release 常见 Markdown 转为 Qt 富文本 HTML。
@@ -160,9 +212,6 @@ class AppUpdateDialog(QDialog):
         self._download_worker = None
         self._download_thread = None
         self._launch_timer_id = None
-        # 取消时仍未退出的下载线程挂在这里，等 finished 后再释放，
-        # 避免跨线程删除仍在运行的 worker/QThread 导致崩溃。
-        self._orphan_downloads = []
 
         self.setWindowTitle("发现新版本")
         self.setMinimumWidth(480)
@@ -327,14 +376,26 @@ class AppUpdateDialog(QDialog):
         self._status_label.setStyleSheet(STATUS_INFO_STYLE)
         self._status_label.setText("正在连接下载源...")
 
-        self._download_worker = DownloadWorker(url, name)
+        expected_size = self._info.get("file_size", 0)
+        if not isinstance(expected_size, int):
+            expected_size = 0
+        expected_sha256 = self._info.get("file_sha256", "")
+        self._download_worker = DownloadWorker(
+            url,
+            name,
+            expected_size,
+            str(expected_sha256 or ""),
+        )
         self._download_thread = QThread(self)
         self._download_worker.moveToThread(self._download_thread)
 
         self._download_worker.progress.connect(self._on_progress)
         self._download_worker.mirror_info.connect(self._on_mirror_info)
         self._download_worker.finished.connect(self._on_download_finished)
+        self._download_worker.finished.connect(self._download_worker.deleteLater)
+        self._download_worker.finished.connect(self._download_thread.quit)
         self._download_thread.started.connect(self._download_worker.run)
+        _retain_download_until_finished(self._download_worker, self._download_thread)
 
         self._download_thread.start()
 
@@ -365,19 +426,19 @@ class AppUpdateDialog(QDialog):
 
         if thread.isRunning():
             worker.cancel()
-            for signal in (worker.progress, worker.mirror_info, worker.finished):
+            connections = (
+                (worker.progress, self._on_progress),
+                (worker.mirror_info, self._on_mirror_info),
+                (worker.finished, self._on_download_finished),
+            )
+            for signal, slot in connections:
                 try:
-                    signal.disconnect()
+                    signal.disconnect(slot)
                 except TypeError:
                     pass
-            thread.quit()
-            if not thread.wait(3000):
-                # 线程可能阻塞在网络 IO 上；不能在它运行期间销毁对象，
-                # 挂起引用并推迟到线程真正结束后再 deleteLater。
-                self._orphan_downloads.append((worker, thread))
-                thread.finished.connect(worker.deleteLater)
-                thread.finished.connect(thread.deleteLater)
-                return
+            thread.setParent(None)
+            _retain_download_until_finished(worker, thread)
+            return
 
         worker.deleteLater()
         thread.deleteLater()
@@ -386,8 +447,12 @@ class AppUpdateDialog(QDialog):
         if self._download_thread is None:
             # 取消清理后仍可能收到已入队的完成信号，直接忽略
             return
-        self._download_thread.quit()
-        self._download_thread.wait(3000)
+        worker = self._download_worker
+        thread = self._download_thread
+        self._download_worker = None
+        self._download_thread = None
+        thread.setParent(None)
+        _retain_download_until_finished(worker, thread)
 
         if success:
             self._progress_bar.setRange(0, 100)

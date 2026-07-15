@@ -1,3 +1,4 @@
+import socket
 import unittest
 
 from core.port_utils import (
@@ -34,6 +35,18 @@ class PortUtilsTests(unittest.TestCase):
             ignore_ports={"8021"},
         )
         self.assertTrue(ok, message)
+
+    def test_validate_port_bindings_rejects_listening_socket(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            port = listener.getsockname()[1]
+
+            ok, message = validate_port_bindings([("Nekro Agent 端口", port)])
+
+        self.assertFalse(ok)
+        self.assertIn(str(port), message)
 
     def test_validate_instance_port_conflicts_rejects_other_instance_port(self):
         instances = [

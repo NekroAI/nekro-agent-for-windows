@@ -49,9 +49,18 @@ class WSLManager(
         self._pending_deploy_info = None
         self._update_optional_reply = None
         self._deploy_optional_reply = None
+        self.launcher_daemon_start_error = ""
         self.launcher_daemon = LauncherDaemonFacade(self)
         try:
             self.launcher_daemon.start()
             self.log_received.emit("Windows 启动器 daemon facade 已启动", "debug")
         except Exception as e:
-            self.log_received.emit(f"Windows 启动器 daemon facade 启动失败: {e}", "warn")
+            self.launcher_daemon_start_error = (
+                "Windows 启动器后台服务无法监听本机端口。"
+                "可能已有另一个启动器进程正在运行，请关闭重复进程后重试。\n"
+                f"错误: {type(e).__name__}: {e}"
+            )
+            self.log_received.emit(
+                f"Windows 启动器 daemon facade 启动失败: {e}",
+                "warn",
+            )

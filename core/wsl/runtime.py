@@ -1,4 +1,6 @@
 import os
+import secrets
+import shlex
 import subprocess
 import tempfile
 import threading
@@ -9,6 +11,9 @@ from core.wsl.constants import DISTRO_NAME, ROOTFS_URLS
 
 
 class WSLRuntimeMixin:
+    _RUNTIME_INSTALL_MARKER = ".nekroagent-runtime-installing"
+    _RUNTIME_GUEST_MARKER = "/etc/nekroagent-launcher-install-id"
+
     def get_host_access_path(self, guest_path=None):
         if guest_path is None and hasattr(self, 'config') and self.config:
             guest_path = self.config.get_active_data_dir()
@@ -24,6 +29,107 @@ class WSLRuntimeMixin:
 
     def create_runtime(self, install_dir):
         return self._create_distro(install_dir)
+
+    def _runtime_install_marker_path(self, install_dir):
+        return os.path.join(install_dir, self._RUNTIME_INSTALL_MARKER)
+
+    def _read_runtime_install_marker(self, install_dir):
+        marker_path = self._runtime_install_marker_path(install_dir)
+        try:
+            with open(marker_path, encoding="utf-8") as marker_file:
+                return marker_file.read().strip()
+        except FileNotFoundError:
+            return ""
+        except OSError as e:
+            detail = (
+                "[发行版创建] 读取恢复标记失败\n"
+                f"文件: {marker_path}\n"
+                f"异常: {type(e).__name__}: {e}"
+            )
+            self.log_received.emit(detail, "error")
+            self.install_error.emit(detail)
+            return ""
+
+    def _write_runtime_install_marker(self, install_dir, token):
+        marker_path = self._runtime_install_marker_path(install_dir)
+        try:
+            with open(marker_path, "w", encoding="utf-8", newline="") as marker_file:
+                marker_file.write(f"{token}\n")
+            return True
+        except OSError as e:
+            detail = (
+                "[发行版创建] 写入恢复标记失败\n"
+                f"文件: {marker_path}\n"
+                f"异常: {type(e).__name__}: {e}"
+            )
+            self.log_received.emit(detail, "error")
+            self.install_error.emit(detail)
+            return False
+
+    def _runtime_guest_marker_matches(self, token):
+        marker = self._wsl_exec(
+            DISTRO_NAME,
+            f"cat {shlex.quote(self._RUNTIME_GUEST_MARKER)} 2>/dev/null",
+            timeout=20,
+            user="root",
+        ).strip()
+        return bool(token) and marker == token
+
+    def _cleanup_runtime_install_markers(self, install_dir):
+        try:
+            self._wsl_run(
+                DISTRO_NAME,
+                f"rm -f -- {shlex.quote(self._RUNTIME_GUEST_MARKER)}",
+                timeout=20,
+                user="root",
+            )
+        except Exception:
+            pass
+        try:
+            os.remove(self._runtime_install_marker_path(install_dir))
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            self.log_received.emit(f"[发行版创建] 清理恢复标记失败: {e}", "warn")
+
+    def _discard_failed_runtime_import(self):
+        """清理本次创建留下的半导入发行版，使向导可以安全重试。"""
+        try:
+            if not self._distro_exists():
+                return True
+            proc = subprocess.run(
+                ["wsl", "--unregister", DISTRO_NAME],
+                capture_output=True,
+                timeout=120,
+                creationflags=self._creation_flags(),
+            )
+            if proc.returncode == 0:
+                self.log_received.emit(
+                    f"[发行版创建] 已清理失败后残留的 {DISTRO_NAME} 半成品发行版",
+                    "warn",
+                )
+                return True
+            detail = self._format_command_failure(
+                "[发行版创建] 清理半成品 WSL 发行版失败",
+                args=["wsl", "--unregister", DISTRO_NAME],
+                timeout=120,
+                returncode=proc.returncode,
+                stdout=proc.stdout,
+                stderr=proc.stderr,
+            )
+        except Exception as e:
+            detail = self._format_command_failure(
+                "[发行版创建] 清理半成品 WSL 发行版异常",
+                args=["wsl", "--unregister", DISTRO_NAME],
+                timeout=120,
+                exception=e,
+            )
+        self.log_received.emit(detail, "error")
+        self.install_error.emit(
+            detail
+            + "\n请手动执行 wsl --unregister NekroAgent 清理半成品后再重试。"
+        )
+        return False
 
     def _create_distro(self, install_dir):
         """下载 Ubuntu rootfs 并用 wsl --import 创建专用发行版（同步，在线程中调用）"""
@@ -44,68 +150,101 @@ class WSLRuntimeMixin:
             self.install_error.emit(detail)
             return False
 
-        self.log_received.emit("[发行版创建] 2/4 下载 Ubuntu rootfs...", "info")
-        rootfs_path = os.path.join(install_dir, "rootfs.tar.gz")
-        if not self._download_rootfs(rootfs_path):
-            self.log_received.emit("[发行版创建] ✗ rootfs 下载失败", "error")
-            return False
-        self.log_received.emit("[发行版创建] ✓ rootfs 下载完成", "info")
-
-        self.progress_updated.emit("正在导入 WSL 发行版...")
-        self.log_received.emit("[发行版创建] 3/4 导入 WSL 发行版...", "info")
-        try:
-            proc = subprocess.run(
-                ["wsl", "--import", DISTRO_NAME, install_dir, rootfs_path],
-                capture_output=True,
-                timeout=300,
-                creationflags=self._creation_flags(),
-            )
-            if proc.returncode != 0:
-                detail = self._format_command_failure(
-                    "[发行版创建] WSL 导入失败",
-                    args=["wsl", "--import", DISTRO_NAME, install_dir, rootfs_path],
-                    timeout=300,
-                    returncode=proc.returncode,
-                    stdout=proc.stdout,
-                    stderr=proc.stderr,
+        install_token = self._read_runtime_install_marker(install_dir)
+        distro_exists = self._distro_exists()
+        resuming_import = False
+        if distro_exists:
+            if not install_token or not self._runtime_guest_marker_matches(install_token):
+                detail = (
+                    f"[发行版创建] {DISTRO_NAME} 发行版已存在，但它不属于本次未完成的创建任务。\n"
+                    "为避免覆盖或误用现有运行环境，启动器不会再次导入或继续配置。\n"
+                    "请在确认无需保留后通过启动器卸载现有运行环境，或选择原创建任务的安装目录重试。"
                 )
-                self.progress_updated.emit("导入失败")
                 self.log_received.emit(detail, "error")
                 self.install_error.emit(detail)
                 return False
+            resuming_import = True
             self.log_received.emit(
-                f"[发行版创建] ✓ {DISTRO_NAME} 发行版导入完成", "info"
+                f"[发行版创建] 检测到 {DISTRO_NAME} 的未完成安装，跳过重复导入并继续配置",
+                "warn",
             )
-        except subprocess.TimeoutExpired as e:
-            detail = self._format_command_failure(
-                "[发行版创建] WSL 导入超时",
-                args=["wsl", "--import", DISTRO_NAME, install_dir, rootfs_path],
-                timeout=300,
-                stdout=e.stdout,
-                stderr=e.stderr,
-                exception=e,
-            )
-            self.progress_updated.emit("导入超时")
-            self.log_received.emit(detail, "error")
-            self.install_error.emit(detail)
-            return False
-        except Exception as e:
-            detail = self._format_command_failure(
-                "[发行版创建] WSL 导入异常",
-                args=["wsl", "--import", DISTRO_NAME, install_dir, rootfs_path],
-                timeout=300,
-                exception=e,
-            )
-            self.progress_updated.emit(f"导入异常: {e}")
-            self.log_received.emit(detail, "error")
-            self.install_error.emit(detail)
-            return False
+        else:
+            if not install_token:
+                install_token = secrets.token_hex(24)
+            if not self._write_runtime_install_marker(install_dir, install_token):
+                return False
 
-        try:
-            os.remove(rootfs_path)
-            self.log_received.emit("[发行版创建] ✓ 临时 rootfs 文件已清理", "info")
-        except Exception:
-            pass
+        rootfs_path = os.path.join(install_dir, "rootfs.tar.gz")
+        if not resuming_import:
+            self.log_received.emit("[发行版创建] 2/4 下载 Ubuntu rootfs...", "info")
+            if not self._download_rootfs(rootfs_path):
+                self.log_received.emit("[发行版创建] ✗ rootfs 下载失败", "error")
+                return False
+            self.log_received.emit("[发行版创建] ✓ rootfs 下载完成", "info")
+
+            self.progress_updated.emit("正在导入 WSL 发行版...")
+            self.log_received.emit("[发行版创建] 3/4 导入 WSL 发行版...", "info")
+            try:
+                proc = subprocess.run(
+                    ["wsl", "--import", DISTRO_NAME, install_dir, rootfs_path],
+                    capture_output=True,
+                    timeout=300,
+                    creationflags=self._creation_flags(),
+                )
+                if proc.returncode != 0:
+                    detail = self._format_command_failure(
+                        "[发行版创建] WSL 导入失败",
+                        args=["wsl", "--import", DISTRO_NAME, install_dir, rootfs_path],
+                        timeout=300,
+                        returncode=proc.returncode,
+                        stdout=proc.stdout,
+                        stderr=proc.stderr,
+                    )
+                    self.progress_updated.emit("导入失败")
+                    self.log_received.emit(detail, "error")
+                    self.install_error.emit(detail)
+                    self._discard_failed_runtime_import()
+                    return False
+                self.log_received.emit(
+                    f"[发行版创建] ✓ {DISTRO_NAME} 发行版导入完成", "info"
+                )
+                self._write_to_wsl(
+                    DISTRO_NAME,
+                    f"{install_token}\n",
+                    self._RUNTIME_GUEST_MARKER,
+                )
+            except subprocess.TimeoutExpired as e:
+                detail = self._format_command_failure(
+                    "[发行版创建] WSL 导入超时",
+                    args=["wsl", "--import", DISTRO_NAME, install_dir, rootfs_path],
+                    timeout=300,
+                    stdout=e.stdout,
+                    stderr=e.stderr,
+                    exception=e,
+                )
+                self.progress_updated.emit("导入超时")
+                self.log_received.emit(detail, "error")
+                self.install_error.emit(detail)
+                self._discard_failed_runtime_import()
+                return False
+            except Exception as e:
+                detail = self._format_command_failure(
+                    "[发行版创建] WSL 导入后写入恢复标记失败",
+                    args=["wsl", "--import", DISTRO_NAME, install_dir, rootfs_path],
+                    timeout=300,
+                    exception=e,
+                )
+                self.progress_updated.emit(f"导入异常: {e}")
+                self.log_received.emit(detail, "error")
+                self.install_error.emit(detail)
+                self._discard_failed_runtime_import()
+                return False
+
+            try:
+                os.remove(rootfs_path)
+                self.log_received.emit("[发行版创建] ✓ 临时 rootfs 文件已清理", "info")
+            except OSError:
+                pass
 
         self.progress_updated.emit("正在配置 WSL 环境...")
         self.log_received.emit(
@@ -165,7 +304,10 @@ default = root
             "[发行版创建] ✓ 发行版创建完成！开始安装 Docker...", "info"
         )
 
-        return self._install_docker_sync()
+        docker_ok = self._install_docker_sync()
+        if docker_ok:
+            self._cleanup_runtime_install_markers(install_dir)
+        return docker_ok
 
     def _download_rootfs(self, dest_path):
         """下载 Ubuntu rootfs，返回是否成功"""
