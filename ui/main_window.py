@@ -1095,7 +1095,8 @@ class MainWindow(QMainWindow):
         if not self.config.get("deploy_mode"):
             self._show_notice_dialog("提示", "尚未完成部署，无法执行升级。")
             return
-        if not self._service_ready():
+        # 升级失败后状态可能停在「更新失败」，只要服务仍在运行就允许重试。
+        if not self._service_active():
             self._show_notice_dialog(
                 "提示", "服务未处于运行中，无法执行升级。请先启动并等待服务就绪。"
             )
@@ -1403,7 +1404,17 @@ class MainWindow(QMainWindow):
             self.napcat_port_setting.setText(str(napcat_port))
         self._refresh_port_settings_ui()
         self._schedule_next_image_update_check()
-        self.start_deploy(show_logs=False, deploy_mode_override=mode)
+        started = self.start_deploy(show_logs=False, deploy_mode_override=mode)
+        if not started:
+            # 主窗口忙（更新中/配网中等）或前置检查失败时部署不会开始，
+            # 必须通知向导解除部署页的等待状态，否则它会永远停在「部署中...」。
+            self._is_first_deploy = False
+            if getattr(self, "_pending_inst_data", None):
+                self._rollback_pending_instance()
+            wizard = self.sender()
+            on_rejected = getattr(wizard, "on_deploy_request_rejected", None)
+            if callable(on_rejected):
+                on_rejected()
 
     _LOG_MAX_BLOCKS = 5000
     _LOG_PREVIEW_MAX_BLOCKS = 500
@@ -1949,6 +1960,13 @@ class MainWindow(QMainWindow):
         current = self.config.get_active_instance_id()
         if not inst_id or inst_id == current:
             return False
+        # 升级/部署等任务以 active 实例为目标，中途切换会让完成回调
+        # 读到另一个实例的端口与配置，把成功升级误判为失败。
+        if self._update_in_progress or self._blocking_status_detail():
+            self._show_notice_dialog(
+                "提示", "当前有部署或更新任务正在进行，请等待完成后再切换实例。"
+            )
+            return False
 
         inst = self._apply_active_instance_config(inst_id)
         if not inst:
@@ -1965,6 +1983,11 @@ class MainWindow(QMainWindow):
         return True
 
     def _show_instance_switch_dialog(self):
+        if self._update_in_progress or self._blocking_status_detail():
+            self._show_notice_dialog(
+                "提示", "当前有部署或更新任务正在进行，请等待完成后再切换实例。"
+            )
+            return
         instances = self.config.list_instances()
         if len(instances) <= 1:
             return
@@ -2082,10 +2105,11 @@ class MainWindow(QMainWindow):
         self.metric_data_dir.set_clickable(bool(host_data))
 
     def start_deploy(self, show_logs=True, deploy_mode_override=None):
+        """尝试发起部署；返回是否真正开始（False 表示被拒绝或前置检查未通过）。"""
         if not self._guard_napcat_network_config_busy("开始部署"):
-            return
+            return False
         if not self._guard_blocking_status_idle("开始部署"):
-            return
+            return False
 
         pending = getattr(self, "_pending_inst_data", None)
         is_new_instance = bool(pending)
@@ -2097,16 +2121,16 @@ class MainWindow(QMainWindow):
                     "当前 WSL 运行环境不存在或已被外部删除，请重新创建运行环境后再部署。",
                     danger=True,
                 )
-                return
+                return False
             self._apply_pending_instance()
         else:
             self._prev_active_instance = None
             self._prev_deploy_mode = None
             if self.backend.is_running:
                 self._show_notice_dialog("提示", "服务已在运行中")
-                return
+                return False
 
-        self._do_deploy(
+        return self._do_deploy(
             deploy_mode_override, show_logs, force_new_instance=is_new_instance
         )
 
@@ -2142,11 +2166,11 @@ class MainWindow(QMainWindow):
     def _do_deploy(
         self, deploy_mode_override=None, show_logs=True, force_new_instance=False
     ):
-        """实际执行部署（前置检查已通过）。"""
+        """实际执行部署（前置检查已通过）。返回是否已发起部署。"""
         deploy_mode = deploy_mode_override or self.config.get("deploy_mode")
         if not deploy_mode:
             self._show_first_run_dialog()
-            return
+            return False
         if not self._backend_runtime_exists():
             self._show_notice_dialog(
                 "运行环境缺失",
@@ -2154,7 +2178,7 @@ class MainWindow(QMainWindow):
                 danger=True,
             )
             self._show_first_run_dialog()
-            return
+            return False
 
         if show_logs:
             self.switch_tab(2)
@@ -2168,7 +2192,11 @@ class MainWindow(QMainWindow):
                 f"<span style='color:#7ce0a3;'>[INFO]</span> 开始部署服务 (模式: {deploy_mode})..."
             )
 
-        self.backend.start_services(deploy_mode, force_new_instance=force_new_instance)
+        return bool(
+            self.backend.start_services(
+                deploy_mode, force_new_instance=force_new_instance
+            )
+        )
 
     def _stop_services_for_mode_change(self):
         if not self._guard_napcat_network_config_busy("关闭服务"):
@@ -2282,9 +2310,11 @@ class MainWindow(QMainWindow):
             self.btn_new_instance_action.setEnabled(
                 not blocking and not self._napcat_network_config_in_progress
             )
+        # 升级失败后状态停在「更新失败」而非「运行中」，但容器往往仍在运行；
+        # 只要服务仍活着且无阻塞任务，就允许重试升级，否则按钮会永久锁死。
         can_update = (
             bool(self.config.get("deploy_mode"))
-            and running
+            and (running or service_active)
             and not blocking
             and not self._napcat_network_config_in_progress
         )
@@ -2329,7 +2359,11 @@ class MainWindow(QMainWindow):
                 self._pending_inst_data = None
                 self._prev_active_instance = None
                 self._prev_deploy_mode = None
-            if self._current_webview() is not None and not was_running:
+            if (
+                self._current_webview() is not None
+                and not was_running
+                and previous_status in {"启动中...", "更新中..."}
+            ):
                 self.switch_tab(1)
                 self._set_browser_target(self.current_browser_target, force_reload=True)
             self._clear_pull_progress()
@@ -2437,6 +2471,11 @@ class MainWindow(QMainWindow):
                 )
         else:
             self._finish_update_session(False, failure_title, message)
+            # 失败时 is_running 可能已失真（如恢复流程中途停了容器），
+            # 探测真实状态并重新发出「运行中/已停止」，避免按钮组永久锁死。
+            refresh_state = getattr(self.backend, "refresh_running_state", None)
+            if callable(refresh_state):
+                refresh_state()
         self.update_status_ui(self._last_status)
 
     def _clear_layout(self, layout):
@@ -3005,6 +3044,14 @@ class MainWindow(QMainWindow):
                     self._switch_log_reader_to_active_instance()
                     self._sync_browser_to_active_instance(force_reload=True)
                     self._refresh_log_tabs_for_active_instance()
+                    # 移除时 backend 已把 is_running 复位并发出「已停止」；
+                    # 新的 active 实例可能仍在运行，重新探测校准状态，
+                    # 保证「关闭服务」作用在正确的实例上。
+                    refresh_state = getattr(
+                        self.backend, "refresh_running_state", None
+                    )
+                    if callable(refresh_state):
+                        refresh_state()
                 else:
                     self.config.clear_runtime_state(keep_first_run=True)
                     self._sync_browser_to_active_instance(force_reload=False)

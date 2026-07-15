@@ -1,15 +1,41 @@
 import re
+import shlex
 import subprocess
 import threading
 import time
 from urllib.request import urlopen
 
 from core.port_utils import normalize_port
+from core.wsl.constants import DISTRO_NAME
 
 
 class WSLMonitorMixin:
     _health_generation: int = 0
     _health_lock = threading.Lock()
+
+    def refresh_running_state(self):
+        """后台探测当前 active 实例的 compose 服务是否仍在运行，校准 is_running。
+
+        用于更新失败、移除实例等 is_running 可能失真的场景；
+        探测完成后按真实状态发出「运行中」或「已停止」。
+        """
+
+        def _probe():
+            deploy_dir, _, _ = self._get_active_deploy_paths()
+            cmd = (
+                f"test -f {shlex.quote(deploy_dir)}/docker-compose.yml "
+                f"&& cd {shlex.quote(deploy_dir)} "
+                "&& docker compose -f docker-compose.yml ps --quiet --status running"
+            )
+            try:
+                output = self._wsl_exec(DISTRO_NAME, cmd, timeout=30)
+            except Exception:
+                return
+            running = bool(self._clean_command_output(output).strip())
+            self.is_running = running
+            self.status_changed.emit("运行中" if running else "已停止")
+
+        threading.Thread(target=_probe, daemon=True).start()
 
     def _log_reader(self, distro, deploy_dir, log_prefix="", inst_id=""):
         """通过 docker compose logs -f 流式读取日志"""

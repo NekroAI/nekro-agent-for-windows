@@ -1,4 +1,5 @@
 import json
+import queue
 import re
 import shlex
 import subprocess
@@ -604,10 +605,27 @@ class WSLImageMixin:
                 )
             ]
 
+        # readline() 在 Windows 管道上会无限阻塞，docker pull 长时间无输出时
+        # deadline 检查永远走不到；改为后台线程读行、主循环带超时轮询队列。
+        line_queue: queue.Queue = queue.Queue()
+
+        def _read_stdout():
+            try:
+                if proc.stdout:
+                    for raw_line in iter(proc.stdout.readline, b""):
+                        line_queue.put(raw_line)
+            except Exception:
+                pass
+            finally:
+                line_queue.put(None)
+
+        threading.Thread(target=_read_stdout, daemon=True).start()
+
         last_lines = []
         deadline = time.monotonic() + self._PULL_TIMEOUT
         while True:
-            if time.monotonic() > deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 proc.kill()
                 try:
                     proc.wait(timeout=5)
@@ -623,16 +641,18 @@ class WSLImageMixin:
                     )
                 )
                 return False, last_lines
-            line = proc.stdout.readline() if proc.stdout else b""
-            if not line and proc.poll() is not None:
+            try:
+                line = line_queue.get(timeout=min(remaining, 1.0))
+            except queue.Empty:
+                continue
+            if line is None:
                 break
-            if line:
-                text = self._safe_decode(line).strip()
-                if text and not self._is_wsl_noise(text):
-                    self._emit_pull_progress("update", text)
-                    last_lines.append(text)
-                    if len(last_lines) > 10:
-                        last_lines.pop(0)
+            text = self._safe_decode(line).strip()
+            if text and not self._is_wsl_noise(text):
+                self._emit_pull_progress("update", text)
+                last_lines.append(text)
+                if len(last_lines) > 10:
+                    last_lines.pop(0)
 
         proc.wait()
         if proc.returncode != 0:

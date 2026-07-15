@@ -1,6 +1,10 @@
+import threading
 import unittest
+from unittest import mock
 
+import core.wsl.images as images_module
 from core.wsl.images import WSLImageMixin
+from core.wsl.shell import WSLShellMixin
 
 
 class _Signal:
@@ -9,6 +13,38 @@ class _Signal:
 
     def emit(self, *args):
         self.messages.append(args)
+
+
+class _SilentPullProc:
+    """模拟 docker pull 启动后长时间不输出任何内容的进程。"""
+
+    def __init__(self):
+        self._killed = threading.Event()
+        self.stdout = self
+
+    def readline(self):
+        self._killed.wait()
+        return b""
+
+    def poll(self):
+        return 0 if self._killed.is_set() else None
+
+    def kill(self):
+        self._killed.set()
+
+    def wait(self, timeout=None):
+        return 0
+
+
+class _SilentPullDummy(WSLImageMixin, WSLShellMixin):
+    _PULL_TIMEOUT = 1
+
+    def __init__(self):
+        self.log_received = _Signal()
+        self.progress = []
+
+    def _emit_pull_progress(self, phase, message):
+        self.progress.append((phase, message))
 
 
 class _DummyImages(WSLImageMixin):
@@ -151,6 +187,20 @@ class WSLImageMixinTests(unittest.TestCase):
         self.assertTrue(backend._pull_images("NekroAgent", ["postgres:14"]))
         self.assertEqual(backend.progress[0][0], "stage")
         self.assertNotIn("speedtest", [phase for phase, _message in backend.progress])
+
+    def test_pull_image_once_times_out_when_docker_pull_stays_silent(self):
+        backend = _SilentPullDummy()
+        proc = _SilentPullProc()
+
+        # 旧实现阻塞在 readline() 上，无输出时永远走不到超时分支
+        with mock.patch.object(images_module.subprocess, "Popen", return_value=proc):
+            ok, lines = backend._pull_image_once(
+                "NekroAgent", "kromiose/nekro-agent:latest"
+            )
+
+        self.assertFalse(ok)
+        self.assertTrue(proc._killed.is_set())
+        self.assertTrue(any("镜像拉取超时" in line for line in lines))
 
 
 if __name__ == "__main__":

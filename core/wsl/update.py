@@ -136,6 +136,17 @@ class WSLUpdateMixin:
         def _do_update():
             self._stop_event.clear()
             self.status_changed.emit("更新中...")
+            # 升级期间用户可能切换 active 实例；发起时就锁定本次升级
+            # 面向的实例与端口，完成后的日志/健康检查不能跟着 config 漂移。
+            inst_id = self.config.get_active_instance_id() if self.config else ""
+            inst = (
+                self.config.get_instance(inst_id) if self.config and inst_id else None
+            ) or {}
+            nekro_port = normalize_port(
+                inst.get("nekro_port")
+                or (self.config.get("nekro_port") if self.config else None),
+                8021,
+            )
             agent_image = self.get_agent_image_ref(self.config)
             steps = build_update_plan(agent_image)
             log_update_plan(self.log_received.emit, steps)
@@ -215,14 +226,8 @@ class WSLUpdateMixin:
 
             self._emit_pull_progress("done", "更新完成")
             self.is_running = True
-            inst_id = self.config.get_active_instance_id() if self.config else ""
             inst_display = inst_id if inst_id and inst_id != "default" else ""
             log_prefix = f"[{inst_display}] " if inst_display else ""
-            nekro_port = (
-                normalize_port(self.config.get("nekro_port"), 8021)
-                if self.config
-                else 8021
-            )
             if self._log_process is None or self._log_process.poll() is not None:
                 threading.Thread(
                     target=self._log_reader,
@@ -546,17 +551,19 @@ class WSLUpdateMixin:
             self._daemon_add_log(job, "已清理一个恢复目标目录", ctx=ctx, sensitive_paths=[target])
 
     def _daemon_restore_archive(self, ctx, job, archive_path, *, action):
-        cmd = f"tar -xzf {shlex.quote(archive_path)} -C /"
+        # 修复前生成的混合归档可能包含其它实例（尤其默认实例）的路径，
+        # 一律按当前实例的白名单成员显式解包，绝不整包解压到 /。
+        targets = self._daemon_restore_targets_in_archive(ctx, archive_path)
+        if not targets:
+            raise RuntimeError(
+                "备份归档中未找到当前实例的可恢复目录（归档损坏或不属于该实例），已拒绝解包。"
+            )
+        member_args = " ".join(shlex.quote(target.lstrip("/")) for target in targets)
+        cmd = f"tar -xzf {shlex.quote(archive_path)} -C / {member_args}"
         try:
             self._daemon_exec(ctx, job, cmd, timeout=600, action=action)
             return
         except Exception as first_error:
-            targets = self._daemon_restore_targets_in_archive(ctx, archive_path)
-            if not targets:
-                raise RuntimeError(
-                    self._daemon_redact_text(str(first_error), ctx=ctx, sensitive_paths=[archive_path])
-                ) from first_error
-
             self._daemon_add_log(
                 job,
                 "直接恢复失败，尝试通过临时 Alpine 容器清理目标目录后重试",
@@ -695,6 +702,10 @@ class WSLUpdateMixin:
             return True
         return False
 
+    def _daemon_emit_cancelled_status(self):
+        """任务取消后按当前运行状态复位状态栏，避免停留在「更新中...」。"""
+        self.status_changed.emit("运行中" if self.is_running else "已停止")
+
     def run_daemon_backup_job(self, request: dict, job):
         """执行 daemon facade 的手动备份任务。"""
         ctx = self._daemon_context(request)
@@ -739,6 +750,7 @@ class WSLUpdateMixin:
             self._daemon_fail(job, "backup_not_found", f"未找到备份: {backup_id}", ctx=ctx)
             return
         if self._daemon_cancelled(job):
+            self._daemon_emit_cancelled_status()
             return
         job.set_progress("restore", 1, 4, "正在停止服务并恢复备份")
         try:
@@ -771,6 +783,7 @@ class WSLUpdateMixin:
         job.set_progress("verify", 3, 4, "等待服务健康检查通过")
         health = self._wait_daemon_update_health(job, ctx["nekro_port"])
         if health is None:
+            self._daemon_emit_cancelled_status()
             return
         if not health:
             self.status_changed.emit("更新失败")
@@ -870,6 +883,7 @@ class WSLUpdateMixin:
         backup_summary = None
         for index, step in enumerate(steps, start=2):
             if self._daemon_cancelled(job):
+                self._daemon_emit_cancelled_status()
                 return
             step_type = str(step.get("type") or "")
             label = str(step.get("label") or "")
@@ -965,6 +979,7 @@ class WSLUpdateMixin:
                 if step_type == "verify":
                     health = self._wait_daemon_update_health(job, ctx["nekro_port"])
                     if health is None:
+                        self._daemon_emit_cancelled_status()
                         return
                     if not health:
                         self.status_changed.emit("更新失败")
@@ -1076,6 +1091,16 @@ class WSLUpdateMixin:
             self._stop_event.clear()
             self.status_changed.emit("更新中...")
             self.log_received.emit("[预览版] 开始切换到预览版 Nekro Agent", "info")
+            # 锁定发起时的实例与端口，防止切换实例后写错目标（见 run_remote_update）。
+            inst_id = self.config.get_active_instance_id() if self.config else ""
+            inst = (
+                self.config.get_instance(inst_id) if self.config and inst_id else None
+            ) or {}
+            nekro_port = normalize_port(
+                inst.get("nekro_port")
+                or (self.config.get("nekro_port") if self.config else None),
+                8021,
+            )
 
             try:
                 if create_backup:
@@ -1121,14 +1146,8 @@ class WSLUpdateMixin:
 
                 self._emit_pull_progress("done", "预览版切换完成")
                 self.is_running = True
-                inst_id = self.config.get_active_instance_id() if self.config else ""
                 inst_display = inst_id if inst_id and inst_id != "default" else ""
                 log_prefix = f"[{inst_display}] " if inst_display else ""
-                nekro_port = (
-                    normalize_port(self.config.get("nekro_port"), 8021)
-                    if self.config
-                    else 8021
-                )
                 if self.config:
                     preview_available = bool(create_backup)
                     if inst_id:
@@ -1221,6 +1240,16 @@ class WSLUpdateMixin:
             self._stop_event.clear()
             self.status_changed.emit("更新中...")
             self.log_received.emit("[恢复正式版] 开始从预览版备份恢复正式版", "info")
+            # 锁定发起时的实例与端口，防止切换实例后写错目标（见 run_remote_update）。
+            inst_id = self.config.get_active_instance_id() if self.config else ""
+            inst = (
+                self.config.get_instance(inst_id) if self.config and inst_id else None
+            ) or {}
+            nekro_port = normalize_port(
+                inst.get("nekro_port")
+                or (self.config.get("nekro_port") if self.config else None),
+                8021,
+            )
 
             archive_path = self._preview_backup_archive_path()
 
@@ -1250,9 +1279,31 @@ class WSLUpdateMixin:
                     self.log_received.emit(out, "info")
 
                 self._emit_pull_progress("stage", "恢复备份数据")
+                # 旧混合归档可能带有其它实例的路径，按当前实例白名单显式解包。
+                deploy_dir_now, data_dir_now, instance_name_now = (
+                    self._get_active_deploy_paths()
+                )
+                restore_ctx = {
+                    "deploy_dir": deploy_dir_now,
+                    "data_dir": data_dir_now,
+                    "instance_name": instance_name_now,
+                }
+                restore_targets = self._daemon_restore_targets_in_archive(
+                    restore_ctx, archive_path
+                )
+                if not restore_targets:
+                    self.status_changed.emit("更新失败")
+                    self.update_finished.emit(
+                        False,
+                        "备份归档中未找到当前实例的可恢复目录（归档损坏或不属于该实例），已中止恢复。",
+                    )
+                    return
+                member_args = " ".join(
+                    shlex.quote(target.lstrip("/")) for target in restore_targets
+                )
                 try:
                     _rc, out = _exec(
-                        f"tar -xzf {shlex.quote(archive_path)} -C /",
+                        f"tar -xzf {shlex.quote(archive_path)} -C / {member_args}",
                         timeout=600,
                         action="[恢复正式版] 恢复备份数据失败",
                     )
@@ -1289,14 +1340,8 @@ class WSLUpdateMixin:
 
                 self._emit_pull_progress("done", "正式版恢复完成")
                 self.is_running = True
-                inst_id = self.config.get_active_instance_id() if self.config else ""
                 inst_display = inst_id if inst_id and inst_id != "default" else ""
                 log_prefix = f"[{inst_display}] " if inst_display else ""
-                nekro_port = (
-                    normalize_port(self.config.get("nekro_port"), 8021)
-                    if self.config
-                    else 8021
-                )
                 if self.config:
                     if inst_id:
                         self.config.update_instance_with_globals(

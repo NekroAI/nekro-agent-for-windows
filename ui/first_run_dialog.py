@@ -903,6 +903,23 @@ class FirstRunDialog(WizardDialogBase):
         self._start_deploy_progress()
         self.deploy_requested.emit(self._pending_deploy_mode, self._pending_inst_data)
 
+    def on_deploy_request_rejected(self, message=""):
+        """主窗口拒绝了部署请求（忙碌/前置检查失败），退回测速页允许稍后重试。
+
+        若不处理，部署页会停在「部署中...」且没有任何状态信号能解锁它。
+        """
+        if self._current_page_name() != "deploy":
+            return
+        try:
+            self.backend.status_changed.disconnect(self._on_deploy_status_changed)
+        except (TypeError, RuntimeError):
+            pass
+        self._goto_page("speedtest")
+        self.speedtest_status_label.setText(
+            message
+            or "部署未能开始：主窗口当前有其他任务在进行，请稍后再点击「继续部署」重试。"
+        )
+
     def _init_deploy_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -1051,6 +1068,33 @@ class FirstRunDialog(WizardDialogBase):
         if existing and inst_id != "default":
             self._show_notice_dialog("实例名冲突", f"已存在 ID 为「{inst_id}」的实例，请更换实例名称。")
             return
+
+        # 实例名留空时二次部署会与默认实例共用 /root/nekro_agent* 目录，
+        # 两个实例互相覆盖对方的部署文件和数据，必须在这里拦下。
+        for other_id, other_inst in self.config.list_instances():
+            if other_id == inst_id:
+                continue
+            if (
+                other_inst.get("deploy_dir") == deploy_dir
+                or other_inst.get("data_dir") == data_dir
+            ):
+                other_name = (
+                    other_inst.get("instance_name", "").rstrip("_") or other_id
+                )
+                if instance_name:
+                    self._show_notice_dialog(
+                        "目录冲突",
+                        f"实例「{other_name}」已占用相同的部署/数据目录，请更换实例名称。",
+                    )
+                else:
+                    self._mark_instance_name_error()
+                    self._show_notice_dialog(
+                        "目录冲突",
+                        f"已存在使用默认目录的实例「{other_name}」。\n\n"
+                        "实例名称留空会与它共用部署目录和数据目录，互相覆盖数据。\n"
+                        "请为本次部署填写一个实例名称。",
+                    )
+                return
 
         port_specs = [("Nekro Agent 端口", nekro_port)]
         if mode == "napcat":

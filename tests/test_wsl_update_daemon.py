@@ -111,6 +111,37 @@ class _RestoreFallbackDummy(_DummyDaemonUpdate):
         return 0, ""
 
 
+class _MixedArchiveRestoreDummy(_DummyDaemonUpdate):
+    """模拟修复前生成的混合归档：命名实例的备份里混入了默认实例的路径。"""
+
+    archive_listing = (
+        "root/foo_nekro_agent/docker-compose.yml\n"
+        "root/foo_nekro_agent_data/config.json\n"
+        "root/nekro_agent/docker-compose.yml\n"
+        "root/nekro_agent_data/config.json\n"
+        "var/lib/docker/volumes/nekro_postgres_data/_data/x\n"
+    )
+
+    def _wsl_exec(self, _distro, cmd, timeout=60, user=None):
+        self.commands.append(cmd)
+        if cmd.startswith("tar -tzf "):
+            return self.archive_listing
+        return ""
+
+    def _daemon_restore_archive(self, ctx, job, archive_path, *, action):
+        WSLUpdateMixin._daemon_restore_archive(self, ctx, job, archive_path, action=action)
+
+    def _daemon_exec(self, ctx, job, cmd, **_kwargs):
+        self.commands.append(cmd)
+        return 0, ""
+
+
+class _CancelDuringValidateDummy(_DummyDaemonUpdate):
+    def _daemon_validate_instance(self, _ctx, job):
+        job.request_cancel()
+        return True
+
+
 class WSLDaemonUpdateTests(unittest.TestCase):
     def test_rollback_restore_pre_preview_skips_stable_pull(self):
         backend = _DummyDaemonUpdate()
@@ -212,6 +243,95 @@ class WSLDaemonUpdateTests(unittest.TestCase):
         self.assertEqual(backend.restore_attempts, 1)
         self.assertTrue(any("docker run --rm" in cmd and "alpine" in cmd for cmd in backend.cleanup_commands))
         self.assertTrue(any(cmd.startswith("tar -xzf ") for cmd in backend.commands))
+
+    def test_restore_mixed_archive_extracts_only_whitelisted_members(self):
+        backend = _MixedArchiveRestoreDummy()
+        ctx = {
+            "deploy_dir": "/root/foo_nekro_agent",
+            "data_dir": "/root/foo_nekro_agent_data",
+            "instance_name": "foo_",
+            "nekro_port": 8021,
+        }
+        job = DaemonJob("upd_test", "restore", "sha256:test", {})
+
+        backend._daemon_restore_archive(
+            ctx,
+            job,
+            "/root/.na-tools/backups/foo/a.tar.gz",
+            action="[daemon 还原] 恢复备份数据失败",
+        )
+
+        tar_cmds = [cmd for cmd in backend.commands if cmd.startswith("tar -xzf ")]
+        self.assertEqual(len(tar_cmds), 1)
+        tar_cmd = tar_cmds[0]
+        self.assertIn("root/foo_nekro_agent_data", tar_cmd)
+        self.assertIn("root/foo_nekro_agent", tar_cmd)
+        # 混入的默认实例路径不得被解包
+        self.assertNotIn(" root/nekro_agent", tar_cmd)
+        self.assertNotIn("var/lib/docker/volumes/nekro_postgres_data", tar_cmd)
+        # 也不允许退化成整包解压
+        self.assertFalse(tar_cmd.rstrip().endswith("-C /"))
+
+    def test_restore_archive_without_instance_members_is_rejected(self):
+        backend = _MixedArchiveRestoreDummy()
+        backend.archive_listing = "root/other_nekro_agent/docker-compose.yml\n"
+        ctx = {
+            "deploy_dir": "/root/foo_nekro_agent",
+            "data_dir": "/root/foo_nekro_agent_data",
+            "instance_name": "foo_",
+            "nekro_port": 8021,
+        }
+        job = DaemonJob("upd_test", "restore", "sha256:test", {})
+
+        with self.assertRaises(RuntimeError):
+            backend._daemon_restore_archive(
+                ctx,
+                job,
+                "/root/.na-tools/backups/foo/a.tar.gz",
+                action="[daemon 还原] 恢复备份数据失败",
+            )
+        self.assertFalse(any(cmd.startswith("tar -xzf ") for cmd in backend.commands))
+
+    def test_daemon_update_job_cancel_resets_status_bar(self):
+        backend = _CancelDuringValidateDummy()
+        backend.is_running = True
+        request = {
+            "instance_id": "sha256:test",
+            "channel": "stable",
+            "backup": False,
+            "_launcher_inst_id": "default",
+            "_deploy_dir": "/root/nekro_agent",
+            "_data_dir": "/root/nekro_agent_data",
+            "_nekro_port": 8021,
+            "_current_channel": "stable",
+        }
+        job = DaemonJob("upd_cancel", "update", "sha256:test", request)
+
+        backend.run_daemon_update_job(request, job)
+
+        self.assertEqual(job.snapshot()["status"], "cancelled")
+        # 状态栏不能停在「更新中...」，取消后要按真实运行状态复位
+        self.assertEqual(backend.status_changed.items[-1], ("运行中",))
+
+    def test_daemon_update_job_cancel_emits_stopped_when_not_running(self):
+        backend = _CancelDuringValidateDummy()
+        backend.is_running = False
+        request = {
+            "instance_id": "sha256:test",
+            "channel": "stable",
+            "backup": False,
+            "_launcher_inst_id": "default",
+            "_deploy_dir": "/root/nekro_agent",
+            "_data_dir": "/root/nekro_agent_data",
+            "_nekro_port": 8021,
+            "_current_channel": "stable",
+        }
+        job = DaemonJob("upd_cancel2", "update", "sha256:test", request)
+
+        backend.run_daemon_update_job(request, job)
+
+        self.assertEqual(job.snapshot()["status"], "cancelled")
+        self.assertEqual(backend.status_changed.items[-1], ("已停止",))
 
 
 if __name__ == "__main__":

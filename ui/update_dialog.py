@@ -160,6 +160,9 @@ class AppUpdateDialog(QDialog):
         self._download_worker = None
         self._download_thread = None
         self._launch_timer_id = None
+        # 取消时仍未退出的下载线程挂在这里，等 finished 后再释放，
+        # 避免跨线程删除仍在运行的 worker/QThread 导致崩溃。
+        self._orphan_downloads = []
 
         self.setWindowTitle("发现新版本")
         self.setMinimumWidth(480)
@@ -353,15 +356,36 @@ class AppUpdateDialog(QDialog):
             self._status_label.setText("正在下载...")
 
     def _cleanup_download_thread(self):
-        if self._download_worker and self._download_thread:
-            if self._download_thread.isRunning():
-                self._download_worker.cancel()
-                self._download_thread.quit()
-                self._download_thread.wait(3000)
-            self._download_worker = None
-            self._download_thread = None
+        worker = self._download_worker
+        thread = self._download_thread
+        self._download_worker = None
+        self._download_thread = None
+        if not worker or not thread:
+            return
+
+        if thread.isRunning():
+            worker.cancel()
+            for signal in (worker.progress, worker.mirror_info, worker.finished):
+                try:
+                    signal.disconnect()
+                except TypeError:
+                    pass
+            thread.quit()
+            if not thread.wait(3000):
+                # 线程可能阻塞在网络 IO 上；不能在它运行期间销毁对象，
+                # 挂起引用并推迟到线程真正结束后再 deleteLater。
+                self._orphan_downloads.append((worker, thread))
+                thread.finished.connect(worker.deleteLater)
+                thread.finished.connect(thread.deleteLater)
+                return
+
+        worker.deleteLater()
+        thread.deleteLater()
 
     def _on_download_finished(self, success: bool, result: str):
+        if self._download_thread is None:
+            # 取消清理后仍可能收到已入队的完成信号，直接忽略
+            return
         self._download_thread.quit()
         self._download_thread.wait(3000)
 

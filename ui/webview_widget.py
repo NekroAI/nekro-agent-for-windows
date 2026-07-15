@@ -44,6 +44,40 @@ _NAV_HOOK_JS = r"""
 })();
 """
 
+# WebView2 只暴露普通 Reload（相当于 F5），没有忽略缓存的变体；
+# 强刷通过 JS 实现：清掉 CacheStorage，再以 cache:'reload' 重新拉取当前
+# 文档绕过 HTTP 缓存，最后 location.reload() 取到新文档。兜底定时器保证
+# 即使 fetch 挂掉也一定会刷新。
+_BYPASS_CACHE_RELOAD_JS = r"""
+(function() {
+    var reloaded = false;
+    function doReload() {
+        if (reloaded) return;
+        reloaded = true;
+        try { location.reload(); } catch (e) {}
+    }
+    setTimeout(doReload, 3000);
+    var clearCaches = Promise.resolve();
+    try {
+        if (window.caches && caches.keys) {
+            clearCaches = caches.keys().then(function(keys) {
+                return Promise.all(keys.map(function(key) { return caches.delete(key); }));
+            });
+        }
+    } catch (e) {}
+    clearCaches.catch(function() {}).then(function() {
+        var refetch;
+        try {
+            refetch = fetch(location.href, {cache: 'reload', credentials: 'include'});
+        } catch (e) {
+            doReload();
+            return;
+        }
+        refetch.catch(function() {}).then(doReload);
+    });
+})();
+"""
+
 
 class WebViewWidget(QWidget):
     """Drop-in replacement for QWebEngineView using WebView2 via qtwebview2."""
@@ -164,6 +198,12 @@ class WebViewWidget(QWidget):
     def reload(self, bypass_cache=False):
         if not self._ready:
             return
+        if bypass_cache and self._current_url.startswith(("http://", "https://")):
+            try:
+                self._webview.evaluate_js(_BYPASS_CACHE_RELOAD_JS)
+                return
+            except Exception:
+                pass
         try:
             self._webview.reload()
         except Exception:

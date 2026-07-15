@@ -806,12 +806,30 @@ class WSLDeployMixin:
                 self.log_received.emit("[卸载] ✓ 容器已清除", "info")
 
                 self.log_received.emit("[卸载] 2/3 清理部署文件...", "info")
-                self._remove_managed_deploy_dir(
+                # 发行版即将整体删除，部署目录缺失或清理失败都不应阻断
+                # 后续的 wsl --unregister，否则发行版会残留。
+                deploy_dir_exists = self._wsl_exec(
                     distro,
-                    deploy_dir,
-                    "[卸载] 清理部署文件失败",
-                )
-                self.log_received.emit("[卸载] ✓ 部署文件已清理", "info")
+                    f"test -d {shlex.quote(deploy_dir)} && echo yes",
+                    timeout=15,
+                ).strip() == "yes"
+                if not deploy_dir_exists:
+                    self.log_received.emit(
+                        f"[卸载] ⚠ 部署目录不存在，跳过清理: {deploy_dir}", "warn"
+                    )
+                else:
+                    try:
+                        self._remove_managed_deploy_dir(
+                            distro,
+                            deploy_dir,
+                            "[卸载] 清理部署文件失败",
+                        )
+                        self.log_received.emit("[卸载] ✓ 部署文件已清理", "info")
+                    except RuntimeError as e:
+                        self.log_received.emit(
+                            f"[卸载] ⚠ 部署文件清理失败，将继续删除发行版\n{e}",
+                            "warn",
+                        )
 
                 self.log_received.emit("[卸载] 3/3 删除 WSL 发行版...", "info")
                 if not self.remove_distro():
@@ -846,6 +864,18 @@ class WSLDeployMixin:
         distro = DISTRO_NAME
         deploy_dir = inst_data.get("deploy_dir", "")
         name = inst_data.get("instance_name", "").rstrip("_") or inst_id
+
+        if was_active:
+            # 日志读取和健康检查都指向 active 实例，移除前先停掉，
+            # 避免它们继续引用一个即将消失的部署目录。
+            self._stop_event.set()
+            if self._log_process and self._log_process.poll() is None:
+                try:
+                    self._log_process.terminate()
+                except Exception:
+                    pass
+                self._log_process = None
+            self._stop_event.clear()
 
         def _do_remove():
             success = True
@@ -921,6 +951,12 @@ class WSLDeployMixin:
                     "error",
                 )
                 success = False
+
+            if success and was_active:
+                # active 实例的容器已 down，运行标志必须复位；
+                # UI 切换到剩余实例后会通过 refresh_running_state 重新探测。
+                self.is_running = False
+                self.status_changed.emit("已停止")
 
             self.instance_removed.emit(success, inst_id, was_active)
 
