@@ -646,7 +646,7 @@ class WSLUpdateMixin:
             DISTRO_NAME,
             f"tar -tzf {shlex.quote(archive_path)}",
             action="校验备份归档失败",
-            timeout=60,
+            timeout=600,
             user="root",
         )
         raw = self._clean_command_output(self._safe_decode(proc.stdout))
@@ -937,6 +937,11 @@ class WSLUpdateMixin:
             job.set_progress("verify", 3, 4, "等待服务健康检查通过")
             health = self._wait_daemon_update_health(job, ctx["nekro_port"])
             if health is None:
+                self._sync_compose_running_state(
+                    DISTRO_NAME,
+                    ctx["deploy_dir"],
+                    action="[daemon 还原] 刷新服务运行状态失败",
+                )
                 self._daemon_emit_cancelled_status()
                 return
             if not health:
@@ -1001,10 +1006,10 @@ class WSLUpdateMixin:
                 ]
             )
         else:
-            steps.append({"type": "switch_channel", "channel": "stable", "label": "写回稳定版镜像配置"})
             if restore_pre_preview:
                 steps.append({"type": "restore_pre_preview", "label": "恢复预览版切换前备份"})
             else:
+                steps.append({"type": "switch_channel", "channel": "stable", "label": "写回稳定版镜像配置"})
                 steps.append({"type": "pull", "image": agent_image, "label": "拉取稳定版 Nekro Agent 镜像"})
             steps.append(
                 {

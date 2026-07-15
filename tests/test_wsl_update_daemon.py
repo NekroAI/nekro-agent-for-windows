@@ -243,6 +243,11 @@ class WSLDaemonUpdateTests(unittest.TestCase):
 
         self.assertEqual(backend.pulls, [])
         self.assertTrue(backend.restore_calls)
+        listing_index = next(
+            i for i, command in enumerate(backend.commands) if command.startswith("tar -tzf ")
+        )
+        switch_index = backend.commands.index("switch:stable")
+        self.assertLess(listing_index, switch_index)
         self.assertEqual(job.snapshot()["status"], "succeeded")
 
     def test_named_instance_backup_targets_exclude_default_instance_paths(self):
