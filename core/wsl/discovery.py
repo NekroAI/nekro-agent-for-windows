@@ -576,7 +576,12 @@ class WSLDiscoveryMixin:
         if instance.get("status") == "running":
             stop_ok = self._stop_source_instance(src_distro, deploy_dir)
             if not stop_ok:
-                self.log_received.emit("[接管] ⚠ 源实例停止失败，将继续迁移（数据可能不完整）", "warn")
+                self.log_received.emit(
+                    "[接管] ✗ 源实例停止失败，已中止迁移；"
+                    "请根据上方命令输出处理后重试",
+                    "error",
+                )
+                return False
         else:
             self.log_received.emit("[接管] 源实例未运行，跳过停止步骤", "debug")
 
@@ -748,12 +753,22 @@ class WSLDiscoveryMixin:
                         stdout=proc.stdout,
                         stderr=proc.stderr,
                     ),
-                    "debug",
+                    "error",
                 )
                 return False
             return True
         except Exception as e:
-            self.log_received.emit(f"[接管] 停止源实例异常: {e}", "debug")
+            self.log_received.emit(
+                self._format_command_failure(
+                    "[接管] 停止源实例异常",
+                    cmd=cmd,
+                    distro=distro,
+                    user="root",
+                    timeout=60,
+                    exception=e,
+                ),
+                "error",
+            )
             return False
 
     def _migrate_images(self, src_distro: str) -> bool:
@@ -1021,42 +1036,62 @@ class WSLDiscoveryMixin:
     def _restore_data(self, archive_path: str) -> bool:
         """在 NekroAgent 发行版中以 root 解压迁移包。
 
-        确保 Docker daemon 已停止再解压，避免 daemon 内部 metadata 与磁盘目录不一致。
-        解压完毕后启动 Docker daemon，让它重新扫描 volumes 目录注册已有 volume。
+        如果 Docker daemon 原本正在运行，解压前停止并在 finally 中恢复运行状态。
+        原本未运行时保持停止，避免迁移意外改变目标环境状态。
         """
+        docker_was_active = False
+        restore_ok = False
+        docker_state_restored = True
         try:
-            self._wsl_exec(DISTRO_NAME, "systemctl stop docker 2>/dev/null || true", timeout=20, user="root")
+            state_cmd = "systemctl is-active docker"
+            state_proc = self._run_wsl_checked(
+                DISTRO_NAME,
+                state_cmd,
+                action="[接管] 检测目标 Docker 运行状态失败",
+                timeout=20,
+                user="root",
+                ok_returncodes=(0, 3),
+            )
+            docker_was_active = state_proc.returncode == 0
+
+            if docker_was_active:
+                self._run_wsl_checked(
+                    DISTRO_NAME,
+                    "systemctl stop docker",
+                    action="[接管] 还原前停止目标 Docker 失败",
+                    timeout=30,
+                    user="root",
+                )
 
             restore_cmd = f"tar -xzf {shlex.quote(archive_path)} -C /"
-            proc = self._wsl_run(DISTRO_NAME, restore_cmd, timeout=300, user="root")
-            if proc.returncode != 0:
-                self.log_received.emit(
-                    self._format_command_failure(
-                        "[接管] 数据还原失败",
-                        cmd=restore_cmd,
-                        distro=DISTRO_NAME,
-                        user="root",
-                        timeout=300,
-                        returncode=proc.returncode,
-                        stdout=proc.stdout,
-                        stderr=proc.stderr,
-                    ),
-                    "debug",
-                )
-                return False
-
             self._run_wsl_checked(
                 DISTRO_NAME,
-                "systemctl start docker",
-                action="[接管] 还原后启动 Docker 失败",
-                timeout=30,
+                restore_cmd,
+                action="[接管] 数据还原失败",
+                timeout=300,
                 user="root",
             )
-            time.sleep(2)
-            return True
+            restore_ok = True
         except Exception as e:
-            self.log_received.emit(f"[接管] 数据还原异常: {e}", "debug")
-            return False
+            self.log_received.emit(f"[接管] 数据还原异常:\n{e}", "error")
+        finally:
+            if docker_was_active:
+                try:
+                    self._run_wsl_checked(
+                        DISTRO_NAME,
+                        "systemctl start docker",
+                        action="[接管] 恢复目标 Docker 原运行状态失败",
+                        timeout=30,
+                        user="root",
+                    )
+                    time.sleep(2)
+                except Exception as e:
+                    docker_state_restored = False
+                    self.log_received.emit(
+                        f"[接管] 恢复目标 Docker 原运行状态异常:\n{e}",
+                        "error",
+                    )
+        return restore_ok and docker_state_restored
 
     def _cleanup_archive(self, src_distro: str, archive_path: str):
         """清理临时打包文件（以 root 执行，文件可能由 root 创建）。"""

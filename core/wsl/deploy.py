@@ -534,7 +534,6 @@ class WSLDeployMixin:
     def stop_services(self):
         """停止 Docker Compose 服务"""
         self._stop_event.set()
-        was_running = self.is_running
 
         if self._log_process and self._log_process.poll() is None:
             try:
@@ -542,11 +541,6 @@ class WSLDeployMixin:
             except Exception:
                 pass
             self._log_process = None
-
-        if not was_running:
-            self.is_running = False
-            self.status_changed.emit("已停止")
-            return
 
         inst_id = ""
         if self.config:

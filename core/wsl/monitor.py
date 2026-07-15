@@ -139,12 +139,12 @@ class WSLMonitorMixin:
             time.sleep(interval)
 
         if not self._stop_event.is_set() and self._health_generation == my_gen:
-            self.is_running = False
             self.log_received.emit(
                 "服务启动超时\n"
                 f"访问地址: http://localhost:{nekro_port}\n"
                 f"等待时长: {timeout}s\n"
-                "建议检查 Docker Compose 日志、端口占用和容器健康状态。",
+                "Compose 服务可能仍在运行，建议检查 Docker Compose 日志、"
+                "端口占用和容器健康状态。",
                 "error",
             )
             self.status_changed.emit("启动超时")

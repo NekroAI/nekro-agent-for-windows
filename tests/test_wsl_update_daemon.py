@@ -135,6 +135,25 @@ class _MixedArchiveRestoreDummy(_DummyDaemonUpdate):
         self.commands.append(cmd)
         return 0, ""
 
+    def _run_wsl_checked(self, _distro, cmd, **_kwargs):
+        self.cleanup_commands.append(cmd)
+        return None
+
+
+class _ConsistentBackupDummy(_DummyDaemonUpdate):
+    def _existing_backup_targets_for_paths(self, *_args):
+        return ["/var/lib/docker/volumes/nekro_postgres_data", "/root/nekro_agent"]
+
+    def _wsl_exec(self, _distro, cmd, timeout=60, user=None):
+        self.commands.append(cmd)
+        if "ps --status running --services" in cmd:
+            return "nekro_agent\nnekro_postgres\n"
+        return ""
+
+    def _run_wsl_checked(self, _distro, cmd, **_kwargs):
+        self.commands.append(cmd)
+        return None
+
 
 class _CancelDuringValidateDummy(_DummyDaemonUpdate):
     def _daemon_validate_instance(self, _ctx, job):
@@ -271,6 +290,28 @@ class WSLDaemonUpdateTests(unittest.TestCase):
         self.assertNotIn("var/lib/docker/volumes/nekro_postgres_data", tar_cmd)
         # 也不允许退化成整包解压
         self.assertFalse(tar_cmd.rstrip().endswith("-C /"))
+        self.assertEqual(len(backend.cleanup_commands), 2)
+        self.assertTrue(all("docker run --rm" in cmd for cmd in backend.cleanup_commands))
+
+    def test_backup_stops_running_database_services_and_restores_original_state(self):
+        backend = _ConsistentBackupDummy()
+
+        ok, _message = backend._backup_nekro_archive_for_paths(
+            "NekroAgent",
+            "/root/backup.tar.gz",
+            "/root/nekro_agent",
+            "/root/nekro_agent_data",
+            "",
+        )
+
+        self.assertTrue(ok)
+        stop_index = next(i for i, cmd in enumerate(backend.commands) if " compose " in cmd and " stop " in cmd)
+        tar_index = next(i for i, cmd in enumerate(backend.commands) if "tar -czf" in cmd)
+        start_index = next(i for i, cmd in enumerate(backend.commands) if " compose " in cmd and " start " in cmd)
+        self.assertLess(stop_index, tar_index)
+        self.assertLess(tar_index, start_index)
+        self.assertIn("nekro_postgres", backend.commands[stop_index])
+        self.assertIn("nekro_agent", backend.commands[start_index])
 
     def test_restore_archive_without_instance_members_is_rejected(self):
         backend = _MixedArchiveRestoreDummy()
