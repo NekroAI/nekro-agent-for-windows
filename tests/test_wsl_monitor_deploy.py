@@ -8,11 +8,14 @@ from core.wsl.monitor import WSLMonitorMixin
 
 
 class _Signal:
-    def __init__(self):
+    def __init__(self, callback=None):
         self.items = []
+        self.callback = callback
 
     def emit(self, *args):
         self.items.append(args)
+        if self.callback:
+            self.callback(*args)
 
 
 class _Config:
@@ -51,6 +54,17 @@ class _DeployDummy(WSLDeployMixin):
         self.log_received = _Signal()
         self.status_changed = _Signal()
         self.commands = []
+        self.health_invalidations = 0
+
+    def _invalidate_health_checks(self):
+        self.health_invalidations += 1
+
+    def _log_reader(self, *args):
+        return None
+
+    @staticmethod
+    def _format_command_failure(action, **kwargs):
+        return action
 
     @staticmethod
     def _creation_flags():
@@ -94,6 +108,44 @@ class WSLMonitorDeployTests(unittest.TestCase):
         )
         self.assertFalse(backend.is_running)
         self.assertEqual(backend.status_changed.items[-1], ("已停止",))
+        self.assertEqual(backend.health_invalidations, 1)
+
+    def test_health_ready_does_not_emit_after_stop_requested(self):
+        backend = _MonitorDummy()
+        backend.log_received = _Signal(lambda *_args: backend._stop_event.set())
+
+        class _Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        with patch("core.wsl.monitor.urlopen", return_value=_Response()):
+            backend._health_check(8021)
+
+        self.assertEqual(backend.progress_updated.items, [])
+        self.assertEqual(backend.boot_finished.items, [])
+        self.assertEqual(backend.status_changed.items, [])
+
+    def test_stop_services_reports_failure_when_compose_precheck_fails(self):
+        backend = _DeployDummy()
+        backend.is_running = True
+        check_failed = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout=b"", stderr=b"wsl unavailable"
+        )
+
+        with (
+            patch("core.wsl.deploy.threading.Thread", _ImmediateThread),
+            patch("core.wsl.deploy.subprocess.run", return_value=check_failed),
+        ):
+            backend.stop_services()
+
+        self.assertEqual(backend.commands, [])
+        self.assertTrue(backend.is_running)
+        self.assertEqual(backend.status_changed.items[-1], ("停止失败",))
 
 
 if __name__ == "__main__":

@@ -109,7 +109,23 @@ class WSLUpdateMixin:
         from core.update_runner import build_update_plan, log_update_plan
 
         distro = DISTRO_NAME
-        deploy_dir, _, _ = self._get_active_deploy_paths()
+        # UI 发起操作时就固定目标上下文。互斥工作线程可能稍后才真正运行，
+        # 期间 active instance 不应改变本次更新的目录、端口或镜像渠道。
+        inst_id = self.config.get_active_instance_id() if self.config else ""
+        inst = self.config.get_instance(inst_id) if self.config and inst_id else None
+        inst = inst or {}
+        deploy_dir, data_dir, instance_name = self._get_active_deploy_paths()
+        nekro_port = normalize_port(
+            inst.get("nekro_port")
+            or (self.config.get("nekro_port") if self.config else None),
+            8021,
+        )
+        release_channel = str(
+            inst.get("release_channel")
+            or (self.config.get("release_channel") if self.config else "stable")
+            or "stable"
+        )
+        agent_image = self.get_agent_image_ref(release_channel=release_channel)
 
         def _exec(cmd, timeout=300, action="[更新] 命令执行失败"):
             proc = self._run_wsl_checked(
@@ -136,18 +152,6 @@ class WSLUpdateMixin:
         def _do_update():
             self._stop_event.clear()
             self.status_changed.emit("更新中...")
-            # 升级期间用户可能切换 active 实例；发起时就锁定本次升级
-            # 面向的实例与端口，完成后的日志/健康检查不能跟着 config 漂移。
-            inst_id = self.config.get_active_instance_id() if self.config else ""
-            inst = (
-                self.config.get_instance(inst_id) if self.config and inst_id else None
-            ) or {}
-            nekro_port = normalize_port(
-                inst.get("nekro_port")
-                or (self.config.get("nekro_port") if self.config else None),
-                8021,
-            )
-            agent_image = self.get_agent_image_ref(self.config)
             steps = build_update_plan(agent_image)
             log_update_plan(self.log_received.emit, steps)
             if not steps:
@@ -168,7 +172,9 @@ class WSLUpdateMixin:
 
                 if step_type == "backup":
                     if step.get("optional"):
-                        backup_size = self.get_backup_size_hint()
+                        backup_size = self._get_backup_size_hint_for_paths(
+                            distro, deploy_dir, data_dir, instance_name
+                        )
                         prompt = step.get("optional_prompt", f"是否执行：{label}？").replace("{backup_size}", backup_size)
                         reply = _wait_optional_reply(label, prompt)
                         if reply is None:
@@ -178,9 +184,12 @@ class WSLUpdateMixin:
                             self.log_received.emit(f"[更新] 已跳过可选步骤: {label}", "info")
                             continue
 
-                    ok, backup_message = self._backup_nekro_archive(
+                    ok, backup_message = self._backup_nekro_archive_for_paths(
                         distro,
                         step.get("archive_path", UPDATE_BACKUP_ARCHIVE_PATH),
+                        deploy_dir,
+                        data_dir,
+                        instance_name,
                     )
                     if not ok:
                         self.status_changed.emit("更新失败")
@@ -403,6 +412,60 @@ class WSLUpdateMixin:
                 existing.append(target)
         return existing
 
+    def _get_backup_size_hint_for_paths(self, distro, deploy_dir, data_dir, instance_name):
+        existing_targets = self._existing_backup_targets_for_paths(
+            distro, deploy_dir, data_dir, instance_name
+        )
+        if not existing_targets:
+            return "未知"
+        cmd = (
+            "du -shc "
+            + " ".join(shlex.quote(target) for target in existing_targets)
+            + " | tail -n1 | cut -f1"
+        )
+        size = self._wsl_exec(distro, cmd, timeout=60).strip()
+        return size or "未知"
+
+    def _compose_running_services(self, distro, deploy_dir, *, action):
+        proc = self._run_wsl_checked(
+            distro,
+            "docker compose -f docker-compose.yml --env-file .env "
+            "ps --status running --services",
+            action=action,
+            cwd=deploy_dir,
+            timeout=30,
+        )
+        output = self._clean_command_output(self._safe_decode(proc.stdout))
+        services = []
+        for line in output.splitlines():
+            service = line.strip()
+            if not service:
+                continue
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", service):
+                raise RuntimeError(f"{action}：Compose 返回了无效服务名: {service}")
+            if service not in services:
+                services.append(service)
+        return services
+
+    def _stop_running_compose_services(self, distro, deploy_dir, *, action):
+        services = self._compose_running_services(
+            distro,
+            deploy_dir,
+            action=f"{action}（读取运行服务失败）",
+        )
+        if not services:
+            return []
+        service_args = " ".join(shlex.quote(service) for service in services)
+        self._run_wsl_checked(
+            distro,
+            "docker compose -f docker-compose.yml --env-file .env "
+            f"stop {service_args}",
+            action=action,
+            cwd=deploy_dir,
+            timeout=120,
+        )
+        return services
+
     def _backup_nekro_archive_for_paths(self, distro, archive_path, deploy_dir, data_dir, instance_name):
         existing_targets = self._existing_backup_targets_for_paths(distro, deploy_dir, data_dir, instance_name)
         if not existing_targets:
@@ -410,27 +473,13 @@ class WSLUpdateMixin:
 
         archive_dir = posixpath.dirname(archive_path.rstrip("/")) or "/root"
         target_args = " ".join(shlex.quote(target.lstrip("/")) for target in existing_targets)
-        services = "nekro_agent nekro_postgres nekro_qdrant nekro_napcat"
-        running_services = ""
+        running_services = []
         try:
-            running_services = self._wsl_exec(
+            running_services = self._stop_running_compose_services(
                 distro,
-                f"cd {shlex.quote(deploy_dir)} && "
-                "docker compose -f docker-compose.yml --env-file .env "
-                f"ps --status running --services {services}",
-                timeout=30,
-            ).strip()
-            if running_services:
-                running_args = " ".join(
-                    shlex.quote(service) for service in running_services.splitlines() if service.strip()
-                )
-                self._run_wsl_checked(
-                    distro,
-                    f"docker compose -f docker-compose.yml --env-file .env stop {running_args}",
-                    action="创建备份前停止相关服务失败",
-                    cwd=deploy_dir,
-                    timeout=120,
-                )
+                deploy_dir,
+                action="创建备份前停止相关服务失败",
+            )
             self._run_wsl_checked(
                 distro,
                 f"mkdir -p {shlex.quote(archive_dir)} && "
@@ -452,9 +501,7 @@ class WSLUpdateMixin:
             result = True, f"已生成备份归档：{posixpath.basename(archive_path)}"
         finally:
             if running_services:
-                running_args = " ".join(
-                    shlex.quote(service) for service in running_services.splitlines() if service.strip()
-                )
+                running_args = " ".join(shlex.quote(service) for service in running_services)
                 try:
                     self._run_wsl_checked(
                         distro,
@@ -575,18 +622,31 @@ class WSLUpdateMixin:
                 targets.append(target)
         return targets
 
-    def _daemon_cleanup_restore_targets_with_alpine(self, ctx, job, targets):
-        cleanup_script = "find /target -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +"
+    def _daemon_cleanup_restore_targets(self, ctx, job, targets):
+        safe_targets = set(self._daemon_safe_restore_targets(ctx))
         for target in targets:
-            volume_arg = f"{target}:/target:rw"
+            normalized = posixpath.normpath("/" + str(target or "").lstrip("/"))
+            if normalized not in safe_targets:
+                raise RuntimeError("拒绝清理不在当前实例白名单中的恢复目标。")
+            cleanup_cmd = (
+                f"mkdir -p -- {shlex.quote(normalized)} && "
+                f"find {shlex.quote(normalized)} -mindepth 1 -maxdepth 1 "
+                "-exec rm -rf -- {} +"
+            )
             self._run_wsl_checked(
                 DISTRO_NAME,
-                f"docker run --rm -v {shlex.quote(volume_arg)} alpine sh -c {shlex.quote(cleanup_script)}",
-                action="[daemon 还原] 使用临时 Alpine 容器清理恢复目标失败",
+                cleanup_cmd,
+                action="[daemon 还原] 清理恢复目标失败",
                 timeout=300,
+                user="root",
             )
             if job is not None:
-                self._daemon_add_log(job, "已清理一个恢复目标目录", ctx=ctx, sensitive_paths=[target])
+                self._daemon_add_log(
+                    job,
+                    "已清理一个恢复目标目录",
+                    ctx=ctx,
+                    sensitive_paths=[normalized],
+                )
 
     def _daemon_restore_archive(self, ctx, job, archive_path, *, action):
         # 修复前生成的混合归档可能包含其它实例（尤其默认实例）的路径，
@@ -599,7 +659,7 @@ class WSLUpdateMixin:
         member_args = " ".join(shlex.quote(target.lstrip("/")) for target in targets)
         cmd = f"tar -xzf {shlex.quote(archive_path)} -C / {member_args}"
         try:
-            self._daemon_cleanup_restore_targets_with_alpine(ctx, job, targets)
+            self._daemon_cleanup_restore_targets(ctx, job, targets)
             self._daemon_exec(ctx, job, cmd, timeout=600, action=action)
             return
         except Exception as first_error:
@@ -611,14 +671,14 @@ class WSLUpdateMixin:
                 sensitive_paths=[archive_path],
             )
             try:
-                self._daemon_cleanup_restore_targets_with_alpine(ctx, job, targets)
+                self._daemon_cleanup_restore_targets(ctx, job, targets)
                 self._daemon_exec(ctx, job, cmd, timeout=600, action=action)
             except Exception as second_error:
                 sensitive_paths = [archive_path, *targets]
                 first = self._daemon_redact_text(str(first_error), ctx=ctx, sensitive_paths=sensitive_paths)
                 second = self._daemon_redact_text(str(second_error), ctx=ctx, sensitive_paths=sensitive_paths)
                 raise RuntimeError(
-                    f"{first}\n已尝试 restore ownership fallback 但仍失败:\n{second}"
+                    f"{first}\n已清理部分恢复数据并重试，但仍失败:\n{second}"
                 ) from second_error
 
     def _daemon_validate_instance(self, ctx, job):
@@ -793,12 +853,9 @@ class WSLUpdateMixin:
             return
         job.set_progress("restore", 1, 4, "正在停止服务并恢复备份")
         try:
-            self._daemon_exec(
-                ctx,
-                job,
-                "docker compose -f docker-compose.yml stop "
-                "nekro_agent nekro_postgres nekro_qdrant nekro_napcat 2>/dev/null || true",
-                timeout=120,
+            self._stop_running_compose_services(
+                DISTRO_NAME,
+                ctx["deploy_dir"],
                 action="[daemon 还原] 停止服务失败",
             )
             self._daemon_restore_archive(
@@ -969,12 +1026,9 @@ class WSLUpdateMixin:
                         self.status_changed.emit("更新失败")
                         self._daemon_fail(job, "backup_not_found", "未找到 pre-preview 备份", ctx=ctx)
                         return
-                    self._daemon_exec(
-                        ctx,
-                        job,
-                        "docker compose -f docker-compose.yml stop "
-                        "nekro_agent nekro_postgres nekro_qdrant nekro_napcat 2>/dev/null || true",
-                        timeout=120,
+                    self._stop_running_compose_services(
+                        DISTRO_NAME,
+                        ctx["deploy_dir"],
                         action="[daemon 更新] 停止服务失败",
                     )
                     self._daemon_restore_archive(
@@ -1244,6 +1298,12 @@ class WSLUpdateMixin:
             or (self.config.get("nekro_port") if self.config else None),
             8021,
         )
+        if "preview_backup_available" in inst:
+            preview_backup_available = bool(inst.get("preview_backup_available"))
+        else:
+            preview_backup_available = bool(
+                self.config.get("preview_backup_available", False) if self.config else False
+            )
 
         def _exec(cmd, timeout=300, action="[恢复正式版] 命令执行失败"):
             proc = self._run_wsl_checked(
@@ -1291,7 +1351,7 @@ class WSLUpdateMixin:
             # 锁定发起时的实例与端口，防止切换实例后写错目标（见 run_remote_update）。
             archive_path = self._preview_backup_archive_path(inst_id=inst_id)
 
-            if self.config and not self.config.get_active_preview_backup_available():
+            if self.config and not preview_backup_available:
                 self.status_changed.emit("更新失败")
                 self.update_finished.emit(False, "当前预览版是在未备份的情况下切换的，无法恢复到正式版。")
                 return
@@ -1303,18 +1363,11 @@ class WSLUpdateMixin:
 
             try:
                 self._emit_pull_progress("stage", "停止相关服务")
-                stop_services_cmd = (
-                    "docker compose -f docker-compose.yml stop "
-                    "nekro_agent nekro_postgres nekro_qdrant nekro_napcat "
-                    "2>/dev/null || true"
-                )
-                _rc, out = _exec(
-                    stop_services_cmd,
-                    timeout=120,
+                self._stop_running_compose_services(
+                    distro,
+                    deploy_dir,
                     action="[恢复正式版] 停止相关服务失败",
                 )
-                if out:
-                    self.log_received.emit(out, "info")
 
                 self._emit_pull_progress("stage", "恢复备份数据")
                 # 旧混合归档可能带有其它实例的路径，按当前实例白名单显式解包。
@@ -1337,7 +1390,7 @@ class WSLUpdateMixin:
                     shlex.quote(target.lstrip("/")) for target in restore_targets
                 )
                 try:
-                    self._daemon_cleanup_restore_targets_with_alpine(
+                    self._daemon_cleanup_restore_targets(
                         restore_ctx, None, restore_targets
                     )
                     _rc, out = _exec(

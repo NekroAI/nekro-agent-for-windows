@@ -1977,6 +1977,7 @@ class MainWindow(QMainWindow):
             f"已切换到实例「{display}」，正在同步日志和内置浏览器。", "info"
         )
         self._switch_log_reader_to_active_instance()
+        self.backend.refresh_running_state()
         self._sync_browser_to_active_instance(force_reload=True)
         self._refresh_log_tabs_for_active_instance()
         self.refresh_dashboard()
@@ -2015,6 +2016,7 @@ class MainWindow(QMainWindow):
         """切换实例时，将日志读取和健康检查指向新的 active 实例。"""
         from core.wsl.constants import DISTRO_NAME
 
+        self.backend._invalidate_health_checks()
         self.backend._stop_event.set()
         if self.backend._log_process and self.backend._log_process.poll() is None:
             try:
@@ -2272,6 +2274,14 @@ class MainWindow(QMainWindow):
         self._sync_browser_to_active_instance(force_reload=False)
         self.refresh_dashboard()
 
+    def _stop_pending_instance_before_rollback(self):
+        """先停止新实例的残留容器，再移除其配置。"""
+        if getattr(self, "_rollback_pending_after_stop", False):
+            return
+        self._rollback_pending_after_stop = True
+        self.append_log("新实例启动失败，正在停止其 Compose 服务后回滚配置。", "warn")
+        self.backend.stop_services()
+
     def update_status_ui(self, status):
         previous_status = self._last_status
         self._last_status = status
@@ -2400,11 +2410,22 @@ class MainWindow(QMainWindow):
                 )
                 _success_title, failure_title = self._active_update_result_titles()
                 self._finish_update_session(False, failure_title, failure_message)
-            if (
+            pending_rollback = getattr(self, "_rollback_pending_after_stop", False)
+            if status == "已停止" and pending_rollback:
+                self._rollback_pending_after_stop = False
+                self._rollback_pending_instance()
+            elif status == "停止失败" and pending_rollback:
+                self._rollback_pending_after_stop = False
+                self._show_notice_dialog(
+                    "回滚失败",
+                    "新实例启动失败，且其 Compose 服务未能确认停止。为避免留下无法管理的容器，实例配置已保留，请检查日志后重试停止。",
+                    danger=True,
+                )
+            elif (
                 status in {"启动失败", "启动超时"}
                 and getattr(self, "_prev_active_instance", None) is not None
             ):
-                self._rollback_pending_instance()
+                self._stop_pending_instance_before_rollback()
 
             if self._quit_after_stop and status in {"已停止", "已卸载"}:
                 self._quit_after_stop = False

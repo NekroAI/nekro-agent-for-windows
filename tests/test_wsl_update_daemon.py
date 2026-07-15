@@ -1,5 +1,6 @@
 import threading
 import unittest
+from types import SimpleNamespace
 
 from core.launcher_daemon import DaemonJob
 from core.wsl.shell import WSLShellMixin
@@ -46,6 +47,10 @@ class _DummyDaemonUpdate(WSLUpdateMixin, WSLShellMixin):
     def _daemon_exec(self, _ctx, _job, cmd, **_kwargs):
         self.commands.append(cmd)
         return 0, ""
+
+    def _run_wsl_checked(self, _distro, cmd, **_kwargs):
+        self.commands.append(cmd)
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
     def _daemon_restore_archive(self, _ctx, _job, archive_path, *, action):
         self.restore_calls.append((archive_path, action))
@@ -144,15 +149,18 @@ class _ConsistentBackupDummy(_DummyDaemonUpdate):
     def _existing_backup_targets_for_paths(self, *_args):
         return ["/var/lib/docker/volumes/nekro_postgres_data", "/root/nekro_agent"]
 
-    def _wsl_exec(self, _distro, cmd, timeout=60, user=None):
-        self.commands.append(cmd)
-        if "ps --status running --services" in cmd:
-            return "nekro_agent\nnekro_postgres\n"
-        return ""
-
     def _run_wsl_checked(self, _distro, cmd, **_kwargs):
         self.commands.append(cmd)
-        return None
+        stdout = b"nekro_agent\nnekro_postgres\n" if "ps --status running --services" in cmd else b""
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr=b"")
+
+
+class _StopFailureBackupDummy(_ConsistentBackupDummy):
+    def _run_wsl_checked(self, _distro, cmd, **_kwargs):
+        if " stop " in cmd:
+            self.commands.append(cmd)
+            raise RuntimeError("compose stop failed")
+        return super()._run_wsl_checked(_distro, cmd, **_kwargs)
 
 
 class _CancelDuringValidateDummy(_DummyDaemonUpdate):
@@ -242,7 +250,7 @@ class WSLDaemonUpdateTests(unittest.TestCase):
         self.assertNotIn("abc", redacted)
         self.assertNotIn("daemon.token", redacted)
 
-    def test_restore_archive_retries_with_alpine_cleanup_on_extract_failure(self):
+    def test_restore_archive_retries_with_root_cleanup_on_extract_failure(self):
         backend = _RestoreFallbackDummy()
         ctx = {
             "deploy_dir": "/root/nekro_agent",
@@ -260,7 +268,8 @@ class WSLDaemonUpdateTests(unittest.TestCase):
         )
 
         self.assertEqual(backend.restore_attempts, 1)
-        self.assertTrue(any("docker run --rm" in cmd and "alpine" in cmd for cmd in backend.cleanup_commands))
+        self.assertTrue(any(cmd.startswith("mkdir -p -- ") and "find " in cmd for cmd in backend.cleanup_commands))
+        self.assertFalse(any("docker run" in cmd or "alpine" in cmd for cmd in backend.cleanup_commands))
         self.assertTrue(any(cmd.startswith("tar -xzf ") for cmd in backend.commands))
 
     def test_restore_mixed_archive_extracts_only_whitelisted_members(self):
@@ -291,7 +300,9 @@ class WSLDaemonUpdateTests(unittest.TestCase):
         # 也不允许退化成整包解压
         self.assertFalse(tar_cmd.rstrip().endswith("-C /"))
         self.assertEqual(len(backend.cleanup_commands), 2)
-        self.assertTrue(all("docker run --rm" in cmd for cmd in backend.cleanup_commands))
+        self.assertTrue(all(cmd.startswith("mkdir -p -- ") for cmd in backend.cleanup_commands))
+        self.assertTrue(all("find " in cmd for cmd in backend.cleanup_commands))
+        self.assertFalse(any("docker run" in cmd or "alpine" in cmd for cmd in backend.cleanup_commands))
 
     def test_backup_stops_running_database_services_and_restores_original_state(self):
         backend = _ConsistentBackupDummy()
@@ -312,6 +323,32 @@ class WSLDaemonUpdateTests(unittest.TestCase):
         self.assertLess(tar_index, start_index)
         self.assertIn("nekro_postgres", backend.commands[stop_index])
         self.assertIn("nekro_agent", backend.commands[start_index])
+
+    def test_backup_stop_failure_aborts_before_archive_creation(self):
+        backend = _StopFailureBackupDummy()
+
+        ok, message = backend._backup_nekro_archive_for_paths(
+            "NekroAgent",
+            "/root/backup.tar.gz",
+            "/root/nekro_agent",
+            "/root/nekro_agent_data",
+            "",
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("compose stop failed", message)
+        self.assertFalse(any("tar -czf" in cmd for cmd in backend.commands))
+
+    def test_compose_service_discovery_does_not_assume_napcat_exists(self):
+        backend = _ConsistentBackupDummy()
+
+        services = backend._compose_running_services(
+            "NekroAgent", "/root/nekro_agent", action="读取服务失败"
+        )
+
+        self.assertEqual(services, ["nekro_agent", "nekro_postgres"])
+        ps_cmd = next(cmd for cmd in backend.commands if "ps --status running --services" in cmd)
+        self.assertNotIn("nekro_napcat", ps_cmd)
 
     def test_restore_archive_without_instance_members_is_rejected(self):
         backend = _MixedArchiveRestoreDummy()

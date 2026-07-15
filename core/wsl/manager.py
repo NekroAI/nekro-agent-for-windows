@@ -44,6 +44,8 @@ class WSLManager(
         self._deploying = False
         self._log_process = None
         self._stop_event = threading.Event()
+        self._health_generation = 0
+        self._health_lock = threading.Lock()
         self._pending_deploy_info = None
         self._update_optional_reply = None
         self._deploy_optional_reply = None

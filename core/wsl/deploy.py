@@ -398,6 +398,7 @@ class WSLDeployMixin:
 
         self._deploying = True
         if force_new_instance:
+            self._invalidate_health_checks()
             self._stop_event.set()
             if self._log_process and self._log_process.poll() is None:
                 try:
@@ -533,6 +534,7 @@ class WSLDeployMixin:
 
     def stop_services(self):
         """停止 Docker Compose 服务"""
+        self._invalidate_health_checks()
         self._stop_event.set()
 
         if self._log_process and self._log_process.poll() is None:
@@ -552,8 +554,9 @@ class WSLDeployMixin:
         self.log_received.emit(f"{log_prefix}正在停止服务...", "info")
         self.status_changed.emit("停止中...")
 
+        deploy_dir, _, _ = self._get_active_deploy_paths()
+
         def _do_stop():
-            deploy_dir, _, _ = self._get_active_deploy_paths()
 
             def _restore_runtime_state():
                 self.is_running = True
@@ -567,7 +570,8 @@ class WSLDeployMixin:
 
             try:
                 compose_check = (
-                    f"test -f {shlex.quote(deploy_dir)}/docker-compose.yml && echo yes"
+                    f"if [ -f {shlex.quote(deploy_dir)}/docker-compose.yml ]; "
+                    "then echo yes; else echo no; fi"
                 )
                 has_compose = False
                 try:
@@ -595,6 +599,9 @@ class WSLDeployMixin:
                             ),
                             "debug",
                         )
+                        _restore_runtime_state()
+                        self.status_changed.emit("停止失败")
+                        return
                 except Exception as e:
                     self.log_received.emit(
                         self._format_command_failure(
@@ -606,7 +613,9 @@ class WSLDeployMixin:
                         ),
                         "debug",
                     )
-                    pass
+                    _restore_runtime_state()
+                    self.status_changed.emit("停止失败")
+                    return
 
                 if has_compose:
                     try:

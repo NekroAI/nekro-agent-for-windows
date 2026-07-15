@@ -571,9 +571,21 @@ class WSLDiscoveryMixin:
             self.progress_updated.emit("__need_create_runtime__")
             return False
 
-        # 2. 停止源实例
+        # 2. 实时检测并停止源实例。扫描结果可能已过期，不能用缓存 status
+        # 判断数据是否可以安全打包。
         _step(1, "停止源实例容器...")
-        if instance.get("status") == "running":
+        running_source_services = self._get_running_source_services(src_distro, deploy_dir)
+        if running_source_services is None:
+            self.log_received.emit(
+                "[接管] ✗ 无法确认源实例的实时运行状态，已中止迁移；"
+                "请根据上方命令输出处理后重试",
+                "error",
+            )
+            return False
+
+        source_stopped = False
+        migration_succeeded = False
+        if running_source_services:
             stop_ok = self._stop_source_instance(src_distro, deploy_dir)
             if not stop_ok:
                 self.log_received.emit(
@@ -582,78 +594,94 @@ class WSLDiscoveryMixin:
                     "error",
                 )
                 return False
+            source_stopped = True
         else:
             self.log_received.emit("[接管] 源实例未运行，跳过停止步骤", "debug")
 
-        # 3. 迁移镜像（docker save → docker load，跳过拉取）
-        _step(2, "迁移 Docker 镜像...")
-        images_ok = self._migrate_images(src_distro)
-        if not images_ok:
-            self.log_received.emit(
-                "[接管] ⚠ 镜像迁移未完成，后续首次启动将需要联网拉取镜像",
-                "warn",
-            )
+        try:
+            # 3. 迁移镜像（docker save → docker load，跳过拉取）
+            _step(2, "迁移 Docker 镜像...")
+            images_ok = self._migrate_images(src_distro)
+            if not images_ok:
+                self.log_received.emit(
+                    "[接管] ⚠ 镜像迁移未完成，后续首次启动将需要联网拉取镜像",
+                    "warn",
+                )
 
-        # 4. 打包数据到共享目录（包含 deploy_dir + data_dir + volumes）
-        _step(3, "打包源实例数据...")
-        archive_path = "/mnt/wsl/na_migrate.tar.gz"
-        if not self._pack_source_data(src_distro, deploy_dir, data_dir, archive_path, instance):
-            self.log_received.emit("[接管] /mnt/wsl 不可用，尝试 Windows 临时目录中转...", "warn")
-            archive_path = self._pack_via_windows_temp(src_distro, deploy_dir, data_dir, instance)
-            if not archive_path:
-                self.log_received.emit("[接管] ✗ 数据打包失败", "error")
+            # 4. 打包数据到共享目录（包含 deploy_dir + data_dir + volumes）
+            _step(3, "打包源实例数据...")
+            archive_path = "/mnt/wsl/na_migrate.tar.gz"
+            if not self._pack_source_data(src_distro, deploy_dir, data_dir, archive_path, instance):
+                self.log_received.emit("[接管] /mnt/wsl 不可用，尝试 Windows 临时目录中转...", "warn")
+                archive_path = self._pack_via_windows_temp(src_distro, deploy_dir, data_dir, instance)
+                if not archive_path:
+                    self.log_received.emit("[接管] ✗ 数据打包失败", "error")
+                    return False
+
+            # 5. 计算目标路径（保留源 INSTANCE_NAME 以确保 volume 名称一致）
+            instance_name = instance.get("instance_name") or instance.get("env", {}).get("INSTANCE_NAME", "")
+            if instance_name and not instance_name.endswith("_"):
+                instance_name += "_"
+            dest_deploy_dir = f"/root/{instance_name}nekro_agent" if instance_name else "/root/nekro_agent"
+            dest_data_dir = f"/root/{instance_name}nekro_agent_data" if instance_name else "/root/nekro_agent_data"
+
+            # 6. 在 NekroAgent 发行版中解压（Docker daemon 尚未启动，避免 metadata 冲突）
+            _step(4, "还原数据到目标环境...")
+            if not self._restore_data(archive_path):
+                self.log_received.emit("[接管] ✗ 数据还原失败", "error")
                 return False
 
-        # 5. 计算目标路径（保留源 INSTANCE_NAME 以确保 volume 名称一致）
-        instance_name = instance.get("instance_name") or instance.get("env", {}).get("INSTANCE_NAME", "")
-        if instance_name and not instance_name.endswith("_"):
-            instance_name += "_"
-        dest_deploy_dir = f"/root/{instance_name}nekro_agent" if instance_name else "/root/nekro_agent"
-        dest_data_dir = f"/root/{instance_name}nekro_agent_data" if instance_name else "/root/nekro_agent_data"
+            # 7. 将解压出的数据移动到 /root 下的标准路径
+            _step(5, "整理目录结构...")
+            if not self._relocate_dir(data_dir, dest_data_dir, timeout=300):
+                self.log_received.emit("[接管] ✗ 数据目录整理失败", "error")
+                return False
+            if not self._relocate_dir(deploy_dir, dest_deploy_dir):
+                self.log_received.emit("[接管] ✗ 部署目录整理失败", "error")
+                return False
 
-        # 6. 在 NekroAgent 发行版中解压（Docker daemon 尚未启动，避免 metadata 冲突）
-        _step(4, "还原数据到目标环境...")
-        if not self._restore_data(archive_path):
-            self.log_received.emit("[接管] ✗ 数据还原失败", "error")
-            return False
+            # 8. 清理临时文件
+            _step(6, "清理临时文件...")
+            self._cleanup_archive(src_distro, archive_path)
 
-        # 7. 将解压出的数据移动到 /root 下的标准路径
-        _step(5, "整理目录结构...")
-        if not self._relocate_dir(data_dir, dest_data_dir, timeout=300):
-            self.log_received.emit("[接管] ✗ 数据目录整理失败", "error")
-            return False
-        if not self._relocate_dir(deploy_dir, dest_deploy_dir):
-            self.log_received.emit("[接管] ✗ 部署目录整理失败", "error")
-            return False
+            # 9. 写入 .env 到目标发行版，保留原始凭据但修正数据目录路径
+            _step(7, "写入配置并同步...")
+            raw_env = instance.get("raw_env", "")
+            if raw_env:
+                fixed_env = self._rewrite_env_data_dir(raw_env, dest_data_dir)
+                self._run_wsl_checked(
+                    DISTRO_NAME,
+                    f"mkdir -p {shlex.quote(dest_deploy_dir)}",
+                    action="[接管] 创建目标部署目录失败",
+                    user="root",
+                    timeout=30,
+                )
+                self._write_to_wsl(DISTRO_NAME, fixed_env, f"{dest_deploy_dir}/.env")
+                self.log_received.emit("[接管] ✓ 原始 .env 已写入目标发行版（数据目录已修正）", "info")
+            else:
+                self.log_received.emit("[接管] ⚠ 未获取到原始 .env，凭据将在首次启动时重新生成", "warn")
 
-        # 8. 清理临时文件
-        _step(6, "清理临时文件...")
-        self._cleanup_archive(src_distro, archive_path)
+            env = instance["env"]
+            normalized_instance = {**instance, "deploy_dir": dest_deploy_dir, "data_dir": dest_data_dir}
+            self._sync_config_from_env(env, instance["deploy_mode"], instance.get("agent_image", ""), normalized_instance)
 
-        # 9. 写入 .env 到目标发行版，保留原始凭据但修正数据目录路径
-        _step(7, "写入配置并同步...")
-        raw_env = instance.get("raw_env", "")
-        if raw_env:
-            fixed_env = self._rewrite_env_data_dir(raw_env, dest_data_dir)
-            self._run_wsl_checked(
-                DISTRO_NAME,
-                f"mkdir -p {shlex.quote(dest_deploy_dir)}",
-                action="[接管] 创建目标部署目录失败",
-                user="root",
-                timeout=30,
-            )
-            self._write_to_wsl(DISTRO_NAME, fixed_env, f"{dest_deploy_dir}/.env")
-            self.log_received.emit("[接管] ✓ 原始 .env 已写入目标发行版（数据目录已修正）", "info")
-        else:
-            self.log_received.emit("[接管] ⚠ 未获取到原始 .env，凭据将在首次启动时重新生成", "warn")
-
-        env = instance["env"]
-        normalized_instance = {**instance, "deploy_dir": dest_deploy_dir, "data_dir": dest_data_dir}
-        self._sync_config_from_env(env, instance["deploy_mode"], instance.get("agent_image", ""), normalized_instance)
-
-        self.log_received.emit("[接管] ✓ 迁移完成，启动器接管", "info")
-        self.progress_updated.emit("迁移完成！")
-        return True
+            migration_succeeded = True
+            self.log_received.emit("[接管] ✓ 迁移完成，启动器接管", "info")
+            self.progress_updated.emit("迁移完成！")
+            return True
+        finally:
+            if source_stopped and not migration_succeeded:
+                self.log_received.emit("[接管] 迁移未完成，正在恢复源实例原运行状态...", "warn")
+                if not self._start_source_instance(
+                    src_distro,
+                    deploy_dir,
+                    running_source_services,
+                ):
+                    self.log_received.emit(
+                        "[接管] ✗ 迁移失败且源实例未能自动恢复；"
+                        "请根据上方命令输出手动启动源实例",
+                        "error",
+                    )
 
     def _relocate_dir(self, src, dest, timeout=120):
         """将 src 目录移动到 dest（同路径则跳过），优先 mv 快速重命名。"""
@@ -724,14 +752,68 @@ class WSLDiscoveryMixin:
             return False
         return True
 
+    def _get_running_source_services(self, distro: str, deploy_dir: str) -> list[str] | None:
+        """实时返回源 Compose 项目中正在运行的 service。
+
+        None 表示无法可靠判断，调用方必须中止迁移，避免在线打包数据。
+        """
+        cmd = (
+            f"cd {shlex.quote(deploy_dir)} && "
+            "if [ ! -S /var/run/docker.sock ]; then exit 0; fi; "
+            "if docker compose version >/dev/null 2>&1; then "
+            "  docker compose ps --services --filter status=running; "
+            "elif docker-compose version >/dev/null 2>&1; then "
+            "  docker-compose ps --services --filter status=running; "
+            "else "
+            "  echo 'Docker Compose is unavailable' >&2; exit 127; "
+            "fi"
+        )
+        try:
+            proc = subprocess.run(
+                ["wsl", "-d", distro, "-u", "root", "--", "bash", "-c", cmd],
+                capture_output=True,
+                timeout=30,
+                creationflags=self._creation_flags(),
+            )
+            if proc.returncode != 0:
+                self.log_received.emit(
+                    self._format_command_failure(
+                        "[接管] 检测源实例运行状态失败",
+                        cmd=cmd,
+                        distro=distro,
+                        user="root",
+                        timeout=30,
+                        returncode=proc.returncode,
+                        stdout=proc.stdout,
+                        stderr=proc.stderr,
+                    ),
+                    "error",
+                )
+                return None
+            output = self._clean_command_output(self._safe_decode(proc.stdout))
+            return list(dict.fromkeys(line.strip() for line in output.splitlines() if line.strip()))
+        except Exception as e:
+            self.log_received.emit(
+                self._format_command_failure(
+                    "[接管] 检测源实例运行状态异常",
+                    cmd=cmd,
+                    distro=distro,
+                    user="root",
+                    timeout=30,
+                    exception=e,
+                ),
+                "error",
+            )
+            return None
+
     def _stop_source_instance(self, distro: str, deploy_dir: str) -> bool:
         """停止源发行版中的 nekro-agent 容器，兼容新版插件式和旧版独立 docker-compose。"""
         cmd = (
             f"cd {shlex.quote(deploy_dir)} && "
             f'if docker compose version >/dev/null 2>&1; then '
-            f'  docker compose -f docker-compose.yml stop 2>&1; '
+            f'  docker compose stop; '
             f'else '
-            f'  docker-compose -f docker-compose.yml stop 2>&1; '
+            f'  docker-compose stop; '
             f'fi'
         )
         try:
@@ -761,6 +843,61 @@ class WSLDiscoveryMixin:
             self.log_received.emit(
                 self._format_command_failure(
                     "[接管] 停止源实例异常",
+                    cmd=cmd,
+                    distro=distro,
+                    user="root",
+                    timeout=60,
+                    exception=e,
+                ),
+                "error",
+            )
+            return False
+
+    def _start_source_instance(
+        self,
+        distro: str,
+        deploy_dir: str,
+        services: list[str],
+    ) -> bool:
+        """恢复迁移前实际运行的源 Compose services，不启动原本停止的 service。"""
+        if not services:
+            return True
+        service_args = " ".join(shlex.quote(service) for service in services)
+        cmd = (
+            f"cd {shlex.quote(deploy_dir)} && "
+            f'if docker compose version >/dev/null 2>&1; then '
+            f'  docker compose start {service_args}; '
+            f'else '
+            f'  docker-compose start {service_args}; '
+            f'fi'
+        )
+        try:
+            proc = subprocess.run(
+                ["wsl", "-d", distro, "-u", "root", "--", "bash", "-c", cmd],
+                capture_output=True,
+                timeout=60,
+                creationflags=self._creation_flags(),
+            )
+            if proc.returncode != 0:
+                self.log_received.emit(
+                    self._format_command_failure(
+                        "[接管] 恢复源实例运行状态失败",
+                        cmd=cmd,
+                        distro=distro,
+                        user="root",
+                        timeout=60,
+                        returncode=proc.returncode,
+                        stdout=proc.stdout,
+                        stderr=proc.stderr,
+                    ),
+                    "error",
+                )
+                return False
+            return True
+        except Exception as e:
+            self.log_received.emit(
+                self._format_command_failure(
+                    "[接管] 恢复源实例运行状态异常",
                     cmd=cmd,
                     distro=distro,
                     user="root",
@@ -1036,8 +1173,8 @@ class WSLDiscoveryMixin:
     def _restore_data(self, archive_path: str) -> bool:
         """在 NekroAgent 发行版中以 root 解压迁移包。
 
-        如果 Docker daemon 原本正在运行，解压前停止并在 finally 中恢复运行状态。
-        原本未运行时保持停止，避免迁移意外改变目标环境状态。
+        如果 Docker daemon 原本正在运行，解压前停止，仅在完整解压成功后恢复。
+        解压失败时保持 Docker 停止，避免 daemon 在部分覆盖的 volume 上启动。
         """
         docker_was_active = False
         restore_ok = False
@@ -1075,7 +1212,7 @@ class WSLDiscoveryMixin:
         except Exception as e:
             self.log_received.emit(f"[接管] 数据还原异常:\n{e}", "error")
         finally:
-            if docker_was_active:
+            if docker_was_active and restore_ok:
                 try:
                     self._run_wsl_checked(
                         DISTRO_NAME,
@@ -1091,6 +1228,12 @@ class WSLDiscoveryMixin:
                         f"[接管] 恢复目标 Docker 原运行状态异常:\n{e}",
                         "error",
                     )
+            elif docker_was_active and not restore_ok:
+                self.log_received.emit(
+                    "[接管] 数据还原未完成，目标 Docker 已保持停止；"
+                    "请先处理上方还原错误，不要手动启动目标 Docker",
+                    "error",
+                )
         return restore_ok and docker_state_restored
 
     def _cleanup_archive(self, src_distro: str, archive_path: str):

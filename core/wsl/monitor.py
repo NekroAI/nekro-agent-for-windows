@@ -13,12 +13,19 @@ class WSLMonitorMixin:
     _health_generation: int = 0
     _health_lock = threading.Lock()
 
+    def _invalidate_health_checks(self):
+        """使所有已启动的健康检查失效。"""
+        with self._health_lock:
+            self._health_generation += 1
+
     def refresh_running_state(self):
         """后台探测当前 active 实例的 compose 服务是否仍在运行，校准 is_running。
 
         用于更新失败、移除实例等 is_running 可能失真的场景；
         探测完成后按真实状态发出「运行中」或「已停止」。
         """
+
+        target_id = self.config.get_active_instance_id() if self.config else ""
 
         def _probe():
             deploy_dir, _, _ = self._get_active_deploy_paths()
@@ -30,6 +37,8 @@ class WSLMonitorMixin:
             try:
                 output = self._wsl_exec(DISTRO_NAME, cmd, timeout=30)
             except Exception:
+                return
+            if self.config and self.config.get_active_instance_id() != target_id:
                 return
             running = bool(self._clean_command_output(output).strip())
             self.is_running = running
@@ -125,12 +134,21 @@ class WSLMonitorMixin:
                 with urlopen(f"http://localhost:{nekro_port}", timeout=5) as resp:
                     ready = resp.status == 200
                 if ready:
-                    if self._health_generation != my_gen:
+                    if (
+                        self._stop_event.is_set()
+                        or self._health_generation != my_gen
+                    ):
                         return
                     elapsed = time.time() - start
                     self.log_received.emit(f"服务已就绪！(耗时 {elapsed:.1f}s)", "info")
+                    if self._stop_event.is_set() or self._health_generation != my_gen:
+                        return
                     self.progress_updated.emit("__deploy_progress__|done|服务已就绪")
+                    if self._stop_event.is_set() or self._health_generation != my_gen:
+                        return
                     self.boot_finished.emit()
+                    if self._stop_event.is_set() or self._health_generation != my_gen:
+                        return
                     self.status_changed.emit("运行中")
                     return
             except Exception:
