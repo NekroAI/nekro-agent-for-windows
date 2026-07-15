@@ -78,21 +78,28 @@ class WSLMonitorMixin:
                     m = napcat_token_pattern.search(text)
                     if m and self.config:
                         token = m.group(1)
-                        info = self.config.get("deploy_info") or {}
+                        info = dict(self.config.get("deploy_info") or {})
                         if info.get("napcat_token") != token:
                             info["napcat_token"] = token
-                            self._save_deploy_info(info, inst_id=inst_id)
-                            self.log_received.emit(
-                                f"{log_prefix}[NapCat] 已捕获 WebUI Token，请在部署凭据窗口查看。",
-                                "info",
-                            )
-                            if self._pending_deploy_info:
-                                self._pending_deploy_info["napcat_token"] = token
-                                self._show_deploy_info(
-                                    self._pending_deploy_info,
-                                    inst_id=inst_id,
+                            if self._save_deploy_info(info, inst_id=inst_id):
+                                self.log_received.emit(
+                                    f"{log_prefix}[NapCat] 已捕获 WebUI Token，请在部署凭据窗口查看。",
+                                    "info",
                                 )
-                                self._pending_deploy_info = None
+                                if self._pending_deploy_info:
+                                    self._pending_deploy_info["napcat_token"] = token
+                                    self._show_deploy_info(
+                                        self._pending_deploy_info,
+                                        inst_id=inst_id,
+                                    )
+                                    self._pending_deploy_info = None
+                            else:
+                                error = self.config.last_save_error or "未知错误"
+                                self.log_received.emit(
+                                    f"{log_prefix}[NapCat] 已捕获 WebUI Token，但保存配置失败。"
+                                    f"错误: {error}",
+                                    "error",
+                                )
         except Exception as e:
             if not self._stop_event.is_set():
                 self.log_received.emit(

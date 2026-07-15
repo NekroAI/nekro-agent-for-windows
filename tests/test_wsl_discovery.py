@@ -99,6 +99,53 @@ class _MigrationFlowDummy(WSLDiscoveryMixin):
         return True
 
 
+class _RollbackMigrationDummy(_MigrationFlowDummy):
+    def __init__(self):
+        super().__init__(running_services=["nekro_agent"])
+        self.paths = set()
+        self.move_calls = []
+        self.deploy_move_failed = False
+        self.docker_restore_calls = 0
+        self.staging_cleanup_calls = 0
+
+    def _find_migration_destination_conflicts(self, paths):
+        return [path for path in paths if path in self.paths]
+
+    def _prepare_target_docker_for_migration(self):
+        return True
+
+    def _restore_data(self, _archive_path, staging_dir):
+        self.paths.update(
+            {
+                self._staged_migration_path(staging_dir, "/root/nekro_agent_data"),
+                self._staged_migration_path(staging_dir, "/root/nekro_agent"),
+            }
+        )
+        return True
+
+    def _relocate_dir(self, src, dest, timeout=120):
+        self.move_calls.append((src, dest, timeout))
+        if dest == "/root/nekro_agent" and not self.deploy_move_failed:
+            self.deploy_move_failed = True
+            return False
+        if src not in self.paths or dest in self.paths:
+            return False
+        self.paths.remove(src)
+        self.paths.add(dest)
+        return True
+
+    def _wsl_path_exists(self, _distro, path, *, user="root"):
+        return path in self.paths
+
+    def _cleanup_migration_staging_dir(self, staging_dir):
+        self.staging_cleanup_calls += 1
+        self.paths = {path for path in self.paths if not path.startswith(staging_dir + "/")}
+
+    def _restore_target_docker_after_migration(self):
+        self.docker_restore_calls += 1
+        return True
+
+
 class _RestoreDummy(WSLDiscoveryMixin, WSLShellMixin):
     def __init__(self, *, docker_active=True, restore_returncode=0, start_returncode=0):
         self.log_received = _Signal()
@@ -197,6 +244,68 @@ class WSLDiscoveryMigrationTests(unittest.TestCase):
         self.assertIn("避免覆盖或合并", message)
         self.assertIn("/root/nekro_agent", message)
         self.assertIn("INSTANCE_NAME", message)
+
+    def test_deploy_move_failure_rolls_back_data_and_allows_retry(self):
+        backend = _RollbackMigrationDummy()
+        instance = {
+            "distro": "Ubuntu",
+            "deploy_dir": "/root/nekro_agent",
+            "data_dir": "/root/nekro_agent_data",
+            "env": {},
+            "deploy_mode": "lite",
+        }
+
+        self.assertFalse(backend._takeover_foreign(instance))
+
+        staging = "/root/.nekro-agent-migrate.test"
+        staged_data = f"{staging}/root/nekro_agent_data"
+        staged_deploy = f"{staging}/root/nekro_agent"
+        self.assertEqual(
+            backend.move_calls[:3],
+            [
+                (staged_data, "/root/nekro_agent_data", 300),
+                (staged_deploy, "/root/nekro_agent", 120),
+                ("/root/nekro_agent_data", staged_data, 300),
+            ],
+        )
+        self.assertNotIn("/root/nekro_agent_data", backend.paths)
+        self.assertNotIn("/root/nekro_agent", backend.paths)
+        self.assertEqual(backend.docker_restore_calls, 1)
+        self.assertEqual(backend.staging_cleanup_calls, 1)
+
+        dest_paths = backend._migration_destination_paths(instance)
+        self.assertEqual(
+            backend._find_migration_destination_conflicts(
+                [dest_paths[0], dest_paths[1], *dest_paths[2]]
+            ),
+            [],
+        )
+        self.assertTrue(backend._takeover_foreign(instance))
+
+    def test_docker_restart_failure_keeps_committed_target_and_source_stopped(self):
+        backend = _RollbackMigrationDummy()
+        backend.deploy_move_failed = True
+        backend._restore_target_docker_after_migration = lambda: False
+        instance = {
+            "distro": "Ubuntu",
+            "deploy_dir": "/root/nekro_agent",
+            "data_dir": "/root/nekro_agent_data",
+            "env": {},
+            "deploy_mode": "lite",
+        }
+
+        self.assertFalse(backend._takeover_foreign(instance))
+
+        self.assertIn("/root/nekro_agent_data", backend.paths)
+        self.assertIn("/root/nekro_agent", backend.paths)
+        self.assertEqual(backend.start_calls, [])
+        self.assertEqual(backend.staging_cleanup_calls, 1)
+        self.assertTrue(
+            any(
+                "数据与启动器配置已完成迁移" in message and level == "error"
+                for message, level in backend.log_received.messages
+            )
+        )
 
     def test_stale_stopped_status_still_stops_actually_running_source(self):
         backend = _MigrationFlowDummy(running_services=["nekro_agent"])

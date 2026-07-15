@@ -93,16 +93,15 @@ class WSLDeployMixin:
 
     def _save_deploy_info(self, info, inst_id=None):
         if not self.config:
-            return
+            return False
         target_id = inst_id or self.config.get_active_instance_id()
         if target_id:
-            self.config.update_instance_with_globals(
+            return self.config.update_instance_with_globals(
                 target_id,
                 instance_updates={"deploy_info": info},
                 global_updates={"deploy_info": info},
             )
-        else:
-            self.config.set("deploy_info", info)
+        return self.config.set("deploy_info", info)
 
     def _wait_deploy_optional_reply(self, label, prompt, timeout=300):
         self._deploy_optional_reply = None

@@ -215,7 +215,7 @@ class CreateRuntimeRecoveryTests(unittest.TestCase):
         self.assertIn("不会再次导入或继续配置", message)
 
     @mock.patch("core.wsl.runtime.time.sleep")
-    def test_guest_marker_failure_discards_partial_distro_for_retry(self, _sleep):
+    def test_guest_marker_failure_does_not_unregister_unproven_distro(self, _sleep):
         backend = _RuntimeDummy()
         backend.fail_guest_marker_once = True
         subprocess_calls = []
@@ -225,15 +225,54 @@ class CreateRuntimeRecoveryTests(unittest.TestCase):
             side_effect=_successful_wsl_run(backend, subprocess_calls),
         ):
             self.assertFalse(backend.create_runtime(install_dir))
-            self.assertFalse(backend.distro_exists)
-            self.assertTrue(backend.create_runtime(install_dir))
+            self.assertTrue(backend.distro_exists)
 
         import_calls = [args for args in subprocess_calls if args[:2] == ["wsl", "--import"]]
         unregister_calls = [
             args for args in subprocess_calls if args[:2] == ["wsl", "--unregister"]
         ]
-        self.assertEqual(len(import_calls), 2)
-        self.assertEqual(len(unregister_calls), 1)
+        self.assertEqual(len(import_calls), 1)
+        self.assertEqual(unregister_calls, [])
+        self.assertTrue(
+            any(
+                "不会自动注销" in message[0]
+                for message in backend.install_error.messages
+            )
+        )
+
+    def test_import_false_negative_never_unregisters_existing_unmarked_distro(self):
+        backend = _RuntimeDummy()
+        import_failure = subprocess.CompletedProcess(
+            [],
+            1,
+            stdout=b"",
+            stderr=b"A distribution with the supplied name already exists.\n",
+        )
+
+        with tempfile.TemporaryDirectory() as install_dir, mock.patch.object(
+            backend,
+            "_distro_exists",
+            side_effect=[False, True],
+        ), mock.patch(
+            "core.wsl.runtime.subprocess.run",
+            return_value=import_failure,
+        ) as run:
+            self.assertFalse(backend.create_runtime(install_dir))
+
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(len([args for args in commands if args[:2] == ["wsl", "--import"]]), 1)
+        self.assertEqual([args for args in commands if args[:2] == ["wsl", "--unregister"]], [])
+
+    def test_discard_refuses_mismatched_guest_marker(self):
+        backend = _RuntimeDummy(distro_exists=True)
+        backend.guest_marker = "another-install-token"
+
+        with mock.patch("core.wsl.runtime.subprocess.run") as run:
+            self.assertFalse(backend._discard_failed_runtime_import("current-install-token"))
+
+        run.assert_not_called()
+        message = backend.install_error.messages[-1][0]
+        self.assertIn("恢复标记与本次创建任务不匹配", message)
 
 
 if __name__ == "__main__":

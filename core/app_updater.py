@@ -184,7 +184,7 @@ def check_update() -> UpdateCheckResult:
             if not isinstance(asset, dict):
                 continue
             name = str(asset.get("name", ""))
-            if ASSET_PATTERN.match(name):
+            if ASSET_PATTERN.fullmatch(name):
                 asset_url = str(asset.get("browser_download_url", ""))
                 asset_name = name
                 asset_size = asset.get("size", 0)

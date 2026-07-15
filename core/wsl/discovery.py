@@ -669,10 +669,11 @@ class WSLDiscoveryMixin:
 
         source_stopped = False
         migration_succeeded = False
+        migration_committed = False
         staging_dir = ""
         target_docker_was_active = False
         target_docker_prepared = False
-        target_paths_mutated = False
+        completed_moves: list[tuple[str, str]] = []
         if running_source_services:
             stop_ok = self._stop_source_instance(src_distro, deploy_dir)
             if not stop_ok:
@@ -729,10 +730,11 @@ class WSLDiscoveryMixin:
             if not self._relocate_dir(staged_data_dir, dest_data_dir, timeout=300):
                 self.log_received.emit("[接管] ✗ 数据目录整理失败", "error")
                 return False
-            target_paths_mutated = True
+            completed_moves.append((staged_data_dir, dest_data_dir))
             if not self._relocate_dir(staged_deploy_dir, dest_deploy_dir):
                 self.log_received.emit("[接管] ✗ 部署目录整理失败", "error")
                 return False
+            completed_moves.append((staged_deploy_dir, dest_deploy_dir))
 
             for volume_dir in dest_volume_dirs:
                 staged_volume_dir = self._staged_migration_path(staging_dir, volume_dir)
@@ -741,6 +743,7 @@ class WSLDiscoveryMixin:
                 if not self._relocate_dir(staged_volume_dir, volume_dir, timeout=300):
                     self.log_received.emit(f"[接管] ✗ Docker volume 整理失败: {volume_dir}", "error")
                     return False
+                completed_moves.append((staged_volume_dir, volume_dir))
 
             # 7. 清理临时文件
             _step(6, "清理临时文件...")
@@ -773,6 +776,8 @@ class WSLDiscoveryMixin:
             ):
                 return False
 
+            migration_committed = True
+
             if target_docker_was_active and not self._restore_target_docker_after_migration():
                 return False
 
@@ -781,18 +786,27 @@ class WSLDiscoveryMixin:
             self.progress_updated.emit("迁移完成！")
             return True
         finally:
-            if staging_dir:
+            rollback_ok = True
+            if not migration_committed and completed_moves:
+                rollback_ok = self._rollback_migration_moves(completed_moves)
+            if staging_dir and (migration_committed or rollback_ok):
                 self._cleanup_migration_staging_dir(staging_dir)
-            if target_docker_prepared and target_docker_was_active and not migration_succeeded:
-                if target_paths_mutated:
+            if target_docker_prepared and target_docker_was_active and not migration_committed:
+                if rollback_ok:
+                    self._restore_target_docker_after_migration()
+                else:
                     self.log_received.emit(
-                        "[接管] 目标数据已发生部分变更，Docker 已保持停止；"
-                        "请根据上方错误检查目标目录后再决定是否启动 Docker",
+                        "[接管] 部分目标数据未能回滚，Docker 已保持停止；"
+                        "请根据上方具体路径和命令输出完成手动恢复后再启动 Docker",
                         "error",
                     )
-                else:
-                    self._restore_target_docker_after_migration()
-            if source_stopped and not migration_succeeded:
+            if migration_committed and not migration_succeeded:
+                self.log_received.emit(
+                    "[接管] 数据与启动器配置已完成迁移，但目标 Docker 未能恢复。"
+                    "源实例将保持停止，请根据上方错误手动启动 NekroAgent 发行版中的 Docker。",
+                    "error",
+                )
+            if source_stopped and not migration_committed:
                 self.log_received.emit("[接管] 迁移未完成，正在恢复源实例原运行状态...", "warn")
                 if not self._start_source_instance(
                     src_distro,
@@ -864,6 +878,44 @@ class WSLDiscoveryMixin:
             "error",
         )
         return False
+
+    def _rollback_migration_moves(self, completed_moves: list[tuple[str, str]]) -> bool:
+        """按逆序将已提交的目标目录移回 staging，全部成功后才允许恢复 Docker。"""
+        self.log_received.emit("[接管] 迁移未完成，正在回滚已移动的目标数据...", "warn")
+        for staged_path, dest_path in reversed(completed_moves):
+            if not self._wsl_path_exists(DISTRO_NAME, dest_path, user="root"):
+                if self._wsl_path_exists(DISTRO_NAME, staged_path, user="root"):
+                    continue
+                self.log_received.emit(
+                    "[接管] 回滚失败：目标与 staging 路径均不存在\n"
+                    f"目标路径: {dest_path}\n"
+                    f"staging 路径: {staged_path}\n"
+                    "请检查上方迁移日志并手动确认数据位置。",
+                    "error",
+                )
+                return False
+            if self._wsl_path_exists(DISTRO_NAME, staged_path, user="root"):
+                self.log_received.emit(
+                    "[接管] 回滚失败：staging 路径已被占用，拒绝覆盖或合并\n"
+                    f"目标路径: {dest_path}\n"
+                    f"staging 路径: {staged_path}",
+                    "error",
+                )
+                return False
+            if not self._relocate_dir(dest_path, staged_path, timeout=300):
+                self.log_received.emit(
+                    "[接管] 回滚目录失败；Docker 将保持停止\n"
+                    f"目标路径: {dest_path}\n"
+                    f"staging 路径: {staged_path}\n"
+                    "请根据紧邻的目录移动命令输出手动恢复。",
+                    "error",
+                )
+                return False
+            self.log_received.emit(
+                f"[接管] 已回滚目录: {dest_path} → {staged_path}",
+                "warn",
+            )
+        return True
 
     def _get_running_source_services(self, distro: str, deploy_dir: str) -> list[str] | None:
         """实时返回源 Compose 项目中正在运行的 service。

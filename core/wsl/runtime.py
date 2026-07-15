@@ -92,11 +92,23 @@ class WSLRuntimeMixin:
         except OSError as e:
             self.log_received.emit(f"[发行版创建] 清理恢复标记失败: {e}", "warn")
 
-    def _discard_failed_runtime_import(self):
-        """清理本次创建留下的半导入发行版，使向导可以安全重试。"""
+    def _discard_failed_runtime_import(self, install_token):
+        """仅清理带有本次 token 的半导入发行版，避免误删既有环境。"""
         try:
             if not self._distro_exists():
                 return True
+            if not self._runtime_guest_marker_matches(install_token):
+                detail = (
+                    f"[发行版创建] 检测到 {DISTRO_NAME} 发行版，但其恢复标记与本次创建任务不匹配。\n"
+                    "为避免删除既有或并发创建的运行环境，启动器不会自动注销该发行版。"
+                )
+                self.log_received.emit(detail, "error")
+                self.install_error.emit(
+                    detail
+                    + "\n请确认该发行版来源；仅在确认它是无用半成品后再手动执行 "
+                    "wsl --unregister NekroAgent。"
+                )
+                return False
             proc = subprocess.run(
                 ["wsl", "--unregister", DISTRO_NAME],
                 capture_output=True,
@@ -203,7 +215,7 @@ class WSLRuntimeMixin:
                     self.progress_updated.emit("导入失败")
                     self.log_received.emit(detail, "error")
                     self.install_error.emit(detail)
-                    self._discard_failed_runtime_import()
+                    self._discard_failed_runtime_import(install_token)
                     return False
                 self.log_received.emit(
                     f"[发行版创建] ✓ {DISTRO_NAME} 发行版导入完成", "info"
@@ -225,7 +237,7 @@ class WSLRuntimeMixin:
                 self.progress_updated.emit("导入超时")
                 self.log_received.emit(detail, "error")
                 self.install_error.emit(detail)
-                self._discard_failed_runtime_import()
+                self._discard_failed_runtime_import(install_token)
                 return False
             except Exception as e:
                 detail = self._format_command_failure(
@@ -237,7 +249,7 @@ class WSLRuntimeMixin:
                 self.progress_updated.emit(f"导入异常: {e}")
                 self.log_received.emit(detail, "error")
                 self.install_error.emit(detail)
-                self._discard_failed_runtime_import()
+                self._discard_failed_runtime_import(install_token)
                 return False
 
             try:

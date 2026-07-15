@@ -33,6 +33,11 @@ class _MonitorDummy(WSLMonitorMixin):
         self.progress_updated = _Signal()
         self.boot_finished = _Signal()
         self.status_changed = _Signal()
+        self._pending_deploy_info = None
+
+    @staticmethod
+    def _creation_flags():
+        return 0
 
 
 class _ImmediateThread:
@@ -79,6 +84,40 @@ class _DeployDummy(WSLDeployMixin):
 
 
 class WSLMonitorDeployTests(unittest.TestCase):
+    def test_token_save_failure_does_not_mutate_config_reference(self):
+        class Config:
+            def __init__(self):
+                self.deploy_info = {"napcat_token": "old"}
+                self.last_save_error = "配置目录只读"
+
+            def get(self, key):
+                return self.deploy_info if key == "deploy_info" else None
+
+        class Stdout:
+            def __init__(self):
+                self.lines = iter([b"WebUi started token=newtoken\n", b""])
+
+            def readline(self):
+                return next(self.lines)
+
+        class Proc:
+            def __init__(self):
+                self.stdout = Stdout()
+
+            @staticmethod
+            def poll():
+                return 0
+
+        backend = _MonitorDummy()
+        backend.config = Config()
+        backend._save_deploy_info = lambda *_args, **_kwargs: False
+
+        with patch("core.wsl.monitor.subprocess.Popen", return_value=Proc()):
+            backend._log_reader("NekroAgent", "/root/nekro_agent")
+
+        self.assertEqual(backend.config.deploy_info, {"napcat_token": "old"})
+        self.assertIn("保存配置失败", backend.log_received.items[-1][0])
+
     def test_health_timeout_keeps_compose_running_state(self):
         backend = _MonitorDummy()
 

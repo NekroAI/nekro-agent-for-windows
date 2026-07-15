@@ -39,6 +39,36 @@ class AppUpdaterTests(unittest.TestCase):
         self.assertEqual(result.update_info["file_name"], "NekroAgent-Setup-v9.9.9.exe")
         self.assertEqual(result.update_info["file_sha256"], "a" * 64)
 
+    def test_check_update_ignores_installer_sidecar_files(self):
+        release = {
+            "tag_name": "v9.9.9",
+            "assets": [
+                {
+                    "name": "NekroAgent-Setup-v9.9.9.exe.sha256",
+                    "browser_download_url": (
+                        "https://github.com/NekroAI/nekro-agent-for-windows/"
+                        "releases/download/v9.9.9/NekroAgent-Setup.exe.sha256"
+                    ),
+                    "size": 64,
+                },
+                {
+                    "name": "NekroAgent-Setup-v9.9.9.exe",
+                    "browser_download_url": (
+                        "https://github.com/NekroAI/nekro-agent-for-windows/"
+                        "releases/download/v9.9.9/NekroAgent-Setup.exe"
+                    ),
+                    "size": 123,
+                },
+            ],
+        }
+
+        with patch.object(app_updater, "_try_github_api", return_value=(release, [])):
+            result = app_updater.check_update()
+
+        self.assertEqual(result.status, "available")
+        assert result.update_info is not None
+        self.assertEqual(result.update_info["file_name"], "NekroAgent-Setup-v9.9.9.exe")
+
     def test_check_update_reports_latest_separately_from_failure(self):
         release = {"tag_name": app_updater.APP_VERSION, "assets": []}
 
