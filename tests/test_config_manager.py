@@ -82,6 +82,78 @@ class ConfigManagerTests(unittest.TestCase):
             self.assertEqual(config.get("nekro_port"), 8021)
             self.assertTrue(config.last_save_error)
 
+    def test_remove_instance_with_globals_is_atomic(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = ConfigManager(config_path=os.path.join(temp_dir, "config.json"))
+            self.assertTrue(
+                config.set_instance(
+                    "default",
+                    {"deploy_mode": "lite", "nekro_port": 8021},
+                )
+            )
+            self.assertTrue(
+                config.set_instance(
+                    "inst_2",
+                    {"deploy_mode": "napcat", "nekro_port": 18021},
+                )
+            )
+            self.assertTrue(
+                config.set_many(
+                    {
+                        "active_instance": "default",
+                        "default_instance": "default",
+                        "deploy_mode": "lite",
+                        "nekro_port": 8021,
+                    }
+                )
+            )
+
+            with patch.object(config, "_save_config_locked", return_value=False):
+                saved = config.remove_instance_with_globals(
+                    "default",
+                    global_updates={
+                        "active_instance": "inst_2",
+                        "deploy_mode": "napcat",
+                        "nekro_port": 18021,
+                    },
+                )
+
+            self.assertFalse(saved)
+            self.assertIsNotNone(config.get_instance("default"))
+            self.assertEqual(config.get_active_instance_id(), "default")
+            self.assertEqual(config.get("deploy_mode"), "lite")
+            self.assertEqual(config.get("nekro_port"), 8021)
+
+    def test_remove_instance_with_globals_commits_fallback_state(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = ConfigManager(config_path=os.path.join(temp_dir, "config.json"))
+            self.assertTrue(config.set_instance("default", {"deploy_mode": "lite"}))
+            self.assertTrue(
+                config.set_instance("inst_2", {"deploy_mode": "napcat"})
+            )
+            self.assertTrue(
+                config.set_many(
+                    {
+                        "active_instance": "default",
+                        "default_instance": "default",
+                    }
+                )
+            )
+
+            saved = config.remove_instance_with_globals(
+                "default",
+                global_updates={
+                    "active_instance": "inst_2",
+                    "deploy_mode": "napcat",
+                },
+            )
+
+            self.assertTrue(saved)
+            self.assertIsNone(config.get_instance("default"))
+            self.assertEqual(config.get_active_instance_id(), "inst_2")
+            self.assertEqual(config.get_default_instance_id(), "inst_2")
+            self.assertEqual(config.get("deploy_mode"), "napcat")
+
 
 if __name__ == "__main__":
     unittest.main()

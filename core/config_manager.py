@@ -381,6 +381,10 @@ class ConfigManager:
             return self._mutate_and_save_locked(_apply)
 
     def remove_instance(self, inst_id):
+        return self.remove_instance_with_globals(inst_id)
+
+    def remove_instance_with_globals(self, inst_id, global_updates=None):
+        """原子移除实例，并按需同步全局兼容字段。"""
         with self._lock:
             def _apply(candidate):
                 instances = candidate.get("instances") or {}
@@ -390,6 +394,8 @@ class ConfigManager:
                     candidate["active_instance"] = fallback
                 if candidate.get("default_instance") == inst_id:
                     candidate["default_instance"] = candidate.get("active_instance") or fallback
+                if global_updates:
+                    candidate.update(copy.deepcopy(global_updates))
 
             return self._mutate_and_save_locked(_apply)
 

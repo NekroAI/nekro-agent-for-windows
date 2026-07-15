@@ -91,7 +91,7 @@ class WSLDeployMixin:
                 )
         return "/root/nekro_agent", "/root/nekro_agent_data", ""
 
-    def _save_deploy_info(self, info, inst_id=None):
+    def _save_deploy_info(self, info, inst_id=None, sync_global=True):
         if not self.config:
             return False
         target_id = inst_id or self.config.get_active_instance_id()
@@ -99,9 +99,21 @@ class WSLDeployMixin:
             return self.config.update_instance_with_globals(
                 target_id,
                 instance_updates={"deploy_info": info},
-                global_updates={"deploy_info": info},
+                global_updates={"deploy_info": info} if sync_global else None,
             )
         return self.config.set("deploy_info", info)
+
+    def _report_deploy_info_save_failure(self):
+        error = self.config.last_save_error if self.config else ""
+        self.log_received.emit(
+            "[部署] 服务已启动但配置未保存。请检查启动器配置目录是否可写，"
+            "修复后重新部署以保存访问凭据。\n"
+            f"错误: {error or '未知错误'}",
+            "error",
+        )
+        # 复用现有部署失败状态，让向导结束等待；is_running 保持 True，
+        # 主窗口会明确显示服务仍在运行，详细原因由上面的日志提供。
+        self.status_changed.emit("启动失败")
 
     def _wait_deploy_optional_reply(self, label, prompt, timeout=300):
         self._deploy_optional_reply = None
@@ -350,21 +362,34 @@ class WSLDeployMixin:
         self.progress_updated.emit("__deploy_progress__|health|等待服务就绪")
         _log("Compose 服务已启动，等待就绪...")
         deploy_info = self._parse_deploy_info(env_content, deploy_mode)
-        # update_instance 会原地覆盖 inst["deploy_info"]，旧凭据必须先取出
         previous_info = inst.get("deploy_info") or {}
-        self.config.update_instance(inst_id, deploy_info=deploy_info)
+        if previous_info.get("napcat_token"):
+            deploy_info["napcat_token"] = previous_info["napcat_token"]
 
         if attach_logs and is_first_deploy:
             if deploy_mode == "napcat":
+                if not self._save_deploy_info(
+                    deploy_info,
+                    inst_id=inst_id,
+                    sync_global=False,
+                ):
+                    self._report_deploy_info_save_failure()
+                    return False
                 self._pending_deploy_info = deploy_info
             else:
-                self._show_deploy_info(deploy_info, inst_id=inst_id)
+                if not self._show_deploy_info(deploy_info, inst_id=inst_id):
+                    return False
+        elif attach_logs:
+            if not self._refresh_deploy_info(deploy_info, inst_id=inst_id):
+                return False
         else:
-            if previous_info.get("napcat_token"):
-                deploy_info["napcat_token"] = previous_info["napcat_token"]
-            self.config.update_instance(inst_id, deploy_info=deploy_info)
-            if attach_logs:
-                self.config.set("deploy_info", deploy_info)
+            if not self._save_deploy_info(
+                deploy_info,
+                inst_id=inst_id,
+                sync_global=False,
+            ):
+                self._report_deploy_info_save_failure()
+                return False
 
         if attach_logs:
             if self._log_process and self._log_process.poll() is None:
@@ -429,10 +454,34 @@ class WSLDeployMixin:
                 "release_channel": self.config.get("release_channel") or "stable",
                 "preview_backup_available": False,
             }
-            self.config.set_instance(inst_id, inst)
+            global_updates = {
+                "active_instance": inst_id,
+                "deploy_mode": inst["deploy_mode"],
+                "nekro_port": inst["nekro_port"],
+                "napcat_port": inst["napcat_port"],
+                "release_channel": inst["release_channel"],
+                "preview_backup_available": False,
+                "deploy_info": inst.get("deploy_info"),
+                "first_run": False,
+            }
             if not self.config.get_default_instance_id():
-                self.config.set_default_instance_id(inst_id)
-            self.config.set("active_instance", inst_id)
+                global_updates["default_instance"] = inst_id
+            saved = self.config.update_instance_with_globals(
+                inst_id,
+                instance_updates=inst,
+                global_updates=global_updates,
+            )
+            if not saved:
+                error = self.config.last_save_error or "未知错误"
+                self.log_received.emit(
+                    "[部署] 无法保存实例配置，服务尚未启动。"
+                    "请检查启动器配置目录是否可写后重试。\n"
+                    f"错误: {error}",
+                    "error",
+                )
+                self.status_changed.emit("启动失败")
+                self._deploying = False
+                return False
 
         def _deploy():
             try:
@@ -966,13 +1015,16 @@ class WSLDeployMixin:
 
     def _show_deploy_info(self, info, inst_id=None):
         """保存凭据并发送信号给 UI 弹窗"""
-        self._save_deploy_info(info, inst_id=inst_id)
+        if not self._save_deploy_info(info, inst_id=inst_id):
+            self._report_deploy_info_save_failure()
+            return False
 
         self.log_received.emit("=== 部署完成！===", "info")
         self.log_received.emit("管理员凭据已生成，请在部署凭据窗口查看。", "info")
         self.log_received.emit(f"Web 访问地址: http://127.0.0.1:{info['port']}", "info")
 
         self.deploy_info_ready.emit(info)
+        return True
 
     def _refresh_deploy_info(self, info, inst_id=None):
         """非首次启动时静默刷新凭据（不弹窗），防止上次中途退出丢失"""
@@ -980,7 +1032,11 @@ class WSLDeployMixin:
             old_info = self.config.get("deploy_info") or {}
             if old_info.get("napcat_token"):
                 info["napcat_token"] = old_info["napcat_token"]
-            self._save_deploy_info(info, inst_id=inst_id)
+            if not self._save_deploy_info(info, inst_id=inst_id):
+                self._report_deploy_info_save_failure()
+                return False
+            return True
+        return False
 
     def _parse_deploy_info(self, env_content, deploy_mode):
         """从 .env 内容中解析部署凭据信息"""

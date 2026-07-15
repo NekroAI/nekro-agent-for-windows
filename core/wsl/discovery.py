@@ -673,6 +673,7 @@ class WSLDiscoveryMixin:
         staging_dir = ""
         target_docker_was_active = False
         target_docker_prepared = False
+        target_docker_stopped_by_recheck = False
         completed_moves: list[tuple[str, str]] = []
         if running_source_services:
             stop_ok = self._stop_source_instance(src_distro, deploy_dir)
@@ -736,10 +737,22 @@ class WSLDiscoveryMixin:
                 return False
             completed_moves.append((staged_deploy_dir, dest_deploy_dir))
 
-            for volume_dir in dest_volume_dirs:
-                staged_volume_dir = self._staged_migration_path(staging_dir, volume_dir)
-                if not self._wsl_path_exists(DISTRO_NAME, staged_volume_dir, user="root"):
-                    continue
+            staged_volumes = [
+                (self._staged_migration_path(staging_dir, volume_dir), volume_dir)
+                for volume_dir in dest_volume_dirs
+                if self._wsl_path_exists(
+                    DISTRO_NAME,
+                    self._staged_migration_path(staging_dir, volume_dir),
+                    user="root",
+                )
+            ]
+            for staged_volume_dir, volume_dir in staged_volumes:
+                stopped_by_recheck = self._ensure_target_docker_stopped_for_volume_change(
+                    f"提交 Docker volume 前（{volume_dir}）"
+                )
+                if stopped_by_recheck is None:
+                    return False
+                target_docker_stopped_by_recheck |= stopped_by_recheck
                 if not self._relocate_dir(staged_volume_dir, volume_dir, timeout=300):
                     self.log_received.emit(f"[接管] ✗ Docker volume 整理失败: {volume_dir}", "error")
                     return False
@@ -788,7 +801,8 @@ class WSLDiscoveryMixin:
         finally:
             rollback_ok = True
             if not migration_committed and completed_moves:
-                rollback_ok = self._rollback_migration_moves(completed_moves)
+                rollback_ok, stopped_by_recheck = self._rollback_migration_moves(completed_moves)
+                target_docker_stopped_by_recheck |= stopped_by_recheck
             if staging_dir and (migration_committed or rollback_ok):
                 self._cleanup_migration_staging_dir(staging_dir)
             if target_docker_prepared and target_docker_was_active and not migration_committed:
@@ -805,6 +819,12 @@ class WSLDiscoveryMixin:
                     "[接管] 数据与启动器配置已完成迁移，但目标 Docker 未能恢复。"
                     "源实例将保持停止，请根据上方错误手动启动 NekroAgent 发行版中的 Docker。",
                     "error",
+                )
+            if target_docker_stopped_by_recheck and not target_docker_was_active:
+                self.log_received.emit(
+                    "[接管] 目标 Docker 在迁移期间被外部启动，已为 volume 安全操作停止；"
+                    "由于迁移开始时 Docker 未运行，将保持停止状态。",
+                    "warn",
                 )
             if source_stopped and not migration_committed:
                 self.log_received.emit("[接管] 迁移未完成，正在恢复源实例原运行状态...", "warn")
@@ -879,10 +899,21 @@ class WSLDiscoveryMixin:
         )
         return False
 
-    def _rollback_migration_moves(self, completed_moves: list[tuple[str, str]]) -> bool:
+    def _rollback_migration_moves(
+        self,
+        completed_moves: list[tuple[str, str]],
+    ) -> tuple[bool, bool]:
         """按逆序将已提交的目标目录移回 staging，全部成功后才允许恢复 Docker。"""
         self.log_received.emit("[接管] 迁移未完成，正在回滚已移动的目标数据...", "warn")
+        docker_stopped_by_recheck = False
         for staged_path, dest_path in reversed(completed_moves):
+            if dest_path.startswith("/var/lib/docker/volumes/"):
+                stopped = self._ensure_target_docker_stopped_for_volume_change(
+                    f"回滚 Docker volume 前（{dest_path}）"
+                )
+                if stopped is None:
+                    return False, docker_stopped_by_recheck
+                docker_stopped_by_recheck |= stopped
             if not self._wsl_path_exists(DISTRO_NAME, dest_path, user="root"):
                 if self._wsl_path_exists(DISTRO_NAME, staged_path, user="root"):
                     continue
@@ -893,7 +924,7 @@ class WSLDiscoveryMixin:
                     "请检查上方迁移日志并手动确认数据位置。",
                     "error",
                 )
-                return False
+                return False, docker_stopped_by_recheck
             if self._wsl_path_exists(DISTRO_NAME, staged_path, user="root"):
                 self.log_received.emit(
                     "[接管] 回滚失败：staging 路径已被占用，拒绝覆盖或合并\n"
@@ -901,7 +932,7 @@ class WSLDiscoveryMixin:
                     f"staging 路径: {staged_path}",
                     "error",
                 )
-                return False
+                return False, docker_stopped_by_recheck
             if not self._relocate_dir(dest_path, staged_path, timeout=300):
                 self.log_received.emit(
                     "[接管] 回滚目录失败；Docker 将保持停止\n"
@@ -910,12 +941,12 @@ class WSLDiscoveryMixin:
                     "请根据紧邻的目录移动命令输出手动恢复。",
                     "error",
                 )
-                return False
+                return False, docker_stopped_by_recheck
             self.log_received.emit(
                 f"[接管] 已回滚目录: {dest_path} → {staged_path}",
                 "warn",
             )
-        return True
+        return True, docker_stopped_by_recheck
 
     def _get_running_source_services(self, distro: str, deploy_dir: str) -> list[str] | None:
         """实时返回源 Compose 项目中正在运行的 service。
@@ -1390,6 +1421,47 @@ class WSLDiscoveryMixin:
             return docker_was_active
         except Exception as e:
             self.log_received.emit(f"[接管] 准备目标 Docker 环境异常:\n{e}", "error")
+            return None
+
+    def _ensure_target_docker_stopped_for_volume_change(self, phase: str) -> bool | None:
+        """在 volume 目录变更前复核 daemon 状态；返回是否由本次复核执行了停止。"""
+        try:
+            state_proc = self._run_wsl_checked(
+                DISTRO_NAME,
+                "systemctl is-active docker",
+                action=f"[接管] {phase}复核目标 Docker 状态失败",
+                timeout=20,
+                user="root",
+                ok_returncodes=(0, 3),
+            )
+            if state_proc.returncode == 3:
+                return False
+
+            self.log_received.emit(
+                f"[接管] {phase}检测到目标 Docker 被外部启动，正在安全停止...",
+                "warn",
+            )
+            self._run_wsl_checked(
+                DISTRO_NAME,
+                "systemctl stop docker",
+                action=f"[接管] {phase}停止目标 Docker 失败",
+                timeout=30,
+                user="root",
+            )
+            self._run_wsl_checked(
+                DISTRO_NAME,
+                "systemctl is-active docker",
+                action=f"[接管] {phase}验证目标 Docker 已停止失败",
+                timeout=20,
+                user="root",
+                ok_returncodes=(3,),
+            )
+            return True
+        except Exception as e:
+            self.log_received.emit(
+                f"[接管] {phase}无法确认 Docker 已安全停止，已中止 volume 变更:\n{e}",
+                "error",
+            )
             return None
 
     def _restore_target_docker_after_migration(self) -> bool:

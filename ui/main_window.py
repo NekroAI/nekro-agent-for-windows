@@ -2213,7 +2213,8 @@ class MainWindow(QMainWindow):
                     danger=True,
                 )
                 return False
-            self._apply_pending_instance()
+            if not self._apply_pending_instance():
+                return False
         else:
             self._prev_active_instance = None
             self._prev_deploy_mode = None
@@ -2229,30 +2230,42 @@ class MainWindow(QMainWindow):
         """将 pending 新实例写入 config 并切换为 active。"""
         pending = self._pending_inst_data
         if not pending:
-            return
+            return False
         self._prev_active_instance = self.config.get_active_instance_id()
         self._prev_deploy_mode = self.config.get("deploy_mode")
         inst_id = pending["inst_id"]
         inst_save = {k: v for k, v in pending.items() if k != "inst_id"}
         inst_save.setdefault("preview_backup_available", False)
-        self.config.set_instance(inst_id, inst_save)
+        global_updates = {
+            "active_instance": inst_id,
+            "nekro_port": pending["nekro_port"],
+            "napcat_port": pending["napcat_port"],
+            "deploy_mode": pending["deploy_mode"],
+            "release_channel": pending.get("release_channel", "stable"),
+            "preview_backup_available": bool(
+                pending.get("preview_backup_available", False)
+            ),
+            "deploy_info": pending.get("deploy_info"),
+            "first_run": False,
+        }
         if not self.config.get_default_instance_id():
-            self.config.set_default_instance_id(inst_id)
-        self.config.set_many(
-            {
-                "active_instance": inst_id,
-                "nekro_port": pending["nekro_port"],
-                "napcat_port": pending["napcat_port"],
-                "deploy_mode": pending["deploy_mode"],
-                "release_channel": pending.get("release_channel", "stable"),
-                "preview_backup_available": bool(
-                    pending.get("preview_backup_available", False)
-                ),
-                "deploy_info": pending.get("deploy_info"),
-                "first_run": False,
-            }
+            global_updates["default_instance"] = inst_id
+        saved = self.config.update_instance_with_globals(
+            inst_id,
+            instance_updates=inst_save,
+            global_updates=global_updates,
         )
+        if not saved:
+            error = self.config.last_save_error or "未知错误"
+            self._show_notice_dialog(
+                "实例配置保存失败",
+                "无法保存新实例配置，部署尚未开始。请检查配置目录是否可写后重试。"
+                f"\n\n错误: {error}",
+                danger=True,
+            )
+            return False
         self.refresh_dashboard()
+        return True
 
     def _do_deploy(
         self, deploy_mode_override=None, show_logs=True, force_new_instance=False
@@ -2512,6 +2525,7 @@ class MainWindow(QMainWindow):
                 )
             elif (
                 status in {"启动失败", "启动超时"}
+                and not service_active
                 and getattr(self, "_prev_active_instance", None) is not None
             ):
                 self._stop_pending_instance_before_rollback()
@@ -3157,12 +3171,57 @@ class MainWindow(QMainWindow):
 
     def _on_remove_instance_done(self, success, inst_id, was_active):
         if success:
-            self.config.remove_instance(inst_id)
+            remaining = [
+                (item_id, item_data)
+                for item_id, item_data in self.config.list_instances()
+                if item_id != inst_id
+            ]
+            global_updates = None
+            if not remaining:
+                global_updates = {
+                    "active_instance": "",
+                    "default_instance": "",
+                    "deploy_mode": "",
+                    "release_channel": "stable",
+                    "preview_backup_available": False,
+                    "deploy_info": None,
+                    "nekro_port": self.config.default_config["nekro_port"],
+                    "napcat_port": self.config.default_config["napcat_port"],
+                    "first_run": True,
+                }
+            elif was_active:
+                first_id, first_data = remaining[0]
+                global_updates = {
+                    "active_instance": first_id,
+                    "deploy_mode": first_data.get("deploy_mode", ""),
+                    "nekro_port": first_data.get("nekro_port", 8021),
+                    "napcat_port": first_data.get("napcat_port", 6099),
+                    "release_channel": first_data.get("release_channel", "stable"),
+                    "preview_backup_available": bool(
+                        first_data.get("preview_backup_available", False)
+                    ),
+                    "deploy_info": first_data.get("deploy_info"),
+                }
+
+            saved = self.config.remove_instance_with_globals(
+                inst_id,
+                global_updates=global_updates,
+            )
+            if not saved:
+                error = self.config.last_save_error or "未知错误"
+                self.refresh_dashboard()
+                self._show_notice_dialog(
+                    "运行资源已删除但配置同步失败",
+                    "实例的容器和部署目录已删除，但启动器配置未能同步保存。"
+                    "请检查配置目录是否可写后重试或重启启动器；该实例可能仍会显示，"
+                    "请勿再次启动。"
+                    f"\n\n错误: {error}",
+                    danger=True,
+                )
+                return
+
             if was_active:
-                remaining = self.config.list_instances()
                 if remaining:
-                    first_id, _first_data = remaining[0]
-                    self._apply_active_instance_config(first_id)
                     self._switch_log_reader_to_active_instance()
                     self._sync_browser_to_active_instance(force_reload=True)
                     self._refresh_log_tabs_for_active_instance()
@@ -3175,7 +3234,6 @@ class MainWindow(QMainWindow):
                     if callable(refresh_state):
                         refresh_state()
                 else:
-                    self.config.clear_runtime_state(keep_first_run=True)
                     self._sync_browser_to_active_instance(force_reload=False)
             self.refresh_dashboard()
             self._show_notice_dialog("移除完成", "实例已移除。")

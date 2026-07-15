@@ -66,6 +66,112 @@ class _PortWindow:
         return None
 
 
+class _PendingConfig:
+    def __init__(self):
+        self.last_save_error = "配置目录只读"
+        self.calls = []
+
+    @staticmethod
+    def get_active_instance_id():
+        return "default"
+
+    @staticmethod
+    def get(key):
+        return "lite" if key == "deploy_mode" else None
+
+    @staticmethod
+    def get_default_instance_id():
+        return "default"
+
+    def update_instance_with_globals(
+        self,
+        inst_id,
+        instance_updates=None,
+        global_updates=None,
+    ):
+        self.calls.append((inst_id, instance_updates, global_updates))
+        return False
+
+
+class _PendingWindow:
+    def __init__(self):
+        self.config = _PendingConfig()
+        self.backend = _Backend()
+        self._pending_inst_data = {
+            "inst_id": "inst_2",
+            "deploy_mode": "napcat",
+            "nekro_port": 18021,
+            "napcat_port": 16099,
+        }
+        self.notices = []
+        self.deploy_started = False
+
+    @staticmethod
+    def _guard_napcat_network_config_busy(_action):
+        return True
+
+    @staticmethod
+    def _guard_blocking_status_idle(_action):
+        return True
+
+    @staticmethod
+    def _backend_runtime_exists():
+        return True
+
+    def _show_notice_dialog(self, title, text, **kwargs):
+        self.notices.append((title, text, kwargs))
+
+    def refresh_dashboard(self):
+        return None
+
+    def _apply_pending_instance(self):
+        return MainWindow._apply_pending_instance(self)
+
+    def _do_deploy(self, *_args, **_kwargs):
+        self.deploy_started = True
+        return True
+
+
+class _RemovalConfig:
+    default_config = {"nekro_port": 8021, "napcat_port": 6099}
+
+    def __init__(self):
+        self.last_save_error = "磁盘已满"
+        self.calls = []
+
+    @staticmethod
+    def list_instances():
+        return [
+            ("default", {"deploy_mode": "lite", "nekro_port": 8021}),
+            (
+                "inst_2",
+                {
+                    "deploy_mode": "napcat",
+                    "nekro_port": 18021,
+                    "napcat_port": 16099,
+                    "release_channel": "stable",
+                },
+            ),
+        ]
+
+    def remove_instance_with_globals(self, inst_id, global_updates=None):
+        self.calls.append((inst_id, global_updates))
+        return False
+
+
+class _RemovalWindow:
+    def __init__(self):
+        self.config = _RemovalConfig()
+        self.notices = []
+        self.refreshed = False
+
+    def refresh_dashboard(self):
+        self.refreshed = True
+
+    def _show_notice_dialog(self, title, text, **kwargs):
+        self.notices.append((title, text, kwargs))
+
+
 class UIFixTests(unittest.TestCase):
     def test_webview_scripts_use_qtwebview2_bridge(self):
         self.assertIn("window.qtwebview2.api.on_nav_change", _NAV_HOOK_JS)
@@ -83,6 +189,41 @@ class UIFixTests(unittest.TestCase):
         self.assertIn("threading.Thread", worker_source)
         self.assertIn("daemon=True", worker_source)
         self.assertIn("notifier.finished.emit", worker_source)
+
+    def test_pending_instance_save_failure_does_not_start_deploy(self):
+        window = _PendingWindow()
+
+        started = MainWindow.start_deploy(window)
+
+        self.assertFalse(started)
+        self.assertFalse(window.deploy_started)
+        self.assertEqual(len(window.config.calls), 1)
+        inst_id, instance_updates, global_updates = window.config.calls[0]
+        self.assertEqual(inst_id, "inst_2")
+        self.assertEqual(instance_updates["deploy_mode"], "napcat")
+        self.assertEqual(global_updates["active_instance"], "inst_2")
+        self.assertEqual(window.notices[0][0], "实例配置保存失败")
+        self.assertIn(window.config.last_save_error, window.notices[0][1])
+
+    def test_remove_resource_success_reports_config_sync_failure(self):
+        window = _RemovalWindow()
+
+        MainWindow._on_remove_instance_done(
+            window,
+            success=True,
+            inst_id="default",
+            was_active=True,
+        )
+
+        self.assertTrue(window.refreshed)
+        self.assertEqual(len(window.config.calls), 1)
+        inst_id, global_updates = window.config.calls[0]
+        self.assertEqual(inst_id, "default")
+        self.assertEqual(global_updates["active_instance"], "inst_2")
+        self.assertEqual(global_updates["nekro_port"], 18021)
+        self.assertEqual(window.notices[0][0], "运行资源已删除但配置同步失败")
+        self.assertIn(window.config.last_save_error, window.notices[0][1])
+        self.assertNotIn("移除完成", [notice[0] for notice in window.notices])
 
     @patch("ui.main_window.validate_instance_port_conflicts", return_value=(True, ""))
     @patch("ui.main_window.validate_port_bindings", return_value=(True, ""))

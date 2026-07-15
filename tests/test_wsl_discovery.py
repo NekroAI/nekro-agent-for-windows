@@ -146,13 +146,53 @@ class _RollbackMigrationDummy(_MigrationFlowDummy):
         return True
 
 
+class _VolumeRecheckMigrationDummy(_RollbackMigrationDummy):
+    VOLUME_DIRS = (
+        "/var/lib/docker/volumes/nekro_postgres_data",
+        "/var/lib/docker/volumes/nekro_qdrant_data",
+    )
+
+    def __init__(self, recheck_results, *, fail_config_sync=False):
+        super().__init__()
+        self.deploy_move_failed = True
+        self.recheck_results = list(recheck_results)
+        self.recheck_phases = []
+        self.fail_config_sync = fail_config_sync
+
+    def _prepare_target_docker_for_migration(self):
+        return False
+
+    def _restore_data(self, archive_path, staging_dir):
+        super()._restore_data(archive_path, staging_dir)
+        self.paths.update(
+            self._staged_migration_path(staging_dir, volume_dir)
+            for volume_dir in self.VOLUME_DIRS
+        )
+        return True
+
+    def _ensure_target_docker_stopped_for_volume_change(self, phase):
+        self.recheck_phases.append(phase)
+        return self.recheck_results.pop(0)
+
+    def _sync_config_from_env(self, *_args):
+        return not self.fail_config_sync
+
+
 class _RestoreDummy(WSLDiscoveryMixin, WSLShellMixin):
-    def __init__(self, *, docker_active=True, restore_returncode=0, start_returncode=0):
+    def __init__(
+        self,
+        *,
+        docker_active=True,
+        restore_returncode=0,
+        start_returncode=0,
+        stop_returncode=0,
+    ):
         self.log_received = _Signal()
         self.commands = []
         self.docker_active = docker_active
         self.restore_returncode = restore_returncode
         self.start_returncode = start_returncode
+        self.stop_returncode = stop_returncode
 
     def _wsl_run(self, distro, cmd, timeout=60, user=None):
         self.commands.append((distro, cmd, timeout, user))
@@ -164,11 +204,22 @@ class _RestoreDummy(WSLDiscoveryMixin, WSLShellMixin):
                 stderr=b"",
             )
         if cmd == "systemctl start docker":
+            if self.start_returncode == 0:
+                self.docker_active = True
             return subprocess.CompletedProcess(
                 [],
                 self.start_returncode,
                 stdout=b"",
                 stderr=b"start failed\n" if self.start_returncode else b"",
+            )
+        if cmd == "systemctl stop docker":
+            if self.stop_returncode == 0:
+                self.docker_active = False
+            return subprocess.CompletedProcess(
+                [],
+                self.stop_returncode,
+                stdout=b"",
+                stderr=b"stop failed\n" if self.stop_returncode else b"",
             )
         if cmd.startswith("tar -xzf "):
             return subprocess.CompletedProcess(
@@ -307,6 +358,84 @@ class WSLDiscoveryMigrationTests(unittest.TestCase):
             )
         )
 
+    def test_external_docker_start_before_volume_move_is_stopped_and_left_stopped(self):
+        backend = _VolumeRecheckMigrationDummy([False, True])
+        instance = {
+            "distro": "Ubuntu",
+            "deploy_dir": "/root/nekro_agent",
+            "data_dir": "/root/nekro_agent_data",
+            "env": {},
+            "deploy_mode": "lite",
+        }
+
+        self.assertTrue(backend._takeover_foreign(instance))
+
+        self.assertEqual(
+            backend.recheck_phases,
+            [
+                "提交 Docker volume 前（/var/lib/docker/volumes/nekro_postgres_data）",
+                "提交 Docker volume 前（/var/lib/docker/volumes/nekro_qdrant_data）",
+            ],
+        )
+        for volume_dir in _VolumeRecheckMigrationDummy.VOLUME_DIRS:
+            self.assertIn(volume_dir, backend.paths)
+        self.assertEqual(backend.docker_restore_calls, 0)
+        self.assertTrue(
+            any(
+                "迁移开始时 Docker 未运行，将保持停止状态" in message
+                for message, _level in backend.log_received.messages
+            )
+        )
+
+    def test_external_docker_start_before_volume_rollback_is_stopped(self):
+        backend = _VolumeRecheckMigrationDummy(
+            [False, False, True, False],
+            fail_config_sync=True,
+        )
+        instance = {
+            "distro": "Ubuntu",
+            "deploy_dir": "/root/nekro_agent",
+            "data_dir": "/root/nekro_agent_data",
+            "env": {},
+            "deploy_mode": "lite",
+        }
+
+        self.assertFalse(backend._takeover_foreign(instance))
+
+        self.assertEqual(
+            backend.recheck_phases,
+            [
+                "提交 Docker volume 前（/var/lib/docker/volumes/nekro_postgres_data）",
+                "提交 Docker volume 前（/var/lib/docker/volumes/nekro_qdrant_data）",
+                "回滚 Docker volume 前（/var/lib/docker/volumes/nekro_qdrant_data）",
+                "回滚 Docker volume 前（/var/lib/docker/volumes/nekro_postgres_data）",
+            ],
+        )
+        for volume_dir in _VolumeRecheckMigrationDummy.VOLUME_DIRS:
+            self.assertNotIn(volume_dir, backend.paths)
+        self.assertEqual(backend.docker_restore_calls, 0)
+
+    def test_volume_recheck_stop_failure_aborts_before_volume_move(self):
+        backend = _VolumeRecheckMigrationDummy([None])
+        instance = {
+            "distro": "Ubuntu",
+            "deploy_dir": "/root/nekro_agent",
+            "data_dir": "/root/nekro_agent_data",
+            "env": {},
+            "deploy_mode": "lite",
+        }
+
+        self.assertFalse(backend._takeover_foreign(instance))
+
+        for volume_dir in _VolumeRecheckMigrationDummy.VOLUME_DIRS:
+            self.assertNotIn(volume_dir, backend.paths)
+        self.assertFalse(
+            any(
+                dest in _VolumeRecheckMigrationDummy.VOLUME_DIRS
+                for _src, dest, _timeout in backend.move_calls
+            )
+        )
+
     def test_stale_stopped_status_still_stops_actually_running_source(self):
         backend = _MigrationFlowDummy(running_services=["nekro_agent"])
         instance = {
@@ -427,6 +556,41 @@ class WSLDiscoveryMigrationTests(unittest.TestCase):
             ["systemctl is-active docker", "systemctl stop docker"],
         )
         self.assertEqual(inactive_commands, ["systemctl is-active docker"])
+
+    def test_volume_recheck_stops_and_verifies_externally_started_docker(self):
+        backend = _RestoreDummy(docker_active=True)
+
+        self.assertTrue(
+            backend._ensure_target_docker_stopped_for_volume_change("提交 Docker volume 前")
+        )
+
+        commands = [cmd for _distro, cmd, _timeout, _user in backend.commands]
+        self.assertEqual(
+            commands,
+            [
+                "systemctl is-active docker",
+                "systemctl stop docker",
+                "systemctl is-active docker",
+            ],
+        )
+        self.assertFalse(backend.docker_active)
+
+    def test_volume_recheck_reports_stop_failure(self):
+        backend = _RestoreDummy(docker_active=True, stop_returncode=1)
+
+        self.assertIsNone(
+            backend._ensure_target_docker_stopped_for_volume_change("回滚 Docker volume 前")
+        )
+
+        commands = [cmd for _distro, cmd, _timeout, _user in backend.commands]
+        self.assertEqual(
+            commands,
+            ["systemctl is-active docker", "systemctl stop docker"],
+        )
+        message, level = backend.log_received.messages[-1]
+        self.assertEqual(level, "error")
+        self.assertIn("已中止 volume 变更", message)
+        self.assertIn("stop failed", message)
 
     def test_restore_succeeds_in_empty_staging_directory(self):
         backend = _RestoreDummy(docker_active=False)

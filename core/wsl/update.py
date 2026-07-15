@@ -815,19 +815,60 @@ class WSLUpdateMixin:
 
     def _daemon_mark_instance_channel(self, ctx, channel, preview_backup_available=False):
         if not self.config:
-            return
+            return True, ""
         updates = {
             "release_channel": channel,
             "preview_backup_available": bool(preview_backup_available),
         }
-        if ctx["inst_id"]:
-            self.config.update_instance_with_globals(
-                ctx["inst_id"],
-                instance_updates=updates,
-                global_updates=updates,
-            )
+        try:
+            if ctx["inst_id"]:
+                saved = self.config.update_instance_with_globals(
+                    ctx["inst_id"],
+                    instance_updates=updates,
+                    global_updates=updates,
+                )
+            else:
+                saved = self.config.set_many(updates)
+        except Exception as error:
+            saved = False
+            detail = f"{type(error).__name__}: {error}"
         else:
-            self.config.set_many(updates)
+            detail = str(getattr(self.config, "last_save_error", "") or "")
+        if saved:
+            return True, ""
+        return False, (
+            f"配置保存失败，运行状态已切换为{channel}，但启动器配置未同步。"
+            + (f" 详情: {detail}" if detail else "")
+        )
+
+    def _save_ui_channel_config(self, inst_id, channel, preview_backup_available):
+        """保存 UI 触发的频道状态，返回 (成功, 可操作错误详情)。"""
+        if not self.config:
+            return True, ""
+        updates = {
+            "release_channel": channel,
+            "preview_backup_available": bool(preview_backup_available),
+        }
+        try:
+            if inst_id:
+                saved = self.config.update_instance_with_globals(
+                    inst_id,
+                    instance_updates=updates,
+                    global_updates=updates,
+                )
+            else:
+                saved = self.config.set_many(updates)
+        except Exception as error:
+            saved = False
+            detail = f"{type(error).__name__}: {error}"
+        else:
+            detail = str(getattr(self.config, "last_save_error", "") or "")
+        if saved:
+            return True, ""
+        return False, (
+            f"运行状态已切换为{channel}，但启动器配置未同步，后续启动可能仍显示旧频道。"
+            + (f" 详情: {detail}" if detail else "")
+        )
 
     def _daemon_preview_backup_available(self, ctx):
         if not self.config:
@@ -1197,15 +1238,30 @@ class WSLUpdateMixin:
         self._emit_pull_progress("done", "更新完成")
         self.is_running = True
         self._daemon_attach_logs(ctx)
+        channel_saved = True
+        channel_save_error = ""
         if channel == "preview":
-            self._daemon_mark_instance_channel(
+            mark_result = self._daemon_mark_instance_channel(
                 ctx,
                 "preview",
                 preview_backup_available=bool(backup_summary) or self._daemon_preview_backup_available(ctx),
             )
+            if isinstance(mark_result, tuple):
+                channel_saved, channel_save_error = mark_result
+            else:
+                channel_saved = mark_result is not False
         elif channel in {"stable", "rollback"}:
-            self._daemon_mark_instance_channel(ctx, "stable", preview_backup_available=False)
+            mark_result = self._daemon_mark_instance_channel(
+                ctx, "stable", preview_backup_available=False
+            )
+            if isinstance(mark_result, tuple):
+                channel_saved, channel_save_error = mark_result
+            else:
+                channel_saved = mark_result is not False
         self.status_changed.emit("运行中")
+        if not channel_saved:
+            self._daemon_fail(job, "config_sync_failed", channel_save_error, ctx=ctx)
+            return
         result = {
             "channel": "preview" if channel == "preview" else "stable",
             "image": agent_image,
@@ -1350,27 +1406,6 @@ class WSLUpdateMixin:
                 self.is_running = True
                 inst_display = inst_id if inst_id and inst_id != "default" else ""
                 log_prefix = f"[{inst_display}] " if inst_display else ""
-                if self.config:
-                    preview_available = bool(create_backup)
-                    if inst_id:
-                        self.config.update_instance_with_globals(
-                            inst_id,
-                            instance_updates={
-                                "release_channel": "preview",
-                                "preview_backup_available": preview_available,
-                            },
-                            global_updates={
-                                "release_channel": "preview",
-                                "preview_backup_available": preview_available,
-                            },
-                        )
-                    else:
-                        self.config.set_many(
-                            {
-                                "release_channel": "preview",
-                                "preview_backup_available": preview_available,
-                            }
-                        )
                 if self._log_process is None or self._log_process.poll() is not None:
                     threading.Thread(
                         target=self._log_reader,
@@ -1378,6 +1413,16 @@ class WSLUpdateMixin:
                         daemon=True,
                     ).start()
                 threading.Thread(target=self._health_check, args=(nekro_port,), daemon=True).start()
+                saved, save_error = self._save_ui_channel_config(
+                    inst_id, "preview", bool(create_backup)
+                )
+                if not saved:
+                    self.status_changed.emit("更新失败")
+                    self.update_finished.emit(
+                        False,
+                        "预览版切换已完成，但启动器配置保存失败；" + save_error,
+                    )
+                    return
                 self.update_finished.emit(True, "预览版切换完成，正在等待服务重新就绪。")
             except Exception as e:
                 self.status_changed.emit("更新失败")
@@ -1543,29 +1588,8 @@ class WSLUpdateMixin:
 
                 self._emit_pull_progress("done", "正式版恢复完成")
                 self.is_running = True
-                restore_completed = True
                 inst_display = inst_id if inst_id and inst_id != "default" else ""
                 log_prefix = f"[{inst_display}] " if inst_display else ""
-                if self.config:
-                    if inst_id:
-                        self.config.update_instance_with_globals(
-                            inst_id,
-                            instance_updates={
-                                "release_channel": "stable",
-                                "preview_backup_available": False,
-                            },
-                            global_updates={
-                                "release_channel": "stable",
-                                "preview_backup_available": False,
-                            },
-                        )
-                    else:
-                        self.config.set_many(
-                            {
-                                "release_channel": "stable",
-                                "preview_backup_available": False,
-                            }
-                        )
                 if self._log_process is None or self._log_process.poll() is not None:
                     threading.Thread(
                         target=self._log_reader,
@@ -1573,6 +1597,15 @@ class WSLUpdateMixin:
                         daemon=True,
                     ).start()
                 threading.Thread(target=self._health_check, args=(nekro_port,), daemon=True).start()
+                saved, save_error = self._save_ui_channel_config(inst_id, "stable", False)
+                if not saved:
+                    self.status_changed.emit("更新失败")
+                    self.update_finished.emit(
+                        False,
+                        "正式版恢复已完成，但启动器配置保存失败；" + save_error,
+                    )
+                    return
+                restore_completed = True
                 self.update_finished.emit(True, "正式版恢复完成，正在等待服务重新就绪。")
             except Exception as e:
                 self.status_changed.emit("更新失败")

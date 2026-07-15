@@ -190,6 +190,21 @@ class _CancelDuringValidateDummy(_DummyDaemonUpdate):
         return True
 
 
+class _ConfigSyncFailureDummy(_DummyDaemonUpdate):
+    def _daemon_mark_instance_channel(self, _ctx, _channel, preview_backup_available=False):
+        return False, "配置保存失败，运行状态已切换，但启动器配置未同步。"
+
+
+class _FailingConfig:
+    last_save_error = "permission denied"
+
+    def update_instance_with_globals(self, *_args, **_kwargs):
+        return False
+
+    def set_many(self, *_args, **_kwargs):
+        return False
+
+
 class _RestoreJobOrderDummy(_DummyDaemonUpdate):
     def __init__(self, archive_listing=None, restore_error=None):
         super().__init__()
@@ -450,6 +465,46 @@ class WSLDaemonUpdateTests(unittest.TestCase):
         self.assertEqual(job.snapshot()["status"], "cancelled")
         # 状态栏不能停在「更新中...」，取消后要按真实运行状态复位
         self.assertEqual(backend.status_changed.items[-1], ("运行中",))
+
+    def test_daemon_update_fails_when_channel_config_cannot_be_saved(self):
+        backend = _ConfigSyncFailureDummy()
+        request = {
+            "instance_id": "sha256:test",
+            "channel": "stable",
+            "backup": False,
+            "_launcher_inst_id": "default",
+            "_deploy_dir": "/root/nekro_agent",
+            "_data_dir": "/root/nekro_agent_data",
+            "_nekro_port": 8021,
+            "_current_channel": "stable",
+        }
+        job = DaemonJob("upd_config_fail", "update", "sha256:test", request)
+
+        backend.run_daemon_update_job(request, job)
+
+        snapshot = job.snapshot()
+        self.assertEqual(snapshot["status"], "failed")
+        self.assertEqual(snapshot["error"]["code"], "config_sync_failed")
+        self.assertIn("运行状态已切换", snapshot["error"]["message"])
+        self.assertTrue(backend.is_running)
+
+    def test_preview_channel_save_failure_is_reported(self):
+        backend = _DummyDaemonUpdate()
+        backend.config = _FailingConfig()
+
+        saved, detail = backend._save_ui_channel_config("default", "preview", True)
+
+        self.assertFalse(saved)
+        self.assertIn("后续启动可能仍显示旧频道", detail)
+
+    def test_restore_channel_save_failure_is_reported(self):
+        backend = _DummyDaemonUpdate()
+        backend.config = _FailingConfig()
+
+        saved, detail = backend._save_ui_channel_config("default", "stable", False)
+
+        self.assertFalse(saved)
+        self.assertIn("后续启动可能仍显示旧频道", detail)
 
     def test_daemon_update_job_cancel_emits_stopped_when_not_running(self):
         backend = _CancelDuringValidateDummy()

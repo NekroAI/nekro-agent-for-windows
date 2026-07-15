@@ -58,6 +58,8 @@ class _DeployDummy(WSLDeployMixin):
         self.config = _Config()
         self.log_received = _Signal()
         self.status_changed = _Signal()
+        self.progress_updated = _Signal()
+        self.deploy_info_ready = _Signal()
         self.commands = []
         self.health_invalidations = 0
 
@@ -185,6 +187,147 @@ class WSLMonitorDeployTests(unittest.TestCase):
         self.assertEqual(backend.commands, [])
         self.assertTrue(backend.is_running)
         self.assertEqual(backend.status_changed.items[-1], ("停止失败",))
+
+    def test_start_services_does_not_start_thread_when_instance_save_fails(self):
+        class FailingConfig:
+            def __init__(self):
+                self.last_save_error = "配置目录只读"
+                self.calls = []
+
+            @staticmethod
+            def get_active_instance_id():
+                return ""
+
+            @staticmethod
+            def next_instance_id():
+                return "default"
+
+            @staticmethod
+            def get(key):
+                values = {
+                    "nekro_port": 8021,
+                    "napcat_port": 6099,
+                    "release_channel": "stable",
+                }
+                return values.get(key)
+
+            @staticmethod
+            def get_default_instance_id():
+                return ""
+
+            def update_instance_with_globals(
+                self,
+                inst_id,
+                instance_updates=None,
+                global_updates=None,
+            ):
+                self.calls.append((inst_id, instance_updates, global_updates))
+                return False
+
+        backend = _DeployDummy()
+        backend.config = FailingConfig()
+        backend._deploying = False
+        backend._distro_exists = lambda: True
+
+        with patch("core.wsl.deploy.threading.Thread") as thread_cls:
+            started = backend.start_services("lite")
+
+        self.assertFalse(started)
+        thread_cls.assert_not_called()
+        self.assertEqual(len(backend.config.calls), 1)
+        inst_id, instance_updates, global_updates = backend.config.calls[0]
+        self.assertEqual(inst_id, "default")
+        self.assertEqual(instance_updates["deploy_mode"], "lite")
+        self.assertEqual(global_updates["active_instance"], "default")
+        self.assertEqual(global_updates["default_instance"], "default")
+        self.assertFalse(backend._deploying)
+        self.assertEqual(backend.status_changed.items[-1], ("启动失败",))
+        self.assertIn(backend.config.last_save_error, backend.log_received.items[-1][0])
+
+    def test_running_service_reports_deploy_info_save_failure(self):
+        class FailingConfig:
+            last_save_error = "磁盘已满"
+
+            @staticmethod
+            def get_active_instance_id():
+                return "default"
+
+            @staticmethod
+            def get(key):
+                if key == "deploy_info":
+                    return {"napcat_token": "saved-token"}
+                return None
+
+            @staticmethod
+            def update_instance_with_globals(
+                _inst_id,
+                instance_updates=None,
+                global_updates=None,
+            ):
+                return False
+
+        backend = _DeployDummy()
+        backend.config = FailingConfig()
+        backend._pending_deploy_info = None
+        backend._launcher_data_path = lambda name: name
+        backend._prepare_compose_content = lambda *_args, **_kwargs: "new-compose"
+        backend._prepare_env = (
+            lambda *_args, **_kwargs: "NEKRO_EXPOSE_PORT=8021\n"
+            "NEKRO_ADMIN_PASSWORD=secret\n"
+            "ONEBOT_ACCESS_TOKEN=token\n"
+        )
+        backend._write_to_wsl = lambda *_args, **_kwargs: None
+        backend._clean_command_output = lambda output: str(output or "")
+        backend._get_missing_images = lambda *_args, **_kwargs: []
+        backend._instance_release_channel = lambda _inst: "stable"
+
+        def _wsl_exec(_distro, command, **_kwargs):
+            if command.startswith("test -f"):
+                return "yes"
+            if command.startswith("cat ") and command.endswith("/.env"):
+                return "NEKRO_EXPOSE_PORT=8021\n"
+            if command.startswith("cat "):
+                return "old-compose"
+            return ""
+
+        backend._wsl_exec = _wsl_exec
+        backend._run_wsl_checked = lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=b"",
+            stderr=b"",
+        )
+        inst = {
+            "deploy_mode": "lite",
+            "deploy_dir": "/root/nekro_agent",
+            "data_dir": "/root/nekro_agent_data",
+            "nekro_port": 8021,
+        }
+
+        with patch("core.wsl.deploy.os.path.exists", return_value=True):
+            started = backend._start_instance_sync("default", inst)
+
+        self.assertFalse(started)
+        self.assertTrue(backend.is_running)
+        self.assertEqual(backend.status_changed.items[-1], ("启动失败",))
+        messages = [item[0] for item in backend.log_received.items]
+        self.assertTrue(any("服务已启动但配置未保存" in msg for msg in messages))
+        self.assertFalse(any("部署完成" in msg for msg in messages))
+        self.assertEqual(backend.deploy_info_ready.items, [])
+
+    def test_show_deploy_info_does_not_emit_credentials_when_save_fails(self):
+        backend = _DeployDummy()
+        backend.config.last_save_error = "配置目录只读"
+        backend._save_deploy_info = lambda *_args, **_kwargs: False
+
+        shown = backend._show_deploy_info({"port": "8021"}, inst_id="default")
+
+        self.assertFalse(shown)
+        self.assertEqual(backend.deploy_info_ready.items, [])
+        self.assertEqual(backend.status_changed.items[-1], ("启动失败",))
+        self.assertFalse(
+            any("部署完成" in item[0] for item in backend.log_received.items)
+        )
 
 
 if __name__ == "__main__":
