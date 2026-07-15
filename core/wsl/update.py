@@ -456,15 +456,57 @@ class WSLUpdateMixin:
         if not services:
             return []
         service_args = " ".join(shlex.quote(service) for service in services)
+        try:
+            self._run_wsl_checked(
+                distro,
+                "docker compose -f docker-compose.yml --env-file .env "
+                f"stop {service_args}",
+                action=action,
+                cwd=deploy_dir,
+                timeout=120,
+            )
+        except Exception as stop_error:
+            # Compose 可能已经停止了部分服务才返回非零。无论失败发生在哪个
+            # 服务，都按停服前快照恢复完整集合，避免操作失败后留下半停机状态。
+            try:
+                self._start_compose_services(
+                    distro,
+                    deploy_dir,
+                    services,
+                    action=f"{action}后恢复原运行服务失败",
+                )
+            except Exception as restart_error:
+                raise RuntimeError(
+                    f"{stop_error}\n停止服务失败后恢复原运行状态也失败:\n{restart_error}"
+                ) from restart_error
+            raise
+        return services
+
+    def _start_compose_services(self, distro, deploy_dir, services, *, action):
+        if not services:
+            return
+        service_args = " ".join(shlex.quote(service) for service in services)
         self._run_wsl_checked(
             distro,
             "docker compose -f docker-compose.yml --env-file .env "
-            f"stop {service_args}",
+            f"start {service_args}",
             action=action,
             cwd=deploy_dir,
             timeout=120,
         )
-        return services
+
+    def _sync_compose_running_state(self, distro, deploy_dir, *, action):
+        """按指定实例的 Compose 状态同步 is_running，不依赖当前 active 实例。"""
+        try:
+            services = self._compose_running_services(
+                distro,
+                deploy_dir,
+                action=action,
+            )
+        except Exception as e:
+            self.log_received.emit(f"{action}\n{e}", "debug")
+            return
+        self.is_running = bool(services)
 
     def _backup_nekro_archive_for_paths(self, distro, archive_path, deploy_dir, data_dir, instance_name):
         existing_targets = self._existing_backup_targets_for_paths(distro, deploy_dir, data_dir, instance_name)
@@ -501,14 +543,12 @@ class WSLUpdateMixin:
             result = True, f"已生成备份归档：{posixpath.basename(archive_path)}"
         finally:
             if running_services:
-                running_args = " ".join(shlex.quote(service) for service in running_services)
                 try:
-                    self._run_wsl_checked(
+                    self._start_compose_services(
                         distro,
-                        f"docker compose -f docker-compose.yml --env-file .env start {running_args}",
+                        deploy_dir,
+                        running_services,
                         action="备份后恢复原运行服务失败",
-                        cwd=deploy_dir,
-                        timeout=120,
                     )
                 except Exception as e:
                     safe_error = self._daemon_redact_text(
@@ -602,14 +642,24 @@ class WSLUpdateMixin:
         return targets
 
     def _daemon_restore_targets_in_archive(self, ctx, archive_path):
-        raw = self._wsl_exec(
+        proc = self._run_wsl_checked(
             DISTRO_NAME,
             f"tar -tzf {shlex.quote(archive_path)}",
+            action="校验备份归档失败",
             timeout=60,
+            user="root",
         )
+        raw = self._clean_command_output(self._safe_decode(proc.stdout))
         archive_entries = []
         for line in raw.splitlines():
-            entry = posixpath.normpath(line.strip().lstrip("./"))
+            raw_entry = line.strip()
+            while raw_entry.startswith("./"):
+                raw_entry = raw_entry[2:]
+            if not raw_entry or raw_entry.startswith("/"):
+                continue
+            entry = posixpath.normpath(raw_entry)
+            if entry == ".." or entry.startswith("../"):
+                continue
             if entry and entry != ".":
                 archive_entries.append(entry)
         if not archive_entries:
@@ -648,10 +698,14 @@ class WSLUpdateMixin:
                     sensitive_paths=[normalized],
                 )
 
-    def _daemon_restore_archive(self, ctx, job, archive_path, *, action):
+    def _daemon_restore_archive(self, ctx, job, archive_path, *, action, targets=None):
         # 修复前生成的混合归档可能包含其它实例（尤其默认实例）的路径，
         # 一律按当前实例的白名单成员显式解包，绝不整包解压到 /。
-        targets = self._daemon_restore_targets_in_archive(ctx, archive_path)
+        if targets is None:
+            targets = self._daemon_restore_targets_in_archive(ctx, archive_path)
+        else:
+            safe_targets = set(self._daemon_safe_restore_targets(ctx))
+            targets = [target for target in targets if target in safe_targets]
         if not targets:
             raise RuntimeError(
                 "备份归档中未找到当前实例的可恢复目录（归档损坏或不属于该实例），已拒绝解包。"
@@ -852,17 +906,25 @@ class WSLUpdateMixin:
             self._daemon_emit_cancelled_status()
             return
         job.set_progress("restore", 1, 4, "正在停止服务并恢复备份")
+        restore_completed = False
         try:
+            restore_targets = self._daemon_restore_targets_in_archive(ctx, archive_path)
+            if not restore_targets:
+                raise RuntimeError(
+                    "备份归档中未找到当前实例的可恢复目录（归档损坏或不属于该实例），已中止恢复。"
+                )
             self._stop_running_compose_services(
                 DISTRO_NAME,
                 ctx["deploy_dir"],
                 action="[daemon 还原] 停止服务失败",
             )
+            self.is_running = False
             self._daemon_restore_archive(
                 ctx,
                 job,
                 action="[daemon 还原] 恢复备份数据失败",
                 archive_path=archive_path,
+                targets=restore_targets,
             )
             job.set_progress("restart_services", 2, 4, "正在重建并启动服务")
             self._daemon_exec(
@@ -872,26 +934,33 @@ class WSLUpdateMixin:
                 timeout=300,
                 action="[daemon 还原] 重建并启动服务失败",
             )
+            job.set_progress("verify", 3, 4, "等待服务健康检查通过")
+            health = self._wait_daemon_update_health(job, ctx["nekro_port"])
+            if health is None:
+                self._daemon_emit_cancelled_status()
+                return
+            if not health:
+                self.status_changed.emit("更新失败")
+                self._daemon_fail(job, "verify_timeout", "服务健康检查超时", ctx=ctx)
+                return
+            self.is_running = True
+            self._daemon_attach_logs(ctx)
+            self.status_changed.emit("运行中")
+            job.succeed(
+                "备份还原完成",
+                {"backup": self._daemon_backup_summary(archive_path), "app_health": "ok"},
+            )
+            restore_completed = True
         except Exception as e:
             self.status_changed.emit("更新失败")
             self._daemon_fail(job, "launcher_update_failed", str(e), ctx=ctx, sensitive_paths=[archive_path])
-            return
-        job.set_progress("verify", 3, 4, "等待服务健康检查通过")
-        health = self._wait_daemon_update_health(job, ctx["nekro_port"])
-        if health is None:
-            self._daemon_emit_cancelled_status()
-            return
-        if not health:
-            self.status_changed.emit("更新失败")
-            self._daemon_fail(job, "verify_timeout", "服务健康检查超时", ctx=ctx)
-            return
-        self.is_running = True
-        self._daemon_attach_logs(ctx)
-        self.status_changed.emit("运行中")
-        job.succeed(
-            "备份还原完成",
-            {"backup": self._daemon_backup_summary(archive_path), "app_health": "ok"},
-        )
+        finally:
+            if not restore_completed:
+                self._sync_compose_running_state(
+                    DISTRO_NAME,
+                    ctx["deploy_dir"],
+                    action="[daemon 还原] 刷新服务运行状态失败",
+                )
 
     def run_daemon_update_job(self, request: dict, job):
         """执行 daemon facade 的非交互更新任务。"""
@@ -977,8 +1046,15 @@ class WSLUpdateMixin:
 
         total = len(steps) + 1
         backup_summary = None
+        restore_flow_active = False
         for index, step in enumerate(steps, start=2):
             if self._daemon_cancelled(job):
+                if restore_flow_active:
+                    self._sync_compose_running_state(
+                        DISTRO_NAME,
+                        ctx["deploy_dir"],
+                        action="[daemon 更新] 刷新服务运行状态失败",
+                    )
                 self._daemon_emit_cancelled_status()
                 return
             step_type = str(step.get("type") or "")
@@ -1026,16 +1102,25 @@ class WSLUpdateMixin:
                         self.status_changed.emit("更新失败")
                         self._daemon_fail(job, "backup_not_found", "未找到 pre-preview 备份", ctx=ctx)
                         return
+                    restore_flow_active = True
+                    restore_targets = self._daemon_restore_targets_in_archive(ctx, archive_path)
+                    if not restore_targets:
+                        raise RuntimeError(
+                            "pre-preview 备份中未找到当前实例的可恢复目录"
+                            "（归档损坏或不属于该实例），已中止恢复。"
+                        )
                     self._stop_running_compose_services(
                         DISTRO_NAME,
                         ctx["deploy_dir"],
                         action="[daemon 更新] 停止服务失败",
                     )
+                    self.is_running = False
                     self._daemon_restore_archive(
                         ctx,
                         job,
                         action="[daemon 更新] 恢复 pre-preview 备份失败",
                         archive_path=archive_path,
+                        targets=restore_targets,
                     )
                     self._rewrite_daemon_compose_channel(ctx, "stable")
                     backup_summary = self._daemon_backup_summary(archive_path, name="pre-preview")
@@ -1072,14 +1157,32 @@ class WSLUpdateMixin:
                 if step_type == "verify":
                     health = self._wait_daemon_update_health(job, ctx["nekro_port"])
                     if health is None:
+                        if restore_flow_active:
+                            self._sync_compose_running_state(
+                                DISTRO_NAME,
+                                ctx["deploy_dir"],
+                                action="[daemon 更新] 刷新服务运行状态失败",
+                            )
                         self._daemon_emit_cancelled_status()
                         return
                     if not health:
+                        if restore_flow_active:
+                            self._sync_compose_running_state(
+                                DISTRO_NAME,
+                                ctx["deploy_dir"],
+                                action="[daemon 更新] 刷新服务运行状态失败",
+                            )
                         self.status_changed.emit("更新失败")
                         self._daemon_fail(job, "verify_timeout", "服务健康检查超时", ctx=ctx)
                         return
                     continue
             except Exception as e:
+                if restore_flow_active:
+                    self._sync_compose_running_state(
+                        DISTRO_NAME,
+                        ctx["deploy_dir"],
+                        action="[daemon 更新] 刷新服务运行状态失败",
+                    )
                 self.status_changed.emit("更新失败")
                 code = "restart_failed" if step_type == "compose_up" else "launcher_update_failed"
                 sensitive_paths = [archive_path] if "archive_path" in locals() else None
@@ -1361,16 +1464,9 @@ class WSLUpdateMixin:
                 self.update_finished.emit(False, f"未找到备份文件：{archive_path}")
                 return
 
+            restore_completed = False
             try:
-                self._emit_pull_progress("stage", "停止相关服务")
-                self._stop_running_compose_services(
-                    distro,
-                    deploy_dir,
-                    action="[恢复正式版] 停止相关服务失败",
-                )
-
-                self._emit_pull_progress("stage", "恢复备份数据")
-                # 旧混合归档可能带有其它实例的路径，按当前实例白名单显式解包。
+                # 必须在停服和清理真实数据前完整读取归档并确认当前实例成员。
                 restore_ctx = {
                     "deploy_dir": deploy_dir,
                     "data_dir": data_dir,
@@ -1386,6 +1482,17 @@ class WSLUpdateMixin:
                         "备份归档中未找到当前实例的可恢复目录（归档损坏或不属于该实例），已中止恢复。",
                     )
                     return
+
+                self._emit_pull_progress("stage", "停止相关服务")
+                self._stop_running_compose_services(
+                    distro,
+                    deploy_dir,
+                    action="[恢复正式版] 停止相关服务失败",
+                )
+                self.is_running = False
+
+                self._emit_pull_progress("stage", "恢复备份数据")
+                # 旧混合归档可能带有其它实例的路径，按当前实例白名单显式解包。
                 member_args = " ".join(
                     shlex.quote(target.lstrip("/")) for target in restore_targets
                 )
@@ -1431,6 +1538,7 @@ class WSLUpdateMixin:
 
                 self._emit_pull_progress("done", "正式版恢复完成")
                 self.is_running = True
+                restore_completed = True
                 inst_display = inst_id if inst_id and inst_id != "default" else ""
                 log_prefix = f"[{inst_display}] " if inst_display else ""
                 if self.config:
@@ -1470,6 +1578,13 @@ class WSLUpdateMixin:
                     f"部署目录: {deploy_dir}\n"
                     f"异常: {type(e).__name__}: {e}",
                 )
+            finally:
+                if not restore_completed:
+                    self._sync_compose_running_state(
+                        distro,
+                        deploy_dir,
+                        action="[恢复正式版] 刷新服务运行状态失败",
+                    )
 
         threading.Thread(
             target=lambda: self._run_exclusive_ui_operation("恢复正式版", _do_restore),

@@ -50,9 +50,12 @@ class _DummyDaemonUpdate(WSLUpdateMixin, WSLShellMixin):
 
     def _run_wsl_checked(self, _distro, cmd, **_kwargs):
         self.commands.append(cmd)
-        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        stdout = b""
+        if cmd.startswith("tar -tzf "):
+            stdout = b"root/nekro_agent/docker-compose.yml\nroot/nekro_agent_data/config.json\n"
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr=b"")
 
-    def _daemon_restore_archive(self, _ctx, _job, archive_path, *, action):
+    def _daemon_restore_archive(self, _ctx, _job, archive_path, *, action, targets=None):
         self.restore_calls.append((archive_path, action))
 
     def _pull_images(self, _distro, images):
@@ -97,12 +100,21 @@ class _RestoreFallbackDummy(_DummyDaemonUpdate):
             return "root/nekro_agent/docker-compose.yml\nroot/nekro_agent_data/config.json\n"
         return ""
 
-    def _daemon_restore_archive(self, ctx, job, archive_path, *, action):
-        WSLUpdateMixin._daemon_restore_archive(self, ctx, job, archive_path, action=action)
+    def _daemon_restore_archive(self, ctx, job, archive_path, *, action, targets=None):
+        WSLUpdateMixin._daemon_restore_archive(
+            self, ctx, job, archive_path, action=action, targets=targets
+        )
 
     def _run_wsl_checked(self, _distro, cmd, **_kwargs):
+        if cmd.startswith("tar -tzf "):
+            self.commands.append(cmd)
+            return SimpleNamespace(
+                returncode=0,
+                stdout=b"root/nekro_agent/docker-compose.yml\nroot/nekro_agent_data/config.json\n",
+                stderr=b"",
+            )
         self.cleanup_commands.append(cmd)
-        return None
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
     def _daemon_exec(self, ctx, job, cmd, **_kwargs):
         self.commands.append(cmd)
@@ -133,16 +145,25 @@ class _MixedArchiveRestoreDummy(_DummyDaemonUpdate):
             return self.archive_listing
         return ""
 
-    def _daemon_restore_archive(self, ctx, job, archive_path, *, action):
-        WSLUpdateMixin._daemon_restore_archive(self, ctx, job, archive_path, action=action)
+    def _daemon_restore_archive(self, ctx, job, archive_path, *, action, targets=None):
+        WSLUpdateMixin._daemon_restore_archive(
+            self, ctx, job, archive_path, action=action, targets=targets
+        )
 
     def _daemon_exec(self, ctx, job, cmd, **_kwargs):
         self.commands.append(cmd)
         return 0, ""
 
     def _run_wsl_checked(self, _distro, cmd, **_kwargs):
+        if cmd.startswith("tar -tzf "):
+            self.commands.append(cmd)
+            return SimpleNamespace(
+                returncode=0,
+                stdout=self.archive_listing.encode("utf-8"),
+                stderr=b"",
+            )
         self.cleanup_commands.append(cmd)
-        return None
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
 
 class _ConsistentBackupDummy(_DummyDaemonUpdate):
@@ -167,6 +188,40 @@ class _CancelDuringValidateDummy(_DummyDaemonUpdate):
     def _daemon_validate_instance(self, _ctx, job):
         job.request_cancel()
         return True
+
+
+class _RestoreJobOrderDummy(_DummyDaemonUpdate):
+    def __init__(self, archive_listing=None, restore_error=None):
+        super().__init__()
+        self.archive_listing = archive_listing or (
+            "root/nekro_agent/docker-compose.yml\n"
+            "root/nekro_agent_data/config.json\n"
+        )
+        self.restore_error = restore_error
+        self.running_services = ["nekro_agent", "nekro_postgres"]
+
+    def _daemon_resolve_backup_path(self, _request, _backup_id):
+        return "/root/.na-tools/backups/test/good.tar.gz"
+
+    def _run_wsl_checked(self, _distro, cmd, **_kwargs):
+        self.commands.append(cmd)
+        if cmd.startswith("tar -tzf "):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=self.archive_listing.encode("utf-8"),
+                stderr=b"",
+            )
+        if "ps --status running --services" in cmd:
+            stdout = ("\n".join(self.running_services) + "\n").encode("utf-8")
+            return SimpleNamespace(returncode=0, stdout=stdout, stderr=b"")
+        if " stop " in cmd:
+            self.running_services = []
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    def _daemon_restore_archive(self, _ctx, _job, archive_path, *, action, targets=None):
+        self.restore_calls.append((archive_path, action))
+        if self.restore_error:
+            raise RuntimeError(self.restore_error)
 
 
 class WSLDaemonUpdateTests(unittest.TestCase):
