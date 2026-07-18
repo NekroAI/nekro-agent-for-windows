@@ -22,8 +22,9 @@ browser_profile/
 debug.log
 *.log
 
-# 本地人工测试记录
-MANUAL_TEST_CHECKLIST.md
+# 本地人工测试执行记录（项目基线模板 MANUAL_TEST_CHECKLIST.md 需提交）
+MANUAL_TEST_CHECKLIST.local.md
+manual-test-results/
 
 # ISO 镜像
 *.iso
