@@ -85,6 +85,76 @@ class _DeployDummy(WSLDeployMixin):
         self.commands.append((distro, cmd, kwargs))
 
 
+class _StartAllConfig:
+    """支持 start_all_services 的最小配置桩，可指定 set_many 第几次失败。"""
+
+    def __init__(self, fail_on_call=None):
+        self.fail_on_call = fail_on_call
+        self.set_many_calls = 0
+        self.last_save_error = "配置目录不可写"
+        self.instances = {
+            "default": {"instance_name": "", "deploy_mode": "lite", "nekro_port": 8021},
+        }
+
+    def list_instances(self):
+        return list(self.instances.items())
+
+    def get_default_instance_id(self):
+        return "default"
+
+    def get_instance(self, inst_id):
+        return self.instances.get(inst_id)
+
+    def get(self, key):
+        return "lite" if key == "deploy_mode" else None
+
+    def set_many(self, _values):
+        self.set_many_calls += 1
+        return self.set_many_calls != self.fail_on_call
+
+
+class StartAllServicesConfigSyncTests(unittest.TestCase):
+    def _run_start_all(self, fail_on_call):
+        backend = _DeployDummy()
+        backend._deploying = False
+        backend.config = _StartAllConfig(fail_on_call=fail_on_call)
+        started_instances = []
+
+        def fake_start(inst_id, *_args, **_kwargs):
+            started_instances.append(inst_id)
+            return True
+
+        backend._distro_exists = lambda: True
+        backend._start_instance_sync = fake_start
+        with patch("core.wsl.deploy.threading.Thread", _ImmediateThread):
+            backend.start_all_services("default")
+        return backend, started_instances
+
+    def test_presync_failure_aborts_before_starting_instance(self):
+        backend, started = self._run_start_all(fail_on_call=1)
+
+        self.assertEqual(started, [])
+        statuses = [item[0] for item in backend.status_changed.items]
+        self.assertIn("启动失败", statuses)
+        self.assertTrue(
+            any("无法同步启动器配置" in item[0] for item in backend.log_received.items)
+        )
+
+    def test_postsync_failure_reports_error_without_faking_start_failure(self):
+        """服务已经起来了，此时再喊"启动失败"只会被健康检查线程覆盖掉。"""
+        backend, started = self._run_start_all(fail_on_call=2)
+
+        self.assertEqual(started, ["default"])
+        statuses = [item[0] for item in backend.status_changed.items]
+        self.assertNotIn("启动失败", statuses)
+        self.assertTrue(
+            any(
+                "服务可能已启动但配置未同步" in item[0]
+                for item in backend.log_received.items
+            )
+        )
+
+
 class WSLMonitorDeployTests(unittest.TestCase):
     def test_token_save_failure_does_not_mutate_config_reference(self):
         class Config:

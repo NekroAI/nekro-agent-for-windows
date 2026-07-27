@@ -39,6 +39,10 @@ Nekro Agent启动器是基于 PyQt6 的 Windows 桌面启动器，用于在 Wind
 - 配置文件保存改为原子写入，降低异常退出导致 `config.json` 损坏的风险。
 - 首次运行和迁移向导的后台线程增加异常兜底，避免后端异常后界面无限等待。
 - 新增人工测试清单，覆盖多实例、混合频道、预览版切换和失败回滚等关键路径。
+- 创建运行环境前会先申请管理员权限启用“适用于 Linux 的 Windows 子系统”和“虚拟机平台”，并能正确识别“已启用、待重启”状态，不再把待重启误判为组件就绪。
+- WSL2 检测不再仅凭 `wsl --version` 成功就判定就绪；导入发行版时显式指定 `--version 2`。
+- rootfs 改为流式下载并校验归档完整性，镜像站返回错误页或内容损坏时自动回退到下一个源，失败时列出依次尝试过的每个源及原因。
+- 打包流程新增打包产物冒烟验证：校验 Python/SSL DLL 可加载，实际启动 EXE 执行后端检查，并回读检查报告。
 
 ## 使用说明
 
@@ -91,6 +95,13 @@ uv run python main.py --debug
 uv run python main.py --backend-check
 ```
 
+打包后的 EXE 是无控制台的 windowed 构建，`print` 输出无处可去，可用
+`--backend-check-output` 把检查结果写成文件再读取（打包冒烟测试即用此方式）：
+
+```bash
+uv run python main.py --backend-check --backend-check-output=report.txt
+```
+
 基础源码检查：
 
 ```bash
@@ -111,13 +122,18 @@ Windows 下运行：
 build.bat
 ```
 
+发布构建需要预先安装 [Inno Setup 6 稳定版](https://jrsoftware.org/isinfo.php)。
+如果安装在自定义目录，可将 `INNO_SETUP_COMPILER` 设置为 `ISCC.exe` 的完整路径。
+脚本不会自动选择 Inno Setup 7 Preview。
+
 打包脚本会执行以下步骤：
 
-1. 检查 uv 是否可用。
-2. 使用 `uv sync --group dev` 同步运行和打包依赖。
+1. 检查 uv 和 Inno Setup 6 是否可用。
+2. 使用 Python 3.11 同步运行和打包依赖。
 3. 清理旧的 `build/`、`dist/`、`installer/` 目录。
 4. 使用 PyInstaller 生成 `dist/NekroAgent/`。
-5. 如检测到 Inno Setup 6，则生成 `installer/NekroAgent-Setup.exe`。
+5. 验证打包后的 Python/SSL DLL 可加载，启动 EXE 执行隔离的后端检查并回读其检查报告。
+6. 使用 Inno Setup 6 生成 `installer/NekroAgent-Setup.exe`；任一步失败都会返回非零退出码。
 
 ## 项目结构
 

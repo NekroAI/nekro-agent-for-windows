@@ -327,11 +327,18 @@ class FirstRunDialog(WizardDialogBase):
             return
 
         if mode == "install_docker":
-            self.backend.install_docker()
             self.check_desc.setText("正在安装 Docker...")
             self.btn_action.setEnabled(False)
             self.check_progress.setVisible(True)
             self._action_mode = "recheck"
+            if not self.backend.install_docker():
+                self.check_progress.setVisible(False)
+                self.check_desc.setText(
+                    "Docker 安装未能启动：当前 WSL 运行环境不存在或已被外部删除。"
+                    "请重新检测环境并创建运行环境后再安装 Docker。"
+                )
+                self.btn_action.setText("重新检测")
+                self.btn_action.setEnabled(True)
             return
 
         if mode == "recheck":
@@ -367,7 +374,10 @@ class FirstRunDialog(WizardDialogBase):
         title.setWordWrap(True)
         layout.addWidget(title)
 
-        desc = QLabel("将下载 Ubuntu 并创建专用 WSL2 运行环境，与系统已有环境互不影响。")
+        desc = QLabel(
+            "将先申请管理员权限检查 WSL2 与“虚拟机平台”，然后下载 Ubuntu "
+            "并创建专用运行环境，与系统已有环境互不影响。"
+        )
         desc.setObjectName("WizardDesc")
         desc.setWordWrap(True)
         layout.addWidget(desc)
@@ -442,7 +452,7 @@ class FirstRunDialog(WizardDialogBase):
         self.btn_back.setEnabled(False)
         self.dir_edit.setReadOnly(True)
         self.create_progress.setVisible(True)
-        self.lbl_progress.setText("准备下载...")
+        self.lbl_progress.setText("准备检查 WSL2 必需组件...")
         self.lbl_error.clear()
         self.lbl_error.setVisible(False)
 

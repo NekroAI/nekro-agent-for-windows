@@ -106,15 +106,45 @@ class SettingsPage(QWidget):
         inst_id = self.w.default_instance_combo.itemData(index)
         if not inst_id:
             return
+        previous_id = self.w.config.get_default_instance_id()
         if self.w.config.set_default_instance_id(inst_id):
             self._refresh_instance_info()
+            return
+
+        # ConfigManager 在保存失败时会回滚内存配置；将下拉框恢复到磁盘中
+        # 仍然有效的值，避免界面显示的默认实例与实际配置不一致。
+        combo = self.w.default_instance_combo
+        combo.blockSignals(True)
+        previous_index = combo.findData(previous_id)
+        if previous_index >= 0:
+            combo.setCurrentIndex(previous_index)
+        combo.blockSignals(False)
+
+        error = self.w.config.last_save_error or "实例不存在或配置未能保存"
+        self.w._show_notice_dialog(
+            "保存失败",
+            "无法保存启动默认实例设置，已恢复原来的选择。"
+            "请检查配置目录是否可写后重试。"
+            f"\n\n错误: {error}",
+            danger=True,
+        )
 
     def _save_instance_remark(self):
         inst_id = self.w.config.get_active_instance_id()
         if not inst_id:
             return
         remark = self.w.instance_remark_edit.text().strip()
-        self.w.config.update_instance(inst_id, remark=remark)
+        if not self.w.config.update_instance(inst_id, remark=remark):
+            error = self.w.config.last_save_error or "未知错误"
+            self._refresh_instance_info()
+            self.w._show_notice_dialog(
+                "保存失败",
+                "无法保存实例备注，已恢复磁盘中的原内容。"
+                "请检查配置目录是否可写后重试。"
+                f"\n\n错误: {error}",
+                danger=True,
+            )
+            return
         self._refresh_instance_info()
         self.w.refresh_dashboard()
 

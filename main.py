@@ -52,7 +52,7 @@ class LogRedirector:
             pass
 
 
-def _run_backend_check():
+def _run_backend_check(output_path=""):
     from core.backend_factory import BackendFactory
     from core.config_manager import ConfigManager
 
@@ -66,7 +66,15 @@ def _run_backend_check():
         "Docker Compose",
     ]
 
-    print(f"Backend check: {backend.display_name or backend.backend_key or 'backend'}")
+    # 打包后的 EXE 是 windowed 构建，sys.stdout 为 None，print() 会被静默丢弃。
+    # 所以同时收集一份报告，供 --backend-check-output 落盘给打包冒烟测试读取。
+    report = []
+
+    def _emit(text):
+        report.append(text)
+        print(text)
+
+    _emit(f"Backend check: {backend.display_name or backend.backend_key or 'backend'}")
     all_passed = True
     for idx, check in enumerate(checks):
         label = labels[idx] if idx < len(labels) else f"Check {idx + 1}"
@@ -77,11 +85,19 @@ def _run_backend_check():
             detail = str(e)
         status = "PASS" if passed else "FAIL"
         suffix = f": {detail}" if detail else ""
-        print(f"[{status}] {label}{suffix}")
+        _emit(f"[{status}] {label}{suffix}")
         if not passed:
             all_passed = False
 
-    print(f"Result: {'PASS' if all_passed else 'FAIL'}")
+    _emit(f"Result: {'PASS' if all_passed else 'FAIL'}")
+
+    if output_path:
+        try:
+            with open(output_path, "w", encoding="utf-8") as report_file:
+                report_file.write("\n".join(report) + "\n")
+        except OSError as e:
+            print(f"[WARN] 无法写入检查结果文件 {output_path}: {e}")
+
     return 0 if all_passed else 1
 
 
@@ -148,13 +164,19 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--debug', action='store_true', help='启用 debug 日志')
     parser.add_argument('--backend-check', action='store_true', help='运行后端环境检查后退出')
+    parser.add_argument(
+        '--backend-check-output',
+        default='',
+        metavar='PATH',
+        help='将后端环境检查结果写入指定文件（打包冒烟测试用）',
+    )
     args = parser.parse_args()
 
     if sys.platform == 'win32':
         os.environ['PYTHONIOENCODING'] = 'utf-8'
 
     if args.backend_check:
-        sys.exit(_run_backend_check())
+        sys.exit(_run_backend_check(args.backend_check_output))
 
     sys.exit(_run_gui(args))
 

@@ -1,6 +1,7 @@
 import subprocess
 
 from core.wsl.constants import DISTRO_NAME
+from core.wsl.prerequisites import is_wsl_virtualization_error
 
 
 class WSLEnvironmentMixin:
@@ -22,19 +23,33 @@ class WSLEnvironmentMixin:
 
             try:
                 proc = _probe(["wsl", "--status"])
-                ok = proc.returncode == 0
+                status_output = self._safe_decode(proc.stdout) + self._safe_decode(
+                    proc.stderr
+                )
+                prerequisite_error = is_wsl_virtualization_error(status_output)
+                ok = proc.returncode == 0 and not prerequisite_error
                 if not ok:
-                    # 刚装好的 Store 版 WSL 在个别状态下 --status 返回非零，
-                    # 用 --version 再确认一次，避免把已安装误判成未安装
+                    # --version 成功只证明 WSL 客户端存在，不能证明 WSL2、
+                    # VirtualMachinePlatform 或待重启状态已经就绪。
                     version_proc = _probe(["wsl", "--version"])
                     if version_proc.returncode == 0:
-                        ok = True
+                        self.log_received.emit(
+                            "[环境检测] WSL 客户端已安装，但 WSL2 运行前置尚未就绪",
+                            "warn",
+                        )
                 ctx["wsl"] = ok
                 if ok:
                     self.log_received.emit("[环境检测] ✓ WSL2 已安装", "info")
                 else:
+                    guidance = (
+                        "检测到 WSL2 虚拟化前置条件未满足。请点击安装以启用“虚拟机平台”，"
+                        "重启电脑后再继续；若仍失败，请检查 BIOS/UEFI 硬件虚拟化。"
+                        if prerequisite_error
+                        else ""
+                    )
                     detail = self._format_command_failure(
-                        "[环境检测] WSL2 检测失败（若刚安装过 WSL，请重启电脑后再检测）",
+                        "[环境检测] WSL2 检测失败（若刚安装过 WSL，请重启电脑后再检测）"
+                        + (f"\n{guidance}" if guidance else ""),
                         args=["wsl", "--status"],
                         timeout=30,
                         returncode=proc.returncode,

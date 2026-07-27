@@ -2,7 +2,9 @@ import inspect
 import unittest
 from unittest.mock import patch
 
+from ui.first_run_dialog import FirstRunDialog
 from ui.main_window import MainWindow
+from ui.pages.settings_page import SettingsPage
 from ui.webview_widget import _NAV_HOOK_JS
 
 
@@ -47,6 +49,41 @@ class _PortConfig:
 
 class _Backend:
     is_running = True
+
+
+class _Control:
+    def __init__(self):
+        self.text = ""
+        self.enabled = True
+        self.visible = False
+
+    def setText(self, text):
+        self.text = text
+
+    def setEnabled(self, enabled):
+        self.enabled = enabled
+
+    def setVisible(self, visible):
+        self.visible = visible
+
+
+class _DockerInstallBackend:
+    def __init__(self, started):
+        self.started = started
+        self.calls = 0
+
+    def install_docker(self):
+        self.calls += 1
+        return self.started
+
+
+class _DockerInstallDialog:
+    def __init__(self, started):
+        self._action_mode = "install_docker"
+        self.backend = _DockerInstallBackend(started)
+        self.check_desc = _Control()
+        self.btn_action = _Control()
+        self.check_progress = _Control()
 
 
 class _PortWindow:
@@ -172,7 +209,115 @@ class _RemovalWindow:
         self.notices.append((title, text, kwargs))
 
 
+class _SettingsCombo:
+    def __init__(self, items):
+        self._items = items
+        self.current_index = 1
+        self.signals_blocked = []
+
+    def itemData(self, index):
+        return self._items[index]
+
+    def findData(self, value):
+        return self._items.index(value) if value in self._items else -1
+
+    def setCurrentIndex(self, index):
+        self.current_index = index
+
+    def blockSignals(self, blocked):
+        self.signals_blocked.append(blocked)
+
+
+class _SettingsConfig:
+    def __init__(self, save_result):
+        self._save_result = save_result
+        self.last_save_error = "配置目录只读"
+        self.default_id = "inst-a"
+        self.update_calls = []
+
+    def get_default_instance_id(self):
+        return self.default_id
+
+    def set_default_instance_id(self, inst_id):
+        if self._save_result:
+            self.default_id = inst_id
+        return self._save_result
+
+    def get_active_instance_id(self):
+        return "inst-a"
+
+    def update_instance(self, inst_id, **kwargs):
+        self.update_calls.append((inst_id, kwargs))
+        return self._save_result
+
+
+class _SettingsWindow:
+    def __init__(self, save_result):
+        self.config = _SettingsConfig(save_result)
+        self.default_instance_combo = _SettingsCombo(["inst-a", "inst-b"])
+        self.instance_remark_edit = _LineEdit("新备注")
+        self.notices = []
+        self.dashboard_refreshes = 0
+
+    def _show_notice_dialog(self, title, message, danger=False):
+        self.notices.append((title, message, danger))
+
+    def refresh_dashboard(self):
+        self.dashboard_refreshes += 1
+
+
+class _SettingsPageStub:
+    def __init__(self, save_result):
+        self.w = _SettingsWindow(save_result)
+        self.info_refreshes = 0
+
+    def _refresh_instance_info(self):
+        self.info_refreshes += 1
+
+
 class UIFixTests(unittest.TestCase):
+    def test_default_instance_save_failure_restores_previous_selection(self):
+        page = _SettingsPageStub(save_result=False)
+
+        SettingsPage._on_default_instance_changed(page, 1)
+
+        combo = page.w.default_instance_combo
+        # 保存失败时 ConfigManager 会回滚内存配置，下拉框必须跟着回到磁盘值
+        self.assertEqual(combo.current_index, 0)
+        self.assertEqual(combo.signals_blocked, [True, False])
+        self.assertEqual(len(page.w.notices), 1)
+        self.assertIn("配置目录只读", page.w.notices[0][1])
+
+    def test_default_instance_save_success_keeps_selection_and_is_silent(self):
+        page = _SettingsPageStub(save_result=True)
+
+        SettingsPage._on_default_instance_changed(page, 1)
+
+        self.assertEqual(page.w.notices, [])
+        self.assertEqual(page.info_refreshes, 1)
+        self.assertEqual(page.w.config.default_id, "inst-b")
+
+    def test_instance_remark_save_failure_warns_and_skips_dashboard_refresh(self):
+        page = _SettingsPageStub(save_result=False)
+
+        SettingsPage._save_instance_remark(page)
+
+        self.assertEqual(len(page.w.notices), 1)
+        self.assertEqual(page.info_refreshes, 1)
+        self.assertEqual(page.w.dashboard_refreshes, 0)
+
+    def test_docker_install_start_failure_restores_wizard_controls(self):
+        dialog = _DockerInstallDialog(started=False)
+
+        FirstRunDialog._handle_action(dialog)
+
+        self.assertEqual(dialog.backend.calls, 1)
+        self.assertFalse(dialog.check_progress.visible)
+        self.assertTrue(dialog.btn_action.enabled)
+        self.assertEqual(dialog.btn_action.text, "重新检测")
+        self.assertEqual(dialog._action_mode, "recheck")
+        self.assertIn("运行环境不存在", dialog.check_desc.text)
+
     def test_webview_scripts_use_qtwebview2_bridge(self):
         self.assertIn("window.qtwebview2.api.on_nav_change", _NAV_HOOK_JS)
         self.assertNotIn("window.pywebview", _NAV_HOOK_JS)

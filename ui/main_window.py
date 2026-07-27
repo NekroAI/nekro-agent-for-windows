@@ -1,4 +1,5 @@
 import json
+import copy
 import os
 import re
 import sys
@@ -1396,7 +1397,12 @@ class MainWindow(QMainWindow):
 
         default_id = self.config.get_default_instance_id()
         if default_id:
-            self._apply_active_instance_config(default_id)
+            if self._apply_active_instance_config(default_id) is None:
+                # 配置未能落盘（该方法已弹窗提示，内存状态也已回滚）。继续刷新
+                # 面板或自动拉起服务只会用未同步的状态再失败一次，这里直接收尾。
+                if self._splash:
+                    self._splash.finish_with_error("实例配置保存失败")
+                return
             self.refresh_dashboard()
             self._sync_browser_to_active_instance(force_reload=False)
 
@@ -2000,7 +2006,7 @@ class MainWindow(QMainWindow):
         inst = self.config.get_instance(inst_id)
         if not inst:
             return None
-        self.config.set_many(
+        saved = self.config.set_many(
             {
                 "active_instance": inst_id,
                 "deploy_mode": inst.get("deploy_mode", ""),
@@ -2013,6 +2019,16 @@ class MainWindow(QMainWindow):
                 "deploy_info": inst.get("deploy_info"),
             }
         )
+        if not saved:
+            error = self.config.last_save_error or "未知错误"
+            self._show_notice_dialog(
+                "实例切换失败",
+                "无法保存所选实例的启动器状态，当前实例未切换。"
+                "请检查配置目录是否可写后重试。"
+                f"\n\n错误: {error}",
+                danger=True,
+            )
+            return None
         return inst
 
     def _sync_browser_to_active_instance(self, force_reload=True):
@@ -2218,6 +2234,8 @@ class MainWindow(QMainWindow):
         else:
             self._prev_active_instance = None
             self._prev_deploy_mode = None
+            self._prev_instance_globals = None
+            self._pending_instance_applied = False
             if self.backend.is_running:
                 self._show_notice_dialog("提示", "服务已在运行中")
                 return False
@@ -2233,6 +2251,22 @@ class MainWindow(QMainWindow):
             return False
         self._prev_active_instance = self.config.get_active_instance_id()
         self._prev_deploy_mode = self.config.get("deploy_mode")
+        self._rollback_failed = False
+        self._prev_instance_globals = {
+            key: copy.deepcopy(self.config.get(key))
+            for key in (
+                "active_instance",
+                "default_instance",
+                "deploy_mode",
+                "nekro_port",
+                "napcat_port",
+                "release_channel",
+                "preview_backup_available",
+                "deploy_info",
+                "first_run",
+            )
+        }
+        self._pending_instance_applied = False
         inst_id = pending["inst_id"]
         inst_save = {k: v for k, v in pending.items() if k != "inst_id"}
         inst_save.setdefault("preview_backup_available", False)
@@ -2264,6 +2298,7 @@ class MainWindow(QMainWindow):
                 danger=True,
             )
             return False
+        self._pending_instance_applied = True
         self.refresh_dashboard()
         return True
 
@@ -2341,40 +2376,71 @@ class MainWindow(QMainWindow):
         prev_id = getattr(self, "_prev_active_instance", None)
         prev_mode = getattr(self, "_prev_deploy_mode", None)
         pending = getattr(self, "_pending_inst_data", None)
+        pending_id = pending.get("inst_id") if pending else ""
+        pending_applied = bool(
+            pending_id and getattr(self, "_pending_instance_applied", False)
+        )
 
-        if pending and pending.get("inst_id"):
-            self.config.remove_instance(pending["inst_id"])
-
-        prev_inst = self.config.get_instance(prev_id) if prev_id else None
-        if prev_inst:
-            self.config.set_many(
-                {
-                    "active_instance": prev_id,
-                    "deploy_mode": prev_mode or prev_inst.get("deploy_mode", ""),
-                    "nekro_port": prev_inst.get("nekro_port", 8021),
-                    "napcat_port": prev_inst.get("napcat_port", 6099),
-                    "release_channel": prev_inst.get("release_channel", "stable"),
-                    "preview_backup_available": bool(
-                        prev_inst.get("preview_backup_available", False)
-                    ),
-                    "deploy_info": prev_inst.get("deploy_info"),
-                }
+        saved = True
+        if pending_applied:
+            previous_globals = getattr(self, "_prev_instance_globals", None)
+            if previous_globals is None:
+                prev_inst = self.config.get_instance(prev_id) if prev_id else None
+                if prev_inst:
+                    previous_globals = {
+                        "active_instance": prev_id,
+                        "deploy_mode": prev_mode
+                        or prev_inst.get("deploy_mode", ""),
+                        "nekro_port": prev_inst.get("nekro_port", 8021),
+                        "napcat_port": prev_inst.get("napcat_port", 6099),
+                        "release_channel": prev_inst.get(
+                            "release_channel", "stable"
+                        ),
+                        "preview_backup_available": bool(
+                            prev_inst.get("preview_backup_available", False)
+                        ),
+                        "deploy_info": prev_inst.get("deploy_info"),
+                    }
+                else:
+                    previous_globals = {
+                        "active_instance": prev_id or "",
+                        "deploy_mode": prev_mode or "",
+                    }
+            saved = self.config.remove_instance_with_globals(
+                pending_id,
+                global_updates=previous_globals,
             )
-        elif prev_id or prev_mode:
-            values = {}
-            if prev_id:
-                values["active_instance"] = prev_id
-            if prev_mode:
-                values["deploy_mode"] = prev_mode
-            self.config.set_many(values)
-        elif not self.config.list_instances():
-            self.config.clear_runtime_state(keep_first_run=True)
+
+        if not saved:
+            error = self.config.last_save_error or "未知错误"
+            self.append_log(
+                "新实例服务已停止，但启动器配置回滚失败。"
+                f"待回滚实例「{pending_id}」的配置仍被保留。错误: {error}",
+                "error",
+            )
+            self._show_notice_dialog(
+                "配置回滚失败",
+                "新实例服务已停止，但无法回滚启动器配置。"
+                "为避免状态与磁盘配置不一致，当前实例配置仍被保留。"
+                "请检查配置目录是否可写，再手动移除该实例。"
+                f"\n\n错误: {error}",
+                danger=True,
+            )
+            # 回滚失败后 _prev_active_instance 等状态被有意保留，若不上闩，
+            # 下一次「启动失败」会再次触发自动停止 + 回滚，形成用户没要求的
+            # 反复停服和重复弹窗。
+            self._rollback_failed = True
+            return False
 
         self._pending_inst_data = None
         self._prev_active_instance = None
         self._prev_deploy_mode = None
+        self._prev_instance_globals = None
+        self._pending_instance_applied = False
+        self._rollback_failed = False
         self._sync_browser_to_active_instance(force_reload=False)
         self.refresh_dashboard()
+        return True
 
     def _stop_pending_instance_before_rollback(self):
         """先停止新实例的残留容器，再移除其配置。"""
@@ -2471,6 +2537,8 @@ class MainWindow(QMainWindow):
                 self._pending_inst_data = None
                 self._prev_active_instance = None
                 self._prev_deploy_mode = None
+                self._prev_instance_globals = None
+                self._pending_instance_applied = False
             if (
                 self._current_webview() is not None
                 and not was_running
@@ -2527,6 +2595,7 @@ class MainWindow(QMainWindow):
                 status in {"启动失败", "启动超时"}
                 and not service_active
                 and getattr(self, "_prev_active_instance", None) is not None
+                and not getattr(self, "_rollback_failed", False)
             ):
                 self._stop_pending_instance_before_rollback()
 

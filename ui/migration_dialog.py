@@ -311,7 +311,8 @@ class MigrationDialog(WizardDialogBase):
 
         desc = QLabel(
             "迁移目标需要 NekroAgent 专用 WSL 运行环境。\n"
-            "将自动下载 Ubuntu 并创建专用环境，完成后继续迁移。"
+            "将先申请管理员权限检查 WSL2 与“虚拟机平台”，然后下载 Ubuntu "
+            "并创建专用环境，完成后继续迁移。"
         )
         desc.setObjectName("WizardDesc")
         desc.setWordWrap(True)
@@ -320,7 +321,7 @@ class MigrationDialog(WizardDialogBase):
         self._create_progress = create_install_progress_bar(0, 0, height=8, radius=4)
         layout.addWidget(self._create_progress)
 
-        self._create_status = QLabel("准备创建...")
+        self._create_status = QLabel("准备检查 WSL2 必需组件...")
         self._create_status.setObjectName("WizardDesc")
         self._create_status.setWordWrap(True)
         layout.addWidget(self._create_status)

@@ -525,8 +525,8 @@ class WSLDeployMixin:
         self.status_changed.emit("启动中...")
         self.log_received.emit("正在启动所有实例服务...", "info")
 
-        def _sync_active_compat_fields(inst_id, inst):
-            self.config.set_many(
+        def _sync_active_compat_fields(inst_id, inst, before_start=True):
+            saved = self.config.set_many(
                 {
                     "active_instance": inst_id,
                     "deploy_mode": inst.get("deploy_mode", ""),
@@ -539,6 +539,17 @@ class WSLDeployMixin:
                     "deploy_info": inst.get("deploy_info"),
                 }
             )
+            if not saved:
+                name = inst.get("instance_name", "").rstrip("_") or inst_id
+                error = self.config.last_save_error or "未知错误"
+                action = "未启动该实例" if before_start else "服务可能已启动但配置未同步"
+                self.log_received.emit(
+                    f"[{name}] 无法同步启动器配置，{action}。"
+                    "请检查配置目录是否可写后重试。\n"
+                    f"错误: {error}",
+                    "error",
+                )
+            return saved
 
         def _deploy_all():
             failures = []
@@ -546,7 +557,13 @@ class WSLDeployMixin:
                 for inst_id, inst in ordered:
                     attach = inst_id == default_id
                     if attach:
-                        _sync_active_compat_fields(inst_id, inst)
+                        if not _sync_active_compat_fields(inst_id, inst):
+                            self.status_changed.emit("启动失败")
+                            self.log_received.emit(
+                                "启动流程已中止：无法保存默认实例配置。",
+                                "error",
+                            )
+                            return
                     try:
                         ok = self._start_instance_sync(
                             inst_id,
@@ -565,7 +582,13 @@ class WSLDeployMixin:
                 if default_id:
                     default_inst = self.config.get_instance(default_id)
                     if default_inst:
-                        _sync_active_compat_fields(default_id, default_inst)
+                        # 服务此时已经起来了，健康检查线程随后会把状态刷成
+                        # "运行中"。这里再 emit 一次"启动失败"只会被覆盖掉，
+                        # 反而让状态在两秒内自相矛盾；配置未同步已经通过
+                        # _sync_active_compat_fields 的 error 日志告知用户。
+                        _sync_active_compat_fields(
+                            default_id, default_inst, before_start=False
+                        )
 
                 if failures and default_id in failures:
                     self.status_changed.emit("启动失败")

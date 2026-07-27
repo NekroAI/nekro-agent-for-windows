@@ -1,13 +1,22 @@
+import gzip
 import os
 import secrets
 import shlex
 import subprocess
+import tarfile
 import tempfile
 import threading
 import time
-from urllib.request import Request, urlopen
+import zlib
+from urllib.parse import urlparse
+
+import requests
 
 from core.wsl.constants import DISTRO_NAME, ROOTFS_URLS
+from core.wsl.prerequisites import (
+    is_wsl_virtualization_error,
+    wsl_virtualization_guidance,
+)
 
 
 class WSLRuntimeMixin:
@@ -148,6 +157,9 @@ class WSLRuntimeMixin:
         self.progress_updated.emit("准备创建 NekroAgent 运行环境...")
         self.log_received.emit("[发行版创建] 开始创建 NekroAgent 专用发行版...", "info")
 
+        if not self._ensure_wsl2_components():
+            return False
+
         self.log_received.emit(f"[发行版创建] 1/4 创建安装目录: {install_dir}", "info")
         try:
             os.makedirs(install_dir, exist_ok=True)
@@ -198,20 +210,41 @@ class WSLRuntimeMixin:
             self.log_received.emit("[发行版创建] 3/4 导入 WSL 发行版...", "info")
             try:
                 proc = subprocess.run(
-                    ["wsl", "--import", DISTRO_NAME, install_dir, rootfs_path],
+                    [
+                        "wsl",
+                        "--import",
+                        DISTRO_NAME,
+                        install_dir,
+                        rootfs_path,
+                        "--version",
+                        "2",
+                    ],
                     capture_output=True,
                     timeout=300,
                     creationflags=self._creation_flags(),
                 )
                 if proc.returncode != 0:
+                    command_output = self._safe_decode(proc.stdout) + self._safe_decode(
+                        proc.stderr
+                    )
                     detail = self._format_command_failure(
                         "[发行版创建] WSL 导入失败",
-                        args=["wsl", "--import", DISTRO_NAME, install_dir, rootfs_path],
+                        args=[
+                            "wsl",
+                            "--import",
+                            DISTRO_NAME,
+                            install_dir,
+                            rootfs_path,
+                            "--version",
+                            "2",
+                        ],
                         timeout=300,
                         returncode=proc.returncode,
                         stdout=proc.stdout,
                         stderr=proc.stderr,
                     )
+                    if is_wsl_virtualization_error(command_output):
+                        detail += wsl_virtualization_guidance()
                     self.progress_updated.emit("导入失败")
                     self.log_received.emit(detail, "error")
                     self.install_error.emit(detail)
@@ -228,7 +261,15 @@ class WSLRuntimeMixin:
             except subprocess.TimeoutExpired as e:
                 detail = self._format_command_failure(
                     "[发行版创建] WSL 导入超时",
-                    args=["wsl", "--import", DISTRO_NAME, install_dir, rootfs_path],
+                    args=[
+                        "wsl",
+                        "--import",
+                        DISTRO_NAME,
+                        install_dir,
+                        rootfs_path,
+                        "--version",
+                        "2",
+                    ],
                     timeout=300,
                     stdout=e.stdout,
                     stderr=e.stderr,
@@ -242,7 +283,15 @@ class WSLRuntimeMixin:
             except Exception as e:
                 detail = self._format_command_failure(
                     "[发行版创建] WSL 导入后写入恢复标记失败",
-                    args=["wsl", "--import", DISTRO_NAME, install_dir, rootfs_path],
+                    args=[
+                        "wsl",
+                        "--import",
+                        DISTRO_NAME,
+                        install_dir,
+                        rootfs_path,
+                        "--version",
+                        "2",
+                    ],
                     timeout=300,
                     exception=e,
                 )
@@ -323,27 +372,43 @@ default = root
 
     def _download_rootfs(self, dest_path):
         """下载 Ubuntu rootfs，返回是否成功"""
-        import socket
-        from urllib.error import HTTPError, URLError
-
-        last_error = ""
+        failures = []
         for url in ROOTFS_URLS:
+            source = urlparse(url).netloc or url
             try:
-                self.progress_updated.emit("正在下载 Ubuntu rootfs...")
-                self.log_received.emit(f"[发行版创建] 下载 rootfs: {url}", "info")
-                req = Request(url, headers={"User-Agent": "NekroAgent/1.0"})
-                with urlopen(req, timeout=60) as resp:
-
-                    total = resp.headers.get("Content-Length")
-                    total = int(total) if total else None
+                self.progress_updated.emit(f"正在从 {source} 下载 Ubuntu rootfs...")
+                self.log_received.emit(
+                    f"[发行版创建] 尝试 rootfs 下载源: {url}", "info"
+                )
+                with requests.get(
+                    url,
+                    headers={
+                        "User-Agent": "NekroAgent/1.0",
+                        # requests 会自动解压 Content-Encoding。优先请求原始字节，
+                        # 避免把传输层长度误当成写入磁盘后的长度。
+                        "Accept-Encoding": "identity",
+                    },
+                    stream=True,
+                    timeout=(15, 60),
+                ) as resp:
+                    resp.raise_for_status()
+                    content_encoding = (
+                        resp.headers.get("content-encoding", "").strip().lower()
+                    )
+                    if content_encoding in {"", "identity"}:
+                        try:
+                            total = int(resp.headers.get("content-length", 0)) or None
+                        except (TypeError, ValueError):
+                            total = None
+                    else:
+                        total = None
                     downloaded = 0
                     chunk_size = 256 * 1024
 
                     with open(dest_path, "wb") as f:
-                        while True:
-                            chunk = resp.read(chunk_size)
+                        for chunk in resp.iter_content(chunk_size=chunk_size):
                             if not chunk:
-                                break
+                                continue
                             f.write(chunk)
                             downloaded += len(chunk)
                             if total:
@@ -357,43 +422,116 @@ default = root
                                 mb_done = downloaded / (1024 * 1024)
                                 self.progress_updated.emit(f"下载中... {mb_done:.1f} MB")
 
-                self.progress_updated.emit("下载完成")
-                return True
-            except HTTPError as e:
-                last_error = f"HTTP {e.code} {e.reason}（{url}）"
-                self.install_error.emit(
-                    f"下载源返回错误: {last_error}，尝试下一个源..."
-                )
-            except URLError as e:
-                reason = str(e.reason)
-                if (
-                    isinstance(e.reason, socket.timeout)
-                    or "timed out" in reason.lower()
-                ):
-                    last_error = f"连接超时（{url}）"
-                elif "Name or service not known" in reason or "getaddrinfo" in reason:
-                    last_error = f"DNS 解析失败，请检查网络连接（{url}）"
-                elif "Connection refused" in reason:
-                    last_error = f"连接被拒绝（{url}）"
-                else:
-                    last_error = f"网络错误: {reason}（{url}）"
-                self.install_error.emit(f"{last_error}，尝试下一个源...")
-            except OSError as e:
-                last_error = f"磁盘写入失败: {e}；目标文件: {dest_path}"
-                self.install_error.emit(last_error)
-                return False
-            except Exception as e:
-                last_error = str(e)
-                self.install_error.emit(f"下载异常: {last_error}，尝试下一个源...")
+                    if downloaded <= 0:
+                        raise requests.RequestException("下载源未返回任何数据")
+                    if total is not None and downloaded != total:
+                        raise requests.RequestException(
+                            f"下载不完整，预期 {total} 字节，实际 {downloaded} 字节"
+                        )
+                    self.progress_updated.emit("正在校验镜像完整性...")
+                    self._validate_rootfs_archive(dest_path)
 
-        self.install_error.emit(f"所有下载源均失败，最后错误: {last_error}")
-        try:
-            if os.path.exists(dest_path):
-                os.remove(dest_path)
-        except OSError:
-            pass
+                self.progress_updated.emit("下载完成")
+                self.log_received.emit(
+                    f"[发行版创建] rootfs 下载成功（{source}）", "info"
+                )
+                return True
+            except requests.RequestException as e:
+                detail = f"{source}: {self._describe_download_error(e)}"
+                failures.append(detail)
+                self._remove_quietly(dest_path)
+                self.log_received.emit(
+                    f"[发行版创建] rootfs 下载源失败: {detail}", "warn"
+                )
+                self.install_error.emit(f"{detail}，尝试下一个源...")
+            except ValueError as e:
+                detail = f"{source}: 下载内容校验失败（{e}）"
+                failures.append(detail)
+                # 校验没过的残档必须立刻删掉，否则会被后续步骤当成可用 rootfs
+                self._remove_quietly(dest_path)
+                self.log_received.emit(
+                    f"[发行版创建] rootfs 下载源失败: {detail}", "warn"
+                )
+                self.install_error.emit(f"{detail}，尝试下一个源...")
+            except OSError as e:
+                detail = f"磁盘写入失败: {e}；目标文件: {dest_path}"
+                self._remove_quietly(dest_path)
+                self.install_error.emit(detail)
+                return False
+
+        failure_summary = "\n".join(f"- {failure}" for failure in failures)
+        self.install_error.emit(
+            "所有下载源均失败，已依次尝试：\n" + failure_summary
+        )
+        self._remove_quietly(dest_path)
         self.progress_updated.emit("所有下载源均失败")
         return False
+
+    @staticmethod
+    def _describe_download_error(e):
+        """把 requests 异常翻成可操作的中文原因，并截断底层 urllib3 堆栈文本。"""
+        if isinstance(e, requests.exceptions.ConnectTimeout):
+            cause = "连接超时"
+        elif isinstance(e, requests.exceptions.ReadTimeout):
+            cause = "读取超时，下载源响应过慢"
+        elif isinstance(e, requests.exceptions.SSLError):
+            cause = "TLS 握手失败"
+        elif isinstance(e, requests.exceptions.ProxyError):
+            cause = "代理连接失败，请检查系统代理设置"
+        elif isinstance(e, requests.exceptions.HTTPError):
+            status = getattr(getattr(e, "response", None), "status_code", "")
+            cause = f"下载源返回 HTTP {status}".strip()
+        elif isinstance(e, requests.exceptions.ConnectionError):
+            lowered = str(e).lower()
+            if "getaddrinfo" in lowered or "name or service not known" in lowered:
+                cause = "DNS 解析失败，请检查网络连接"
+            elif "refused" in lowered:
+                cause = "连接被拒绝"
+            elif "timed out" in lowered or "timeout" in lowered:
+                cause = "连接超时"
+            else:
+                cause = "网络连接失败"
+        else:
+            cause = "下载失败"
+        text = " ".join(str(e).split())
+        if len(text) > 160:
+            text = f"{text[:160]}..."
+        return f"{cause}（{text}）" if text else cause
+
+    @staticmethod
+    def _validate_rootfs_archive(path):
+        """拒绝镜像站返回的 HTML/错误页，并校验 gzip tar 归档完整可读。
+
+        必须读满整个 gzip 流，而不是读到 tar 的 EOF 块就停：gzip 的 CRC32 和
+        长度校验位在流尾部，只迭代 tar 成员根本够不到，单比特翻转的损坏镜像
+        会被直接放行。校验放在成员检查之前，损坏镜像可以更早失败。
+
+        任何读取或解压异常都归一成 ValueError，交给调用方切换下一个下载源：
+        损坏的 deflate 流抛 zlib.error，gzip.BadGzipFile 又是 OSError 子类，
+        两者都不是 TarError；漏接会被误判成"磁盘写入失败"而放弃剩余镜像，
+        或者干脆逃出下载循环、结束整个创建线程。
+        """
+        try:
+            with open(path, "rb") as archive_file:
+                if archive_file.read(2) != b"\x1f\x8b":
+                    raise ValueError("返回内容不是 gzip 归档，可能是镜像站错误页")
+
+            # tar 的 EOF 块之后仍有 gzip 尾部，必须单独读满整个流，
+            # CRC32/长度校验位才会被检查到（只迭代 tar 成员够不到）
+            with gzip.open(path, "rb") as stream:
+                while stream.read(1024 * 1024):
+                    pass
+
+            member_count = 0
+            with tarfile.open(path, mode="r:gz") as archive:
+                for _member in archive:
+                    member_count += 1
+            if member_count == 0:
+                raise ValueError("gzip tar 归档为空")
+        except (tarfile.TarError, EOFError, zlib.error, OSError) as e:
+            raise ValueError(
+                f"gzip tar 归档已损坏或不完整: {type(e).__name__}: {e}"
+            ) from e
 
     def _install_docker_sync(self):
         """在专用发行版内同步安装 Docker（通过 Docker 官方源，使用国内镜像）"""
@@ -626,11 +764,87 @@ default = root
             return False
 
     _WSL_INSTALL_REBOOT_MARKERS = (
-        "重新启动",
-        "重启",
-        "reboot",
-        "restart",
+        "需要重新启动",
+        "需要重启",
+        "重启电脑",
+        "重启后",
+        "重新启动系统前",
+        "reboot required",
+        "reboot is required",
+        "restart required",
+        "restart is required",
+        "reboot your computer",
+        "restart your computer",
+        "changes will not be effective until",
+        "restart needed",
+        "enable pending",
+        "启用挂起",
     )
+    _WSL_INSTALL_NO_REBOOT_MARKERS = (
+        "无需重启",
+        "无需重新启动",
+        "no restart required",
+        "restart required: no",
+    )
+    _WSL_INSTALL_ALREADY_READY_MARKERS = (
+        "windows subsystem for linux is already installed",
+        "wsl is already installed",
+        "适用于 linux 的 windows 子系统已安装",
+        "适用于linux的windows子系统已安装",
+    )
+
+    @staticmethod
+    def _remove_quietly(path):
+        """删除临时文件，失败时静默忽略（清理失败不应影响安装结果判定）。"""
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _decode_wsl_install_output(data):
+        """解码 DISM/WSL 重定向日志，兼容无 BOM 的 UTF-16LE 中文输出。"""
+        if isinstance(data, str):
+            return data
+        if not isinstance(data, bytes):
+            return str(data or "")
+        if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+            return data.decode("utf-16", errors="replace")
+
+        markers = (
+            "重新启动",
+            "重启",
+            "操作成功",
+            "已安装",
+            "错误",
+            "部署映像",
+            "restart",
+            "reboot",
+            "operation completed",
+            "already installed",
+            "windows subsystem",
+            "virtualmachineplatform",
+            "error",
+            "dism",
+        )
+        candidates = []
+        for encoding in ("utf-8-sig", "utf-16-le", "gbk"):
+            try:
+                text = data.decode(encoding)
+            except (UnicodeDecodeError, LookupError):
+                continue
+            lowered = text.lower()
+            marker_score = sum(1 for marker in markers if marker in lowered)
+            printable = sum(1 for char in text if char.isprintable() or char.isspace())
+            printable_ratio = printable / len(text) if text else 0
+            score = marker_score * 100 + printable_ratio * 10
+            if encoding == "utf-16-le" and b"\x00" in data:
+                score += 5
+            score -= text.count("\ufffd") * 20
+            candidates.append((score, text))
+        if candidates:
+            return max(candidates, key=lambda item: item[0])[1]
+        return data.decode("latin1", errors="replace")
 
     @classmethod
     def _parse_wsl_install_outcome(cls, exit_token, output):
@@ -643,81 +857,228 @@ default = root
         """
         if exit_token == "DENIED":
             return "fail"
+        if exit_token in {"1641", "3010"}:
+            return "reboot"
         lowered = (output or "").lower()
-        reboot_marker = any(marker in lowered for marker in cls._WSL_INSTALL_REBOOT_MARKERS)
+        reboot_marker = (
+            not any(marker in lowered for marker in cls._WSL_INSTALL_NO_REBOOT_MARKERS)
+            and any(marker in lowered for marker in cls._WSL_INSTALL_REBOOT_MARKERS)
+        )
+        already_ready = any(
+            marker in lowered for marker in cls._WSL_INSTALL_ALREADY_READY_MARKERS
+        )
         if exit_token == "0":
             return "reboot" if reboot_marker else "done"
+        if already_ready and not reboot_marker:
+            return "done"
         return "reboot" if reboot_marker else "fail"
+
+    # 分支逻辑写进临时批处理再提权执行，而不是拼一条单行 cmd 串：
+    # 单行串在 PowerShell -ArgumentList 的引号嵌套下会被割裂，dism 的
+    # 3010/1641（需重启）退出码会因此丢失，被误判成"安装完成"。
+    # 正文保持纯 ASCII，日志路径由脚本按 %~dpn0 自行推导。
+    _ELEVATED_INSTALL_SCRIPT = "\n".join(
+        (
+            "@echo off",
+            "setlocal EnableExtensions",
+            'call :na_main > "%~dpn0.log" 2>&1',
+            "exit /b %ERRORLEVEL%",
+            "",
+            ":na_main",
+            "dism.exe /online /enable-feature "
+            "/featurename:Microsoft-Windows-Subsystem-Linux /all /norestart",
+            'set "NA_WSL_RC=%ERRORLEVEL%"',
+            "dism.exe /online /enable-feature "
+            "/featurename:VirtualMachinePlatform /all /norestart",
+            'set "NA_VMP_RC=%ERRORLEVEL%"',
+            "call :na_accepts_rc %NA_WSL_RC%",
+            "if errorlevel 1 exit /b %NA_WSL_RC%",
+            "call :na_accepts_rc %NA_VMP_RC%",
+            "if errorlevel 1 exit /b %NA_VMP_RC%",
+            'if "%NA_WSL_RC%"=="3010" exit /b 3010',
+            'if "%NA_WSL_RC%"=="1641" exit /b 1641',
+            'if "%NA_VMP_RC%"=="3010" exit /b 3010',
+            'if "%NA_VMP_RC%"=="1641" exit /b 1641',
+            "wsl.exe --install --no-distribution",
+            "exit /b %ERRORLEVEL%",
+            "",
+            "rem Only 0/3010/1641 may continue; string compare also"
+            " rejects negative dism codes.",
+            ":na_accepts_rc",
+            'if "%~1"=="0" exit /b 0',
+            'if "%~1"=="3010" exit /b 0',
+            'if "%~1"=="1641" exit /b 0',
+            "exit /b 1",
+            "",
+        )
+    )
+
+    def _run_elevated_wsl_install(self):
+        """提权执行 WSL 必需组件安装，返回 (outcome, output, detail)。"""
+        # 提权进程的输出无法直接通过管道回传，由批处理重定向到日志文件再读回；
+        # dism/wsl.exe 输出编码不一，交由 _decode_wsl_install_output 识别。
+        token = secrets.token_hex(8)
+        base_path = os.path.join(
+            tempfile.gettempdir(), f"na_wsl_install_{os.getpid()}_{token}"
+        )
+        script_path = f"{base_path}.cmd"
+        log_path = f"{base_path}.log"
+        try:
+            with open(script_path, "w", encoding="ascii", newline="\r\n") as f:
+                f.write(self._ELEVATED_INSTALL_SCRIPT)
+        except (OSError, UnicodeEncodeError) as e:
+            detail = self._format_command_failure(
+                "无法写入 WSL2 组件安装脚本",
+                cmd=script_path,
+                exception=e,
+            )
+            return "fail", "", detail
+
+        ps_target = script_path.replace("'", "''")
+        ps_script = (
+            "try { "
+            f"$p = Start-Process -FilePath '{ps_target}' "
+            "-Verb RunAs -Wait -PassThru; "
+            "Write-Output ('NA_EXIT=' + $p.ExitCode) "
+            "} catch { "
+            "$msg = $_.Exception.Message; "
+            "Write-Output ('NA_ERROR=' + $msg); "
+            "if ($msg -match 'cancel|取消|1223') { "
+            "Write-Output 'NA_EXIT=DENIED' "
+            "} else { Write-Output 'NA_EXIT=LAUNCH_ERROR' } "
+            "}"
+        )
+        exit_token = ""
+        launch_error = ""
+        try:
+            proc = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    ps_script,
+                ],
+                capture_output=True,
+                timeout=1800,
+                creationflags=self._creation_flags(),
+            )
+            for line in self._safe_decode(proc.stdout).splitlines():
+                line = line.strip().strip("\x00")
+                if line.startswith("NA_EXIT="):
+                    exit_token = line.split("=", 1)[1].strip()
+                elif line.startswith("NA_ERROR="):
+                    launch_error = line.split("=", 1)[1].strip()
+            if not exit_token:
+                outer_error = self._safe_decode(proc.stderr).strip()
+                launch_error = outer_error or (
+                    f"PowerShell 未返回安装进程退出码（退出码 {proc.returncode}）"
+                )
+                exit_token = "LAUNCH_ERROR"
+        except Exception as e:
+            detail = self._format_command_failure(
+                "WSL2 安装进程执行异常",
+                cmd=(
+                    "启用 Microsoft-Windows-Subsystem-Linux、VirtualMachinePlatform "
+                    "并执行 wsl --install --no-distribution"
+                ),
+                timeout=1800,
+                exception=e,
+            )
+            self._remove_quietly(script_path)
+            self._remove_quietly(log_path)
+            return "fail", "", detail
+
+        raw_output = ""
+        try:
+            with open(log_path, "rb") as f:
+                raw_output = self._decode_wsl_install_output(f.read())
+        except OSError:
+            pass
+        finally:
+            self._remove_quietly(log_path)
+            self._remove_quietly(script_path)
+
+        outcome = self._parse_wsl_install_outcome(exit_token, raw_output)
+        output = raw_output.replace("\x00", "").strip()
+        detail = (
+            "用户拒绝了管理员权限请求"
+            if exit_token == "DENIED"
+            else (
+                f"管理员安装进程启动失败: {launch_error or '未知错误'}"
+                if exit_token == "LAUNCH_ERROR"
+                else f"安装进程退出码: {exit_token or '未知'}"
+            )
+        )
+        return outcome, output, detail
+
+    def _wsl2_components_ready(self):
+        """不提权地判断 WSL2 组件是否已就绪。
+
+        用于跳过多余的 UAC：组件早就装好的机器不该每次创建运行环境都被提权
+        打断。判定保守——只有在 `wsl --status` 明确成功且输出里没有虚拟化前置
+        错误时才认为就绪，任何存疑情况都退回提权路径。
+        """
+        try:
+            proc = subprocess.run(
+                ["wsl", "--status"],
+                capture_output=True,
+                timeout=30,
+                creationflags=self._creation_flags(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        if proc.returncode != 0:
+            return False
+        output = self._safe_decode(proc.stdout) + self._safe_decode(proc.stderr)
+        return not is_wsl_virtualization_error(output)
+
+    def _ensure_wsl2_components(self):
+        """在下载 rootfs 前确保 WSL 与虚拟机平台组件已启用。"""
+        self.progress_updated.emit("正在检查 WSL2 必需组件...")
+        if self._wsl2_components_ready():
+            self.log_received.emit(
+                "[发行版创建] ✓ WSL2 必需组件已就绪，跳过管理员预检", "info"
+            )
+            return True
+
+        self.progress_updated.emit("正在检查并启用 WSL2 必需组件...")
+        self.log_received.emit(
+            "[发行版创建] 预检 WSL 子系统与虚拟机平台（需要管理员权限）...",
+            "info",
+        )
+        outcome, output, detail = self._run_elevated_wsl_install()
+        if output:
+            self.log_received.emit(f"[WSL 安装] 安装输出:\n{output}", "info")
+        if outcome == "done":
+            self.log_received.emit("[发行版创建] ✓ WSL2 必需组件已就绪", "info")
+            return True
+        if outcome == "reboot":
+            message = (
+                "已启用 WSL 子系统和“虚拟机平台”，需要重启电脑后才能创建运行环境。\n"
+                "请重启电脑，再重新打开启动器继续。"
+            )
+        else:
+            message = (
+                "无法启用 WSL2 必需组件。\n"
+                f"{detail}\n"
+                "请确认管理员授权，并检查 Windows 版本是否支持 WSL2。"
+            )
+        self.log_received.emit(f"[发行版创建] {message}", "error")
+        self.install_error.emit(message)
+        self.progress_updated.emit("WSL2 必需组件尚未就绪")
+        return False
 
     def install_wsl(self):
         """以管理员权限安装 WSL2，等待安装进程结束并回收结果（后台线程）。"""
         self.log_received.emit("正在请求管理员权限安装 WSL2...", "info")
 
         def _do_install():
-            # 提权进程的输出无法直接通过管道回传，重定向到日志文件再读回；
-            # wsl.exe 输出为 UTF-16，交由 _safe_decode 识别。
-            log_path = os.path.join(
-                tempfile.gettempdir(), f"na_wsl_install_{os.getpid()}.log"
-            )
-            inner_cmd = f'wsl --install --no-distribution > "{log_path}" 2>&1'
-            ps_inner = inner_cmd.replace("'", "''")
-            ps_script = (
-                "try { "
-                "$p = Start-Process -FilePath 'cmd.exe' "
-                f"-ArgumentList '/d','/c','{ps_inner}' "
-                "-Verb RunAs -Wait -PassThru; "
-                "Write-Output ('NA_EXIT=' + $p.ExitCode) "
-                "} catch { Write-Output 'NA_EXIT=DENIED' }"
-            )
-            exit_token = ""
-            try:
-                proc = subprocess.run(
-                    [
-                        "powershell",
-                        "-NoProfile",
-                        "-NonInteractive",
-                        "-ExecutionPolicy",
-                        "Bypass",
-                        "-Command",
-                        ps_script,
-                    ],
-                    capture_output=True,
-                    timeout=1800,
-                    creationflags=self._creation_flags(),
-                )
-                for line in self._safe_decode(proc.stdout).splitlines():
-                    line = line.strip().strip("\x00")
-                    if line.startswith("NA_EXIT="):
-                        exit_token = line.split("=", 1)[1].strip()
-            except Exception as e:
-                self.log_received.emit(
-                    self._format_command_failure(
-                        "WSL2 安装进程执行异常",
-                        cmd="wsl --install --no-distribution",
-                        timeout=1800,
-                        exception=e,
-                    ),
-                    "error",
-                )
-                self.progress_updated.emit("__wsl_fail__")
-                return
-
-            output = ""
-            try:
-                with open(log_path, "rb") as f:
-                    output = self._clean_command_output(self._safe_decode(f.read()))
-            except OSError:
-                pass
-            finally:
-                try:
-                    os.remove(log_path)
-                except OSError:
-                    pass
-
+            outcome, output, detail = self._run_elevated_wsl_install()
             if output:
                 self.log_received.emit(f"[WSL 安装] 安装输出:\n{output}", "info")
-
-            outcome = self._parse_wsl_install_outcome(exit_token, output)
             if outcome == "done":
                 self.log_received.emit("[WSL 安装] 安装步骤执行完成，开始重新检测", "info")
                 self.progress_updated.emit("__wsl_done__")
@@ -729,9 +1090,6 @@ default = root
                 )
                 self.progress_updated.emit("__wsl_reboot__")
             else:
-                detail = "用户拒绝了管理员权限请求" if exit_token == "DENIED" else (
-                    f"安装进程退出码: {exit_token or '未知'}"
-                )
                 self.log_received.emit(f"[WSL 安装] 安装失败（{detail}）", "error")
                 self.progress_updated.emit("__wsl_fail__")
 
